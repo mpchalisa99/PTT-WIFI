@@ -1,0 +1,6 @@
+{
+  "name": "DISKOMLEKAU Tactical PTT",
+  "description": "Aplikasi Android Push-to-Talk (PTT) Walkie Talkie taktikal berbasis Flutter dengan Auto-Discovery UDP Broadcast/Multicast dan transmisi suara real-time via LAN Hotspot tanpa internet.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
