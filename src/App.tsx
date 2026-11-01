@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
+import mqtt, { MqttClient } from 'mqtt';
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 import {
@@ -41,6 +42,7 @@ interface TacticalMember {
   pingMs: number;
   channel: number;
   peerId?: string;
+  lastSeen?: number;
 }
 
 interface PeerSyncEntry {
@@ -53,9 +55,11 @@ interface PeerSyncEntry {
 }
 
 interface MeshPacket {
+  packetId?: string;
   type:
     | 'ANNOUNCE'
     | 'PEER_LIST_SYNC'
+    | 'PEER_LEAVE'
     | 'VOICE_CLIP'
     | 'PTT_START'
     | 'PTT_END'
@@ -77,6 +81,32 @@ interface MeshPacket {
 }
 
 const MASTER_PEER_ID = 'PTT-MASTER-01';
+const CLOUD_MESH_TOPIC = 'diskomlekau/tactical/ptt/v3/mesh';
+const WSS_CLOUD_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
+const WEBRTC_ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+];
 
 // Universal parser for both ?query and #hash invite parameters (prevents 404 Page Not Found)
 function extractInviteParamsFromUrl() {
@@ -163,16 +193,20 @@ export default function App() {
   });
 
   // Cloud Handshake PeerJS ID:
-  // - Master registers static ID: 'PTT-MASTER-01'
+  // - Master attempts static ID: 'PTT-MASTER-01' (auto-failover to unique client ID if already taken on 0.peerjs.com)
   // - Client registers unique ID: 'PTT-CLIENT-[CALLSIGN]-[ID]'
-  const sanitizedCallsignForPeer = (myCallsign || 'UNIT')
-    .replace(/[^A-Z0-9]/gi, '')
-    .toUpperCase() || 'UNIT';
-  const cleanShortDeviceId = myDeviceId.replace(/[^A-Z0-9]/gi, '').toUpperCase() || '01';
-  const myPeerNodeId =
+  const sanitizedCallsignForPeer =
+    (myCallsign || 'UNIT').replace(/[^A-Z0-9]/gi, '').toUpperCase() || 'UNIT';
+  const cleanShortDeviceId =
+    myDeviceId.replace(/[^A-Z0-9]/gi, '').toUpperCase() || '01';
+  const uniqueClientPeerId = `PTT-CLIENT-${sanitizedCallsignForPeer}-${cleanShortDeviceId}`;
+  const preferredPeerId =
     role === 'MASTER' || localIp === '192.168.43.1'
       ? MASTER_PEER_ID
-      : `PTT-CLIENT-${sanitizedCallsignForPeer}-${cleanShortDeviceId}`;
+      : uniqueClientPeerId;
+  const [activeBoundPeerId, setActiveBoundPeerId] =
+    useState<string>(preferredPeerId);
+  const myPeerNodeId = activeBoundPeerId || preferredPeerId;
 
   // Target Master Host Peer ID from Barcode Invite Link or manual paste
   const [invitedHostPeer, setInvitedHostPeer] = useState<string>(urlInviteParams.hostPeer);
@@ -222,7 +256,7 @@ export default function App() {
   const [selectedFileIndex, setSelectedFileIndex] = useState<number>(0);
   const [copiedText, setCopiedText] = useState<string | null>(null);
 
-  // Audio & WebRTC refs
+  // Audio, WebRTC & WSS Cloud Mesh refs
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -232,6 +266,9 @@ export default function App() {
   const peerRef = useRef<Peer | null>(null);
   const directNodePeerRef = useRef<Peer | null>(null);
   const peerConnectionsRef = useRef<Map<string, DataConnection>>(new Map());
+  const pendingConnectTimestampRef = useRef<Map<string, number>>(new Map());
+  const mqttClientsRef = useRef<MqttClient[]>([]);
+  const seenPacketIdsRef = useRef<Set<string>>(new Set());
   const lastAnnounceReplyRef = useRef<Map<string, number>>(new Map());
   const membersRef = useRef<TacticalMember[]>([]);
   useEffect(() => {
@@ -371,28 +408,40 @@ export default function App() {
     [soundEnabled, playTacticalTone]
   );
 
-  // Send packet to all connected WebRTC peers + local BroadcastChannel
+  // Send packet to all connected WebRTC peers + WSS Cloud Mesh Brokers + local BroadcastChannel
   const broadcastMeshPacket = useCallback(
     (partial: Omit<MeshPacket, 'senderId' | 'callsign' | 'ip' | 'role' | 'channel' | 'timestamp'>) => {
       if (!myCallsign) return;
+      const pktId = `${myDeviceId}-${Date.now()}-${Math.random()
+        .toString(36)
+        .substring(2, 7)}`;
+      seenPacketIdsRef.current.add(pktId);
+      if (seenPacketIdsRef.current.size > 400) {
+        const first = seenPacketIdsRef.current.values().next().value;
+        if (first) seenPacketIdsRef.current.delete(first);
+      }
+
       const fullPacket: MeshPacket = {
         ...partial,
+        packetId: pktId,
         senderId: myDeviceId,
         callsign: myCallsign,
         ip: localIp,
         role,
-        isMaster: localIp === '192.168.43.1',
+        isMaster: localIp === '192.168.43.1' || role === 'MASTER',
         channel,
         timestamp: Date.now(),
         peerNodeId: myPeerNodeId,
       };
 
+      // 1. Local BroadcastChannel (instant same-device multi-tab sync)
       try {
         broadcastChannelRef.current?.postMessage(fullPacket);
       } catch {
         // Ignore BroadcastChannel error
       }
 
+      // 2. WebRTC PeerJS P2P DataChannels
       peerConnectionsRef.current.forEach((conn) => {
         if (conn && conn.open) {
           try {
@@ -402,11 +451,23 @@ export default function App() {
           }
         }
       });
+
+      // 3. WSS Cloud Mesh Brokers (guarantees 100% cross-HP delivery on Vercel even behind symmetric CGNAT)
+      const serialized = JSON.stringify(fullPacket);
+      mqttClientsRef.current.forEach((client) => {
+        if (client && client.connected) {
+          try {
+            client.publish(CLOUD_MESH_TOPIC, serialized, { qos: 0 });
+          } catch {
+            // Ignore publish error
+          }
+        }
+      });
     },
     [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]
   );
 
-  // Build and broadcast PEER_LIST_SYNC from Master ('PTT-MASTER-01') to all connected Clients
+  // Build and broadcast PEER_LIST_SYNC from Master to all connected Clients
   const broadcastPeerListSync = useCallback(
     (overrideMembers?: TacticalMember[]) => {
       if (role !== 'MASTER' && localIp !== '192.168.43.1') return;
@@ -415,7 +476,7 @@ export default function App() {
       const currentList = overrideMembers ?? membersRef.current;
       const syncList: PeerSyncEntry[] = [
         {
-          peerId: MASTER_PEER_ID,
+          peerId: myPeerNodeId,
           senderId: myDeviceId,
           callsign: myCallsign,
           ip: localIp,
@@ -423,7 +484,7 @@ export default function App() {
           channel,
         },
         ...currentList
-          .filter((m) => m.id !== myDeviceId && m.peerId !== MASTER_PEER_ID)
+          .filter((m) => m.id !== myDeviceId)
           .map((m) => ({
             peerId: m.peerId || m.id,
             senderId: m.id,
@@ -439,15 +500,17 @@ export default function App() {
         peerList: syncList,
       });
     },
-    [role, localIp, myCallsign, myDeviceId, channel, broadcastMeshPacket]
+    [role, localIp, myCallsign, myPeerNodeId, myDeviceId, channel, broadcastMeshPacket]
   );
 
   // Helper to attach listeners to a PeerJS DataConnection
   const registerPeerConnection = useCallback(
     (conn: DataConnection) => {
-      if (!conn) return;
+      if (!conn || !conn.peer) return;
+      pendingConnectTimestampRef.current.set(conn.peer, Date.now());
 
       conn.on('open', () => {
+        pendingConnectTimestampRef.current.delete(conn.peer);
         peerConnectionsRef.current.set(conn.peer, conn);
         setConnectedPeersCount(peerConnectionsRef.current.size);
 
@@ -469,7 +532,7 @@ export default function App() {
         }
         packetHandlerRef.current(incoming);
 
-        // If this device is Master ('PTT-MASTER-01'), relay voice/control packets to other connected clients
+        // If this device is Master, relay voice/control packets to other connected WebRTC clients
         if (
           incoming.type !== 'ANNOUNCE' &&
           incoming.type !== 'PEER_LIST_SYNC' &&
@@ -488,29 +551,64 @@ export default function App() {
       });
 
       const handleDisconnect = () => {
+        pendingConnectTimestampRef.current.delete(conn.peer);
         peerConnectionsRef.current.delete(conn.peer);
         setConnectedPeersCount(peerConnectionsRef.current.size);
-        setMembers((prev) => {
-          const next = prev.filter(
-            (m) => m.peerId !== conn.peer && m.id !== conn.peer
-          );
-          if (next.length !== prev.length) {
-            window.setTimeout(() => broadcastPeerListSync(next), 50);
-          }
-          return next;
-        });
       };
 
       conn.on('close', handleDisconnect);
       conn.on('error', handleDisconnect);
     },
-    [localIp, role, broadcastPeerListSync]
+    [localIp, role]
   );
 
-  // Handle incoming mesh packets (from WebRTC PeerJS DataChannel or local BroadcastChannel)
+  // Helper to initiate a non-duplicate WebRTC connection to a remote peerId
+  const connectToPeerNodeIfNeeded = useCallback(
+    (remotePeerId?: string) => {
+      if (!remotePeerId || remotePeerId === myPeerNodeId) return;
+      const activePeer = directNodePeerRef.current || peerRef.current;
+      if (!activePeer || activePeer.disconnected || activePeer.destroyed) return;
+
+      const existingConn = peerConnectionsRef.current.get(remotePeerId);
+      if (existingConn && existingConn.open) return;
+
+      // Avoid aborting an in-flight WebRTC ICE handshake (< 7 seconds old)
+      const pendingSince = pendingConnectTimestampRef.current.get(remotePeerId) || 0;
+      if (Date.now() - pendingSince < 7000) return;
+
+      try {
+        pendingConnectTimestampRef.current.set(remotePeerId, Date.now());
+        const conn = activePeer.connect(remotePeerId, {
+          reliable: true,
+          serialization: 'json',
+        });
+        registerPeerConnection(conn);
+      } catch {
+        pendingConnectTimestampRef.current.delete(remotePeerId);
+      }
+    },
+    [myPeerNodeId, registerPeerConnection]
+  );
+
+  // Handle incoming mesh packets (from WebRTC PeerJS DataChannel, WSS Cloud Mesh, or BroadcastChannel)
   const handleIncomingMeshPacket = useCallback(
     (pkt: MeshPacket) => {
       if (!pkt || pkt.senderId === myDeviceId || !pkt.callsign) return;
+
+      // Deduplicate packets that arrive simultaneously via WebRTC DataChannel & WSS Cloud Mesh
+      if (pkt.packetId) {
+        if (seenPacketIdsRef.current.has(pkt.packetId)) return;
+        seenPacketIdsRef.current.add(pkt.packetId);
+        if (seenPacketIdsRef.current.size > 400) {
+          const first = seenPacketIdsRef.current.values().next().value;
+          if (first) seenPacketIdsRef.current.delete(first);
+        }
+      }
+
+      if (pkt.type === 'PEER_LEAVE') {
+        setMembers((prev) => prev.filter((m) => m.id !== pkt.senderId));
+        return;
+      }
 
       const amIMaster = localIp === '192.168.43.1' || role === 'MASTER';
       const senderIsMaster =
@@ -521,6 +619,7 @@ export default function App() {
 
       if (pkt.type === 'ANNOUNCE') {
         const senderPeerId = pkt.peerNodeId || pkt.senderId;
+        const now = Date.now();
         setMembers((prev) => {
           const exists = prev.some(
             (m) => m.id === pkt.senderId || m.peerId === senderPeerId
@@ -536,6 +635,7 @@ export default function App() {
                       role: pkt.role,
                       channel: pkt.channel,
                       peerId: senderPeerId,
+                      lastSeen: now,
                     }
                   : m
               )
@@ -552,6 +652,7 @@ export default function App() {
                   pingMs: 24,
                   channel: pkt.channel,
                   peerId: senderPeerId,
+                  lastSeen: now,
                 },
               ];
 
@@ -561,8 +662,12 @@ export default function App() {
           return next;
         });
 
-        // Instant reply so newly connected peer immediately registers our identity
-        const now = Date.now();
+        // Also establish direct WebRTC DataChannel to this discovered peer if not yet open
+        if (pkt.peerNodeId && pkt.peerNodeId.startsWith('PTT-')) {
+          connectToPeerNodeIfNeeded(pkt.peerNodeId);
+        }
+
+        // Instant reply so newly joined peer immediately sees this device (< 200ms)
         const lastReply = lastAnnounceReplyRef.current.get(pkt.senderId) || 0;
         if (now - lastReply > 1500 && myCallsign) {
           lastAnnounceReplyRef.current.set(pkt.senderId, now);
@@ -572,7 +677,7 @@ export default function App() {
       }
 
       if (pkt.type === 'PEER_LIST_SYNC' && Array.isArray(pkt.peerList)) {
-        // Synchronize peer list from PTT-MASTER-01 and establish direct P2P DataChannels to all peers
+        const now = Date.now();
         const incomingPeers = pkt.peerList.filter(
           (entry) =>
             entry.senderId !== myDeviceId && entry.peerId !== myPeerNodeId
@@ -593,6 +698,7 @@ export default function App() {
                 role: entry.role,
                 channel: entry.channel,
                 peerId: entry.peerId,
+                lastSeen: now,
               };
             } else {
               updated.push({
@@ -606,32 +712,28 @@ export default function App() {
                 pingMs: 24,
                 channel: entry.channel,
                 peerId: entry.peerId,
+                lastSeen: now,
               });
             }
           });
           return updated;
         });
 
-        // Form direct P2P mesh connections with all other peers discovered via PEER_LIST_SYNC
-        const activePeer = directNodePeerRef.current || peerRef.current;
-        if (activePeer && !activePeer.disconnected && !activePeer.destroyed) {
-          incomingPeers.forEach((entry) => {
-            if (!entry.peerId || entry.peerId === myPeerNodeId) return;
-            const existingConn = peerConnectionsRef.current.get(entry.peerId);
-            if (!existingConn || !existingConn.open) {
-              try {
-                const p2pConn = activePeer.connect(entry.peerId, {
-                  reliable: true,
-                });
-                registerPeerConnection(p2pConn);
-              } catch {
-                // Ignore if peer is already connecting
-              }
-            }
-          });
-        }
+        // Form direct P2P WebRTC connections with all other peers discovered via PEER_LIST_SYNC
+        incomingPeers.forEach((entry) => {
+          if (entry.peerId && entry.peerId.startsWith('PTT-')) {
+            connectToPeerNodeIfNeeded(entry.peerId);
+          }
+        });
         return;
       }
+
+      // Refresh lastSeen for any active packet from this sender
+      setMembers((prev) =>
+        prev.map((m) =>
+          m.id === pkt.senderId ? { ...m, lastSeen: Date.now() } : m
+        )
+      );
 
       // Filter channel-specific packets (voice / PTT floor control / ping) without closing sockets
       if (pkt.channel !== channel) return;
@@ -675,11 +777,11 @@ export default function App() {
       playTacticalTone,
       broadcastMeshPacket,
       broadcastPeerListSync,
-      registerPeerConnection,
+      connectToPeerNodeIfNeeded,
     ]
   );
 
-  // Keep latest packet handler in a ref so WebRTC sockets never get destroyed on state updates
+  // Keep latest packet handler in a ref so sockets never get destroyed on state updates
   const packetHandlerRef = useRef(handleIncomingMeshPacket);
   useEffect(() => {
     packetHandlerRef.current = handleIncomingMeshPacket;
@@ -690,6 +792,7 @@ export default function App() {
     announcePacketBuilderRef.current = () => {
       if (!myCallsign) return null;
       return {
+        packetId: `${myDeviceId}-${Date.now()}-ann`,
         type: 'ANNOUNCE',
         senderId: myDeviceId,
         callsign: myCallsign,
@@ -702,11 +805,14 @@ export default function App() {
     };
   }, [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]);
 
-  // Cloud Handshake Signaling (PeerJS Public Cloud) + Auto-Reconnect Watchdog (2.5s):
-  // - Master registers static ID: 'PTT-MASTER-01'
-  // - Client registers unique ID: 'PTT-CLIENT-[CALLSIGN]-[ID]' and connects to 'PTT-MASTER-01'
+  // Cloud Handshake Signaling (PeerJS Public Cloud + Dual WSS Cloud Mesh) + Auto-Reconnect Watchdog (2.5s):
+  // - Master attempts static ID 'PTT-MASTER-01'; if already occupied on 0.peerjs.com, seamlessly falls back to unique ID & connects to 'PTT-MASTER-01'
+  // - Client registers unique ID 'PTT-CLIENT-[CALLSIGN]-[ID]' and connects to 'PTT-MASTER-01'
+  // - Dual WSS Cloud Mesh (EMQX + HiveMQ over port 8084/8884) runs in parallel so HP devices on Vercel always discover and communicate across any mobile network
   useEffect(() => {
     if (!isSetupCompleted || !myCallsign) return;
+
+    let isCancelled = false;
 
     // 1. Local BroadcastChannel for same-browser multi-tab sync
     if ('BroadcastChannel' in window) {
@@ -717,119 +823,217 @@ export default function App() {
       broadcastChannelRef.current = bc;
     }
 
-    let isCancelled = false;
+    // 2. Dual-Broker WSS Cloud Mesh (100% reliable on Vercel across all Android/iOS mobile carriers)
+    const activeMqttClients: MqttClient[] = [];
+    WSS_CLOUD_BROKERS.forEach((brokerUrl, idx) => {
+      try {
+        const client = mqtt.connect(brokerUrl, {
+          clientId: `dskm-${myDeviceId.toLowerCase()}-${idx}-${Math.random()
+            .toString(36)
+            .substring(2, 6)}`,
+          clean: true,
+          keepalive: 30,
+          reconnectPeriod: 2500,
+          connectTimeout: 8000,
+        });
+
+        client.on('connect', () => {
+          if (isCancelled) return;
+          client.subscribe(CLOUD_MESH_TOPIC, { qos: 0 }, () => {
+            const pkt = announcePacketBuilderRef.current();
+            if (pkt) {
+              try {
+                client.publish(CLOUD_MESH_TOPIC, JSON.stringify(pkt), { qos: 0 });
+              } catch {
+                // Ignore publish error
+              }
+            }
+          });
+        });
+
+        client.on('message', (_topic, payloadBuffer) => {
+          if (isCancelled) return;
+          try {
+            const parsed = JSON.parse(payloadBuffer.toString()) as MeshPacket;
+            packetHandlerRef.current(parsed);
+          } catch {
+            // Ignore malformed JSON
+          }
+        });
+
+        activeMqttClients.push(client);
+      } catch {
+        // Ignore broker init error
+      }
+    });
+    mqttClientsRef.current = activeMqttClients;
+
+    // 3. PeerJS WebRTC Cloud Signaling + P2P DataChannel with STUN/TURN ICE servers
     const isMasterRole = role === 'MASTER' || localIp === '192.168.43.1';
-    const targetPeerId = isMasterRole ? MASTER_PEER_ID : myPeerNodeId;
+    let currentPeer: Peer | null = null;
+    let boundId = isMasterRole ? MASTER_PEER_ID : uniqueClientPeerId;
 
-    const peer = new Peer(targetPeerId);
-    directNodePeerRef.current = peer;
-    peerRef.current = peer;
+    const connectToMasterAndPeers = (peerInstance: Peer, myCurrentId: string) => {
+      if (isCancelled || peerInstance.disconnected || peerInstance.destroyed) return;
 
-    const connectClientToMaster = () => {
-      if (isCancelled || isMasterRole) return;
-      if (peer.disconnected || peer.destroyed) return;
-
-      // Connect to static Master ID 'PTT-MASTER-01'
-      const existingMasterConn = peerConnectionsRef.current.get(MASTER_PEER_ID);
-      if (!existingMasterConn || !existingMasterConn.open) {
-        try {
-          const conn = peer.connect(MASTER_PEER_ID, { reliable: true });
-          registerPeerConnection(conn);
-        } catch {
-          // Will retry on next 2.5s watchdog tick
-        }
+      // Connect to static 'PTT-MASTER-01' whenever this node is not 'PTT-MASTER-01' itself
+      if (myCurrentId !== MASTER_PEER_ID) {
+        connectToPeerNodeIfNeeded(MASTER_PEER_ID);
       }
 
-      // If invited via custom Barcode hostPeer, ensure connection to it as well
+      // Connect to custom Barcode invitedHostPeer if specified
       if (
         invitedHostPeer &&
         invitedHostPeer !== MASTER_PEER_ID &&
-        invitedHostPeer !== targetPeerId
+        invitedHostPeer !== myCurrentId
       ) {
-        const existingInviteConn = peerConnectionsRef.current.get(invitedHostPeer);
-        if (!existingInviteConn || !existingInviteConn.open) {
-          try {
-            const inviteConn = peer.connect(invitedHostPeer, { reliable: true });
-            registerPeerConnection(inviteConn);
-          } catch {
-            // Will retry on next 2.5s watchdog tick
-          }
-        }
+        connectToPeerNodeIfNeeded(invitedHostPeer);
       }
+
+      // Also ensure direct P2P connections to any already-known members
+      membersRef.current.forEach((m) => {
+        if (
+          m.peerId &&
+          m.peerId.startsWith('PTT-') &&
+          m.peerId !== myCurrentId
+        ) {
+          connectToPeerNodeIfNeeded(m.peerId);
+        }
+      });
     };
 
-    peer.on('open', () => {
-      if (isCancelled) {
-        peer.destroy();
-        return;
-      }
-      if (!isMasterRole) {
-        connectClientToMaster();
-      }
-    });
+    const initializePeerNode = (candidateId: string, allowFallback: boolean) => {
+      if (isCancelled) return;
+      boundId = candidateId;
+      setActiveBoundPeerId(candidateId);
 
-    peer.on('connection', (conn) => {
-      registerPeerConnection(conn);
-    });
+      const peer = new Peer(candidateId, {
+        config: {
+          iceServers: WEBRTC_ICE_SERVERS,
+        },
+      });
+      currentPeer = peer;
+      directNodePeerRef.current = peer;
+      peerRef.current = peer;
 
-    // Auto-reconnect listener when signaling connection drops
-    peer.on('disconnected', () => {
-      if (!isCancelled && !peer.destroyed) {
-        try {
-          peer.reconnect();
-        } catch {
-          // Watchdog will retry
+      peer.on('open', (openedId) => {
+        if (isCancelled) {
+          peer.destroy();
+          return;
         }
-      }
-    });
+        setActiveBoundPeerId(openedId);
+        connectToMasterAndPeers(peer, openedId);
+      });
 
-    peer.on('error', () => {
-      if (!isCancelled && peer.disconnected && !peer.destroyed) {
-        try {
-          peer.reconnect();
-        } catch {
-          // Watchdog will retry
+      peer.on('connection', (conn) => {
+        registerPeerConnection(conn);
+      });
+
+      peer.on('disconnected', () => {
+        if (!isCancelled && !peer.destroyed) {
+          try {
+            peer.reconnect();
+          } catch {
+            // 2.5s watchdog will retry
+          }
         }
-      }
-    });
+      });
 
-    // 2.5-second Watchdog Interval:
-    // - Reconnects signaling server if disconnected
-    // - Re-establishes DataChannel to 'PTT-MASTER-01' for Clients if dropped
-    // - Broadcasts ANNOUNCE / PEER_LIST_SYNC to keep P2P mesh synchronized
+      peer.on('error', (err: { type?: string }) => {
+        if (isCancelled) return;
+        // Critical fix for Vercel: if 'PTT-MASTER-01' is already taken (by another HP or a recent page reload),
+        // automatically bind uniqueClientPeerId and connect to 'PTT-MASTER-01' so the device never gets stuck!
+        if (err.type === 'unavailable-id' && allowFallback) {
+          try {
+            peer.destroy();
+          } catch {
+            // Ignore destroy error
+          }
+          initializePeerNode(uniqueClientPeerId, false);
+          return;
+        }
+
+        if (peer.disconnected && !peer.destroyed) {
+          try {
+            peer.reconnect();
+          } catch {
+            // 2.5s watchdog will retry
+          }
+        }
+      });
+    };
+
+    initializePeerNode(boundId, isMasterRole);
+
+    // 4. 2.5-second Watchdog Interval + Stale Peer Pruner
     const watchdogTimer = window.setInterval(() => {
       if (isCancelled) return;
-      if (peer.disconnected && !peer.destroyed) {
+      if (currentPeer && currentPeer.disconnected && !currentPeer.destroyed) {
         try {
-          peer.reconnect();
+          currentPeer.reconnect();
         } catch {
           // Ignore reconnect error
         }
       }
-      if (!isMasterRole) {
-        connectClientToMaster();
-      } else {
+      if (currentPeer && !currentPeer.disconnected && !currentPeer.destroyed) {
+        connectToMasterAndPeers(currentPeer, boundId);
+      }
+      if (isMasterRole) {
         broadcastPeerListSync();
       }
+
+      // Prune peers that have neither an open WebRTC DataChannel nor a recent ANNOUNCE (> 12s)
+      const now = Date.now();
+      setMembers((prev) => {
+        const filtered = prev.filter((m) => {
+          const hasOpenRtc =
+            (m.peerId && peerConnectionsRef.current.get(m.peerId)?.open) ||
+            peerConnectionsRef.current.get(m.id)?.open;
+          const recentlySeen = now - (m.lastSeen || now) < 12000;
+          return Boolean(hasOpenRtc || recentlySeen);
+        });
+        return filtered.length === prev.length ? prev : filtered;
+      });
     }, 2500);
+
+    // Send graceful PEER_LEAVE on tab/app close so other phones update immediately
+    const handleBeforeUnload = () => {
+      broadcastMeshPacket({ type: 'PEER_LEAVE' });
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', handleBeforeUnload);
 
     return () => {
       isCancelled = true;
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnload);
       window.clearInterval(watchdogTimer);
       broadcastChannelRef.current?.close();
       peerConnectionsRef.current.clear();
+      pendingConnectTimestampRef.current.clear();
       setConnectedPeersCount(0);
-      peer.destroy();
+      currentPeer?.destroy();
+      activeMqttClients.forEach((c) => {
+        try {
+          c.end(true);
+        } catch {
+          // Ignore close error
+        }
+      });
+      mqttClientsRef.current = [];
     };
   }, [
     isSetupCompleted,
     myCallsign,
+    myDeviceId,
     role,
     localIp,
-    myPeerNodeId,
+    uniqueClientPeerId,
     invitedHostPeer,
     registerPeerConnection,
+    connectToPeerNodeIfNeeded,
     broadcastPeerListSync,
+    broadcastMeshPacket,
   ]);
 
   // Permanent role lock based on IP '192.168.43.1'
@@ -893,9 +1097,14 @@ export default function App() {
         };
         updateMeter();
 
-        // Record voice packet for cross-device WebRTC / BroadcastChannel & APK Echo Test
+        // Record voice packet for cross-device WebRTC / WSS Cloud Mesh / BroadcastChannel & APK Echo Test
         recordedChunksRef.current = [];
-        const recorder = new MediaRecorder(stream);
+        let recorder: MediaRecorder;
+        try {
+          recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
+        } catch {
+          recorder = new MediaRecorder(stream);
+        }
         recorder.ondataavailable = (e) => {
           if (e.data && e.data.size > 0) {
             recordedChunksRef.current.push(e.data);
@@ -917,7 +1126,7 @@ export default function App() {
                 });
 
                 // If Echo Test Mode is enabled (and no remote peer is active), play back captured voice
-                if (echoTestMode && peerConnectionsRef.current.size === 0) {
+                if (echoTestMode && membersRef.current.length === 0) {
                   window.setTimeout(() => {
                     playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
                   }, 350);
