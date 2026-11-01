@@ -44,11 +44,20 @@ interface TacticalMember {
 }
 
 interface MeshPacket {
-  type: 'ANNOUNCE' | 'VOICE_CLIP' | 'PTT_START' | 'PTT_END' | 'PING' | 'PONG';
+  type:
+    | 'ANNOUNCE'
+    | 'VOICE_CLIP'
+    | 'PTT_START'
+    | 'PTT_END'
+    | 'TX_START'
+    | 'TX_STOP'
+    | 'PING'
+    | 'PONG';
   senderId: string;
   callsign: string;
   ip: string;
   role: 'MASTER' | 'CLIENT';
+  isMaster?: boolean;
   channel: number;
   timestamp: number;
   audioBase64?: string;
@@ -328,14 +337,48 @@ export default function App() {
     [soundEnabled]
   );
 
-  // Play incoming Base64 voice clip received from another device or loopback test
+  const activeAudioElementRef = useRef<HTMLAudioElement | null>(null);
+  const isTransmittingRef = useRef<boolean>(false);
+  useEffect(() => {
+    isTransmittingRef.current = isTransmitting;
+  }, [isTransmitting]);
+
+  // Helper to force-stop microphone recording (Strict Half-Duplex when switching to Rx)
+  const forceStopLocalRecording = useCallback(() => {
+    setIsTransmitting(false);
+    isTransmittingRef.current = false;
+    setMicLevel(0);
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {
+        // Ignore stop error
+      }
+    }
+  }, []);
+
+  // Play incoming Base64 voice clip received from another device or loopback test (Strict Half-Duplex Rx)
   const playIncomingAudioBase64 = useCallback(
     (base64Data: string, senderCallsign: string) => {
       if (!soundEnabled) return;
+      // Strict Half-Duplex: If local device is transmitting, do not play speaker audio unless forced into Rx
+      if (isTransmittingRef.current) return;
+
       playTacticalTone('rx');
       setIncomingSpeaker(senderCallsign);
 
+      if (activeAudioElementRef.current) {
+        activeAudioElementRef.current.pause();
+        activeAudioElementRef.current = null;
+      }
+
       const audio = new Audio(base64Data);
+      audio.volume = 1.0; // Strict Half-Duplex: Max volume on Rx
+      activeAudioElementRef.current = audio;
       audio.onended = () => {
         setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
         playTacticalTone('end');
@@ -360,6 +403,7 @@ export default function App() {
         callsign: myCallsign,
         ip: localIp,
         role,
+        isMaster: localIp === '192.168.43.1',
         channel,
         timestamp: Date.now(),
         peerNodeId: myPeerNodeId,
@@ -390,6 +434,9 @@ export default function App() {
       if (!pkt || pkt.senderId === myDeviceId || !pkt.callsign) return;
       // Filter by currentChannel without closing sockets
       if (pkt.channel !== channel) return;
+
+      const amIMaster = localIp === '192.168.43.1';
+      const senderIsMaster = pkt.ip === '192.168.43.1' || pkt.role === 'MASTER' || Boolean(pkt.isMaster);
 
       if (pkt.type === 'ANNOUNCE') {
         setMembers((prev) => {
@@ -435,12 +482,23 @@ export default function App() {
           lastAnnounceReplyRef.current.set(pkt.senderId, now);
           broadcastMeshPacket({ type: 'ANNOUNCE' });
         }
-      } else if (pkt.type === 'PTT_START') {
+      } else if (pkt.type === 'TX_START' || pkt.type === 'PTT_START') {
+        // MASTER OVERRIDE: If I am Master and currently transmitting, ignore Client TX_START
+        if (amIMaster && isTransmittingRef.current && !senderIsMaster) {
+          return;
+        }
+        // If Master overrides while this Client is transmitting, force-stop mic and switch to Rx
+        if (isTransmittingRef.current && (!amIMaster || senderIsMaster)) {
+          forceStopLocalRecording();
+        }
         setIncomingSpeaker(pkt.callsign);
         playTacticalTone('rx');
-      } else if (pkt.type === 'PTT_END') {
+      } else if (pkt.type === 'TX_STOP' || pkt.type === 'PTT_END') {
         setIncomingSpeaker((curr) => (curr === pkt.callsign ? null : curr));
       } else if (pkt.type === 'VOICE_CLIP' && pkt.audioBase64) {
+        if (amIMaster && isTransmittingRef.current && !senderIsMaster) {
+          return;
+        }
         playIncomingAudioBase64(pkt.audioBase64, pkt.callsign);
       } else if (pkt.type === 'PING') {
         broadcastMeshPacket({ type: 'PONG' });
@@ -450,7 +508,17 @@ export default function App() {
         setPingMs(rtt);
       }
     },
-    [myDeviceId, channel, pingMs, myCallsign, playIncomingAudioBase64, playTacticalTone, broadcastMeshPacket]
+    [
+      myDeviceId,
+      channel,
+      localIp,
+      pingMs,
+      myCallsign,
+      forceStopLocalRecording,
+      playIncomingAudioBase64,
+      playTacticalTone,
+      broadcastMeshPacket,
+    ]
   );
 
   // Keep latest packet handler in a ref so WebRTC sockets never get destroyed on state updates
@@ -613,13 +681,31 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [invitedHostPeer, myPeerNodeId, registerPeerConnection]);
 
+  // Permanent role lock based on IP '192.168.43.1'
+  const isMasterDevice = localIp === '192.168.43.1';
+  const permanentRoleLabel = isMasterDevice ? 'HP MASTER' : 'CLIENT';
+  // FLOOR CONTROL & MASTER OVERRIDE:
+  // Clients are locked out of PTT when someone else is transmitting.
+  // HP MASTER (192.168.43.1) is never locked and can override at any time.
+  const isPttLocked = !isMasterDevice && Boolean(incomingSpeaker);
+
   // Start Push-To-Talk (`onLongPress` / Hold) -> Captures real microphone audio
   const handlePttStart = async () => {
     if (isTransmitting) return;
+    if (isPttLocked) return;
+
+    // Strict Half-Duplex: Immediately mute (volume 0) and stop speaker playback before opening mic
+    if (activeAudioElementRef.current) {
+      activeAudioElementRef.current.volume = 0.0;
+      activeAudioElementRef.current.pause();
+      activeAudioElementRef.current = null;
+    }
+
     setIncomingSpeaker(null);
     setIsTransmitting(true);
+    isTransmittingRef.current = true;
     playTacticalTone('start');
-    broadcastMeshPacket({ type: 'PTT_START' });
+    broadcastMeshPacket({ type: 'TX_START' });
 
     try {
       if (!mediaStreamRef.current) {
@@ -708,6 +794,7 @@ export default function App() {
   const handlePttEnd = () => {
     if (!isTransmitting) return;
     setIsTransmitting(false);
+    isTransmittingRef.current = false;
     setMicLevel(0);
 
     if (animFrameRef.current) {
@@ -724,7 +811,7 @@ export default function App() {
     }
 
     playTacticalTone('end');
-    broadcastMeshPacket({ type: 'PTT_END' });
+    broadcastMeshPacket({ type: 'TX_STOP' });
   };
 
   // Toggle Native Browser/WebView FullScreen when clicking [FULL]
@@ -764,9 +851,6 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [isSetupCompleted, myCallsign, broadcastMeshPacket]);
 
-  // Permanent role lock based on IP '192.168.43.1'
-  const isMasterDevice = localIp === '192.168.43.1';
-  const permanentRoleLabel = isMasterDevice ? 'HP MASTER' : 'CLIENT';
 
   const handleSetupConnect = (e: React.FormEvent) => {
     e.preventDefault();
@@ -1632,21 +1716,24 @@ export default function App() {
             {/* Tombol Lingkaran Raksasa PTT (Push-To-Talk & Hold) */}
             <button
               type="button"
-              onMouseDown={handlePttStart}
-              onMouseUp={handlePttEnd}
-              onMouseLeave={handlePttEnd}
+              disabled={isPttLocked}
+              onMouseDown={isPttLocked ? undefined : handlePttStart}
+              onMouseUp={isPttLocked ? undefined : handlePttEnd}
+              onMouseLeave={isPttLocked ? undefined : handlePttEnd}
               onTouchStart={(e) => {
                 e.preventDefault();
-                handlePttStart();
+                if (!isPttLocked) handlePttStart();
               }}
               onTouchEnd={(e) => {
                 e.preventDefault();
-                handlePttEnd();
+                if (!isPttLocked) handlePttEnd();
               }}
-              className={`relative w-48 h-48 sm:w-52 sm:h-52 rounded-full border-[3px] flex items-center justify-center transition-transform duration-150 cursor-pointer select-none ${
-                isTransmitting
-                  ? 'ptt-ring-active border-white scale-[0.97]'
-                  : 'ptt-ring-outer border-[#2fe0ff] active:scale-95'
+              className={`relative w-48 h-48 sm:w-52 sm:h-52 rounded-full border-[3px] flex items-center justify-center transition-transform duration-150 select-none ${
+                isPttLocked
+                  ? 'bg-[#1a1318] border-red-500/80 opacity-85 cursor-not-allowed'
+                  : isTransmitting
+                  ? 'ptt-ring-active border-white scale-[0.97] cursor-pointer'
+                  : 'ptt-ring-outer border-[#2fe0ff] active:scale-95 cursor-pointer'
               }`}
             >
               {/* Teks Melingkar "PUSH TO TALK & HOLD" */}
@@ -1673,24 +1760,32 @@ export default function App() {
               {/* Lingkaran Dalam Tombol PTT */}
               <div
                 className={`w-32 h-32 sm:w-36 sm:h-36 rounded-full border-2 flex flex-col items-center justify-center px-3 text-center transition-all ${
-                  isTransmitting
+                  isPttLocked
+                    ? 'bg-gradient-to-b from-[#3d121d] to-[#1c080d] border-red-400/80'
+                    : isTransmitting
                     ? 'bg-gradient-to-b from-[#33e6ff] to-[#066c96] border-white shadow-inner'
                     : 'bg-gradient-to-b from-[#178bbf] via-[#0a4c73] to-[#052942] border-[#6beaff]/65 shadow-[inset_0_3px_10px_rgba(255,255,255,0.25)]'
                 }`}
               >
                 <Radio
                   className={`w-10 h-10 sm:w-11 sm:h-11 mb-1 ${
-                    isTransmitting
+                    isPttLocked
+                      ? 'text-red-300 animate-pulse'
+                      : isTransmitting
                       ? 'text-[#021b30] animate-pulse'
                       : 'text-[#03233b]'
                   }`}
                 />
-                <span className="font-tactical text-[15px] sm:text-[16px] font-extrabold tracking-wider text-white drop-shadow">
+                <span className="font-tactical text-[13px] sm:text-[15px] font-extrabold tracking-wider text-white drop-shadow leading-tight">
                   {isTransmitting
                     ? 'TRANSMITTING'
                     : incomingSpeaker
-                    ? `RX: ${incomingSpeaker}`
-                    : 'MASTER READY'}
+                    ? isPttLocked
+                      ? `LOCKED • RX ${incomingSpeaker}`
+                      : `OVERRIDE READY`
+                    : isMasterDevice
+                    ? 'MASTER READY'
+                    : 'CLIENT READY'}
                 </span>
               </div>
             </button>
@@ -1715,27 +1810,36 @@ export default function App() {
             </div>
           </section>
 
-          {/* BANNER STATUS BAWAH ("MASTER READY") */}
+          {/* BANNER STATUS BAWAH ("MASTER READY" / "RECEIVING FROM [NAMA]") */}
           <button
             type="button"
-            onMouseDown={handlePttStart}
-            onMouseUp={handlePttEnd}
-            onMouseLeave={handlePttEnd}
+            disabled={isPttLocked}
+            onMouseDown={isPttLocked ? undefined : handlePttStart}
+            onMouseUp={isPttLocked ? undefined : handlePttEnd}
+            onMouseLeave={isPttLocked ? undefined : handlePttEnd}
             onTouchStart={(e) => {
               e.preventDefault();
-              handlePttStart();
+              if (!isPttLocked) handlePttStart();
             }}
             onTouchEnd={(e) => {
               e.preventDefault();
-              handlePttEnd();
+              if (!isPttLocked) handlePttEnd();
             }}
-            className="w-full py-3 rounded-2xl cyan-btn-glow font-tactical text-[19px] font-extrabold tracking-[0.08em] text-white text-center shadow-[0_0_25px_rgba(35,220,255,0.45)] cursor-pointer"
+            className={`w-full py-3 rounded-2xl font-tactical text-[19px] font-extrabold tracking-[0.08em] text-white text-center transition-all ${
+              isPttLocked
+                ? 'bg-red-950/90 border-2 border-red-400/80 text-red-100 cursor-not-allowed'
+                : 'cyan-btn-glow shadow-[0_0_25px_rgba(35,220,255,0.45)] cursor-pointer'
+            }`}
           >
             {isTransmitting
               ? 'TRANSMITTING VOICE STREAM...'
               : incomingSpeaker
-              ? `RECEIVING VOICE: ${incomingSpeaker}`
-              : 'MASTER READY'}
+              ? isMasterDevice
+                ? `RECEIVING FROM ${incomingSpeaker} (TEKAN UNTUK OVERRIDE)`
+                : `RECEIVING FROM ${incomingSpeaker} (PTT LOCKED)`
+              : isMasterDevice
+              ? 'MASTER READY'
+              : 'CLIENT READY'}
           </button>
         </div>
 

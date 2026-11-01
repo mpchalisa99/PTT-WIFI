@@ -29,7 +29,14 @@ void main() async {
   final audioService = AudioService();
   final udpNetworkService = UdpNetworkService();
 
-  // Hubungkan paket suara PCM yang masuk dari UDP Port 50001 ke AudioService
+  // Hubungkan Floor Control & Strict Half-Duplex antara UdpNetworkService dan AudioService:
+  // 1) Saat menerima paket TX_START dari peer lain (atau terkena Master Override),
+  //    paksa matikan Mic (stopRecording) dan kembalikan volume speaker ke 1.0 (Max).
+  udpNetworkService.onEnterReceiveMode = () async {
+    await audioService.enterReceiveMode();
+  };
+
+  // 2) Saat menerima paket suara PCM dari UDP Port 50001, putar hanya jika tidak sedang Tx
   udpNetworkService.onAudioPacketReceived = (Uint8List pcmBytes, String senderIp) {
     audioService.playAudioChunk(pcmBytes);
   };
@@ -58,6 +65,7 @@ class PeerMember {
   final String ipAddress;
   final int channel;
   bool isTargeted;
+  bool isTransmitting;
   DateTime lastSeen;
   int lastPingMs;
 
@@ -67,6 +75,7 @@ class PeerMember {
     required this.ipAddress,
     required this.channel,
     this.isTargeted = true,
+    this.isTransmitting = false,
     this.lastPingMs = 18,
     DateTime? lastSeen,
   }) : lastSeen = lastSeen ?? DateTime.now();
@@ -79,6 +88,7 @@ class PeerMember {
       ipAddress: (json['ip'] ?? '0.0.0.0').toString(),
       channel: (json['ch'] as num?)?.toInt() ?? 12,
       isTargeted: json['isTargeted'] as bool? ?? true,
+      isTransmitting: json['tx'] as bool? ?? false,
       lastPingMs: (json['ping'] as num?)?.toInt() ?? 18,
       lastSeen: DateTime.now(),
     );
@@ -90,15 +100,17 @@ class PeerMember {
         'ip': ipAddress,
         'ch': channel,
         'isTargeted': isTargeted,
+        'tx': isTransmitting,
         'ping': lastPingMs,
       };
 }
 
 /// ============================================================================
 /// 3. UDP NETWORK SERVICE
+/// - Floor Control (TX_START & TX_STOP) via Port 50000 (Anti-Crowded)
+/// - Master Override: HP MASTER (192.168.43.1) selalu bisa mengambil alih jalur bicara
 /// - Tanpa Re-bind saat pindah channel (Socket tetap terbuka & stabil)
 /// - Auto-Discovery Broadcast konstan setiap 1 detik (Port 50000)
-/// - Identitas Permanen: IP '192.168.43.1' = HP MASTER, selain itu = CLIENT
 /// - Real Peers Only (Tidak ada data anggota palsu/simulasi)
 /// ============================================================================
 class UdpNetworkService extends ChangeNotifier {
@@ -110,6 +122,7 @@ class UdpNetworkService extends ChangeNotifier {
   UDP? _audioSocket;
   Timer? _heartbeatTimer;
   Timer? _pruneTimer;
+  Timer? _floorWatchdogTimer;
 
   bool _isInitialized = false;
   String _localIp = '0.0.0.0';
@@ -123,11 +136,18 @@ class UdpNetworkService extends ChangeNotifier {
   int _pingDeltaMs = 2;
   int _txSequence = 0;
 
+  /// State Floor Control (Hak Bicara / Anti-Crowded)
+  String? _activeSpeakerIp;
+  String? _activeSpeakerCallsign;
+  bool _activeSpeakerIsMaster = false;
+  DateTime? _lastTxPacketTime;
+
   /// Map murni berisi perangkat nyata yang aktif di jaringan Hotspot (key: IP)
   final Map<String, PeerMember> _peers = {};
 
-  /// Callback saat paket suara PCM diterima dari jaringan
+  /// Callback ke AudioService saat paket PCM diterima atau saat dipaksa masuk mode Rx
   void Function(Uint8List pcmBytes, String senderIp)? onAudioPacketReceived;
+  Future<void> Function()? onEnterReceiveMode;
 
   bool get isInitialized => _isInitialized;
   String get localIp => _localIp;
@@ -140,6 +160,19 @@ class UdpNetworkService extends ChangeNotifier {
   int get lastPingMs => _lastPingMs;
   int get pingDeltaMs => _pingDeltaMs;
   bool get isHighLatency => _lastPingMs > 150;
+
+  /// Informasi siapa yang sedang memegang Floor Control (Hak Bicara) di channel ini
+  String? get activeSpeakerIp => _activeSpeakerIp;
+  String? get activeSpeakerCallsign => _activeSpeakerCallsign;
+  bool get isReceiving =>
+      !_isTransmitting && _activeSpeakerIp != null && _activeSpeakerIp != _localIp;
+
+  /// ATURAN FLOOR CONTROL & MASTER OVERRIDE:
+  /// - Jika ada user lain yang sedang bicara (`isReceiving == true`):
+  ///   * Klien biasa (`!_isMaster`) DIKUNCI tombol PTT-nya (`isPttLocked == true`).
+  ///   * HP MASTER (`_isMaster == true`, IP 192.168.43.1) TIDAK DIKUNCI (`isPttLocked == false`)
+  ///     karena memiliki hak MASTER OVERRIDE untuk mengambil alih jalur bicara kapan saja.
+  bool get isPttLocked => isReceiving && !_isMaster;
 
   /// Hanya mengembalikan daftar klien nyata yang aktif pada channel saat ini
   List<PeerMember> get activeChannelPeers => _peers.values
@@ -162,7 +195,6 @@ class UdpNetworkService extends ChangeNotifier {
   Future<void> initialize() async {
     await _detectLocalHotspotIp();
 
-    // Cegah re-bind jika socket sudah terbuka agar koneksi selalu stabil
     if (_discoverySocket == null) {
       await _bindDiscoverySocket();
     }
@@ -177,11 +209,14 @@ class UdpNetworkService extends ChangeNotifier {
       (_) => _sendDiscoveryAnnouncement(),
     );
 
-    // Bersihkan peer yang tidak mengirim heartbeat > 5 detik (putus WiFi)
+    // Bersihkan peer yang putus WiFi (> 5 detik) & reset Floor Control jika paket TX_STOP hilang
     _pruneTimer?.cancel();
     _pruneTimer = Timer.periodic(
-      const Duration(seconds: 2),
-      (_) => _pruneStalePeers(),
+      const Duration(seconds: 1),
+      (_) {
+        _pruneStalePeers();
+        _checkFloorControlTimeout();
+      },
     );
 
     _isInitialized = true;
@@ -197,7 +232,6 @@ class UdpNetworkService extends ChangeNotifier {
       final info = NetworkInfo();
       detectedIp = await info.getWifiIP();
 
-      // Cek seluruh NetworkInterface untuk mendeteksi interface Hotspot (ap0/wlan0)
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLoopback: false,
@@ -228,7 +262,7 @@ class UdpNetworkService extends ChangeNotifier {
     _isMaster = (_localIp == masterHotspotIp);
   }
 
-  /// Buka socket UDP Port 50000 sekali saja selama aplikasi berjalan
+  /// Buka socket UDP Port 50000 sekali saja & tangani ANNOUNCE, TX_START, TX_STOP, PING, PONG
   Future<void> _bindDiscoverySocket() async {
     try {
       _discoverySocket = await UDP.bind(Endpoint.any(port: const Port(discoveryPort)));
@@ -243,9 +277,10 @@ class UdpNetworkService extends ChangeNotifier {
         try {
           final Map<String, dynamic> data = jsonDecode(utf8.decode(datagram.data));
           final String type = (data['type'] ?? '').toString();
+          final int packetCh = (data['ch'] as num?)?.toInt() ?? _currentChannel;
 
           if (type == 'ANNOUNCE') {
-            data['ip'] = senderIp; // Gunakan IP sumber asli dari datagram UDP
+            data['ip'] = senderIp;
             final incoming = PeerMember.fromJson(data);
             final existing = _peers[senderIp];
             if (existing != null) {
@@ -253,6 +288,44 @@ class UdpNetworkService extends ChangeNotifier {
               incoming.lastPingMs = existing.lastPingMs;
             }
             _peers[senderIp] = incoming;
+
+            // Sinkronisasi Floor Control jika pengirim sedang transmit di channel yang sama
+            if (packetCh == _currentChannel && incoming.isTransmitting) {
+              _handleIncomingTxStart(
+                senderIp: senderIp,
+                senderCallsign: incoming.callsign,
+                senderIsMaster: senderIp == masterHotspotIp || (data['isMaster'] == true),
+              );
+            }
+            notifyListeners();
+          } else if (type == 'TX_START') {
+            // Abaikan jika paket TX_START berasal dari channel berbeda
+            if (packetCh != _currentChannel) return;
+
+            final String speakerCallsign =
+                (data['callsign'] ?? _peers[senderIp]?.callsign ?? senderIp)
+                    .toString()
+                    .toUpperCase();
+            final bool senderIsMaster =
+                senderIp == masterHotspotIp || (data['isMaster'] == true);
+
+            _handleIncomingTxStart(
+              senderIp: senderIp,
+              senderCallsign: speakerCallsign,
+              senderIsMaster: senderIsMaster,
+            );
+          } else if (type == 'TX_STOP') {
+            if (packetCh != _currentChannel) return;
+
+            if (_peers.containsKey(senderIp)) {
+              _peers[senderIp]!.isTransmitting = false;
+            }
+            if (_activeSpeakerIp == senderIp) {
+              _activeSpeakerIp = null;
+              _activeSpeakerCallsign = null;
+              _activeSpeakerIsMaster = false;
+              _lastTxPacketTime = null;
+            }
             notifyListeners();
           } else if (type == 'PING') {
             _sendPong(senderIp, (data['ts'] as num).toInt());
@@ -275,6 +348,87 @@ class UdpNetworkService extends ChangeNotifier {
     }
   }
 
+  /// Proses paket `TX_START` (Floor Control & Master Override)
+  void _handleIncomingTxStart({
+    required String senderIp,
+    required String senderCallsign,
+    required bool senderIsMaster,
+  }) {
+    if (_peers.containsKey(senderIp)) {
+      _peers[senderIp]!.isTransmitting = true;
+      _peers[senderIp]!.lastSeen = DateTime.now();
+    }
+
+    // Jika perangkat ini adalah HP MASTER dan sedang berbicara, klien biasa tidak boleh memotong
+    if (_isMaster && _isTransmitting && !senderIsMaster) {
+      return;
+    }
+
+    // Jika perangkat ini (CLIENT) sedang berbicara lalu HP MASTER menekan PTT (MASTER OVERRIDE),
+    // atau jika klien lain sudah lebih dulu memegang Floor Control:
+    // Hentikan paksa rekaman Mic lokal (Strict Half-Duplex) dan pindah ke mode Receiving!
+    if (_isTransmitting && (senderIsMaster || !_isMaster)) {
+      _isTransmitting = false;
+      onEnterReceiveMode?.call();
+    } else if (!_isTransmitting) {
+      // Pastikan AudioService berada di mode Receive (Mic Off, Speaker Volume = 1.0 Max)
+      onEnterReceiveMode?.call();
+    }
+
+    _activeSpeakerIp = senderIp;
+    _activeSpeakerCallsign = senderCallsign;
+    _activeSpeakerIsMaster = senderIsMaster;
+    _lastTxPacketTime = DateTime.now();
+    notifyListeners();
+  }
+
+  /// Kirim sinyal Floor Control `TX_START` atau `TX_STOP` via port UDP Discovery (50000)
+  Future<void> _sendFloorControlSignal(String signalType) async {
+    if (_discoverySocket == null) return;
+
+    final payload = utf8.encode(
+      jsonEncode({
+        'type': signalType, // 'TX_START' atau 'TX_STOP'
+        'ip': _localIp,
+        'callsign': _myCallsign,
+        'ch': _currentChannel,
+        'isMaster': _isMaster,
+        'ts': DateTime.now().millisecondsSinceEpoch,
+      }),
+    );
+
+    final parts = _localIp.split('.');
+    final subnetBroadcast = parts.length == 4
+        ? '${parts[0]}.${parts[1]}.${parts[2]}.255'
+        : '192.168.43.255';
+
+    try {
+      // Kirim ke Subnet Broadcast & Global Broadcast
+      await _discoverySocket!.send(
+        payload,
+        Endpoint.unicast(
+          InternetAddress(subnetBroadcast),
+          port: const Port(discoveryPort),
+        ),
+      );
+      await _discoverySocket!.send(
+        payload,
+        Endpoint.broadcast(port: const Port(discoveryPort)),
+      );
+
+      // Kirim Unicast langsung ke setiap peer aktif di channel ini agar bebas packet loss
+      for (final peer in activeChannelPeers) {
+        await _discoverySocket!.send(
+          payload,
+          Endpoint.unicast(
+            InternetAddress(peer.ipAddress),
+            port: const Port(discoveryPort),
+          ),
+        );
+      }
+    } catch (_) {}
+  }
+
   /// Kirim paket ANNOUNCE setiap 1 detik ke Broadcast Subnet & Global Broadcast
   Future<void> _sendDiscoveryAnnouncement() async {
     if (_discoverySocket == null || _myCallsign.isEmpty) return;
@@ -286,6 +440,8 @@ class UdpNetworkService extends ChangeNotifier {
         'callsign': _myCallsign,
         'ip': _localIp,
         'ch': _currentChannel,
+        'tx': _isTransmitting,
+        'isMaster': _isMaster,
         'ping': _lastPingMs,
       }),
     );
@@ -322,21 +478,77 @@ class UdpNetworkService extends ChangeNotifier {
 
         final bytes = datagram.data;
         final int packetChannel = bytes[0];
+        final int flags = bytes[1];
+        final bool packetFromMaster = (flags & 1) != 0;
 
         // Filter channel di level aplikasi tanpa menutup/re-bind socket UDP
         if (packetChannel != _currentChannel) return;
 
+        // Jika pengirim adalah HP MASTER (Override) saat klien ini sedang Tx, hentikan Tx klien!
+        if (_isTransmitting && packetFromMaster && !_isMaster) {
+          _isTransmitting = false;
+          onEnterReceiveMode?.call();
+        }
+
+        // Strict Half-Duplex: Jangan putar audio masuk jika perangkat ini sedang Transmitting
+        if (_isTransmitting) return;
+
+        // Perbarui indikator Floor Control aktif dari paket suara yang mengalir
+        _activeSpeakerIp = senderIp;
+        _activeSpeakerCallsign =
+            _peers[senderIp]?.callsign ?? (packetFromMaster ? 'MASTER' : senderIp);
+        _activeSpeakerIsMaster = packetFromMaster;
+        _lastTxPacketTime = DateTime.now();
+
         final pcmPayload = Uint8List.sublistView(bytes, 6);
         onAudioPacketReceived?.call(pcmPayload, senderIp);
+        notifyListeners();
       });
     } catch (e) {
       debugPrint('Gagal bind audio socket port $audioPort: $e');
     }
   }
 
+  /// Mulai bicara (Push-To-Talk Ditekan):
+  /// - Cek apakah Floor Control sedang dikunci (`isPttLocked`).
+  /// - Jika HP MASTER, diizinkan melakukan Override meskipun ada klien yang sedang bicara.
+  /// - Kirim paket `TX_START` ke seluruh anggota channel.
+  Future<bool> startTransmitting() async {
+    if (isPttLocked) {
+      return false; // Ditolak karena anggota lain sedang bicara & perangkat ini bukan Master
+    }
+
+    // Jika HP MASTER melakukan Override saat klien lain sedang bicara, ambil alih Floor Control
+    _activeSpeakerIp = _localIp;
+    _activeSpeakerCallsign = _myCallsign;
+    _activeSpeakerIsMaster = _isMaster;
+    _isTransmitting = true;
+    notifyListeners();
+
+    await _sendFloorControlSignal('TX_START');
+    await _sendDiscoveryAnnouncement();
+    return true;
+  }
+
+  /// Berhenti bicara (Push-To-Talk Dilepas):
+  /// - Kirim paket `TX_STOP` agar kunci PTT terbuka kembali untuk seluruh anggota.
+  Future<void> stopTransmitting() async {
+    if (!_isTransmitting) return;
+    _isTransmitting = false;
+    if (_activeSpeakerIp == _localIp) {
+      _activeSpeakerIp = null;
+      _activeSpeakerCallsign = null;
+      _activeSpeakerIsMaster = false;
+    }
+    notifyListeners();
+
+    await _sendFloorControlSignal('TX_STOP');
+    await _sendDiscoveryAnnouncement();
+  }
+
   /// Mengirim potongan suara PCM mentah dengan header 6-byte (Byte 0 = _currentChannel)
   Future<void> sendRawAudioChunk(Uint8List pcmChunk) async {
-    if (_audioSocket == null || pcmChunk.isEmpty) return;
+    if (_audioSocket == null || !_isTransmitting || pcmChunk.isEmpty) return;
 
     _txSequence = (_txSequence + 1) & 0xFFFF;
 
@@ -405,18 +617,49 @@ class UdpNetworkService extends ChangeNotifier {
   void _pruneStalePeers() {
     final now = DateTime.now();
     final beforeCount = _peers.length;
-    _peers.removeWhere((_, peer) => now.difference(peer.lastSeen).inSeconds > 5);
+    _peers.removeWhere((ip, peer) {
+      final isStale = now.difference(peer.lastSeen).inSeconds > 5;
+      if (isStale && _activeSpeakerIp == ip) {
+        _activeSpeakerIp = null;
+        _activeSpeakerCallsign = null;
+        _activeSpeakerIsMaster = false;
+      }
+      return isStale;
+    });
     if (_peers.length != beforeCount) {
       notifyListeners();
     }
   }
 
+  /// Watchdog: Jika paket UDP `TX_STOP` hilang di udara selama > 3 detik tanpa ada paket audio baru,
+  /// otomatis buka kembali kunci Floor Control agar channel tidak macet terkunci.
+  void _checkFloorControlTimeout() {
+    if (_activeSpeakerIp != null &&
+        _activeSpeakerIp != _localIp &&
+        _lastTxPacketTime != null) {
+      if (DateTime.now().difference(_lastTxPacketTime!).inSeconds > 3) {
+        final peer = _peers[_activeSpeakerIp!];
+        if (peer != null) peer.isTransmitting = false;
+        _activeSpeakerIp = null;
+        _activeSpeakerCallsign = null;
+        _activeSpeakerIsMaster = false;
+        _lastTxPacketTime = null;
+        notifyListeners();
+      }
+    }
+  }
+
   /// Pindah channel dengan aman: TIDAK menutup/re-bind socket UDP!
-  /// Hanya memperbarui `_currentChannel` dan langsung mengumumkan via Broadcast.
   void setChannel(int newChannel) {
     final nextChannel = newChannel.clamp(1, 99);
     if (_currentChannel == nextChannel) return;
+    if (_isTransmitting) {
+      stopTransmitting();
+    }
     _currentChannel = nextChannel;
+    _activeSpeakerIp = null;
+    _activeSpeakerCallsign = null;
+    _activeSpeakerIsMaster = false;
     _sendDiscoveryAnnouncement();
     notifyListeners();
   }
@@ -448,19 +691,9 @@ class UdpNetworkService extends ChangeNotifier {
     }
   }
 
-  void setTransmitting(bool value) {
-    if (_isTransmitting == value) return;
-    _isTransmitting = value;
-    _sendDiscoveryAnnouncement();
-    notifyListeners();
-  }
-
-  /// Menghasilkan Link Invite Barcode yang berisi IP Host, Channel Aktif, dan Callsign
   String get inviteLink =>
       'diskomlekau://join?ip=$_localIp&ch=$_currentChannel&host=${Uri.encodeComponent(_myCallsign)}';
 
-  /// Memproses Link Invite Barcode yang ditempel/di-scan dari perangkat lain
-  /// lalu otomatis menyamakan channel dan mengirim paket ANNOUNCE Unicast langsung ke IP Host
   Future<bool> joinViaInviteLink(String rawInput) async {
     final trimmed = rawInput.trim();
     if (trimmed.isEmpty) return false;
@@ -499,34 +732,12 @@ class UdpNetworkService extends ChangeNotifier {
           lastPingMs: 18,
           lastSeen: DateTime.now(),
         );
-
-        // Kirim paket ANNOUNCE langsung (Unicast) ke IP Host dari link invite
-        if (_discoverySocket != null && _myCallsign.isNotEmpty) {
-          final bytes = utf8.encode(
-            jsonEncode({
-              'type': 'ANNOUNCE',
-              'id': _deviceId,
-              'callsign': _myCallsign,
-              'ip': _localIp,
-              'ch': _currentChannel,
-              'ping': _lastPingMs,
-            }),
-          );
-          await _discoverySocket!.send(
-            bytes,
-            Endpoint.unicast(
-              InternetAddress(targetIp),
-              port: const Port(discoveryPort),
-            ),
-          );
-        }
       }
 
       await _sendDiscoveryAnnouncement();
       notifyListeners();
       return true;
-    } catch (e) {
-      debugPrint('Format link invite tidak valid: $e');
+    } catch (_) {
       return false;
     }
   }
@@ -535,6 +746,7 @@ class UdpNetworkService extends ChangeNotifier {
   void dispose() {
     _heartbeatTimer?.cancel();
     _pruneTimer?.cancel();
+    _floorWatchdogTimer?.cancel();
     _discoverySocket?.close();
     _audioSocket?.close();
     super.dispose();
@@ -542,7 +754,10 @@ class UdpNetworkService extends ChangeNotifier {
 }
 
 /// ============================================================================
-/// 4. AUDIO SERVICE (Raw PCM 16-bit 16kHz Mono Streaming & Playback)
+/// 4. AUDIO SERVICE - STRICT HALF-DUPLEX (ANTI-ECHO)
+/// - Saat Transmitting (Tx): Volume AudioPlayer = 0.0 (Mute) & mulai Record Mic.
+/// - Saat Receiving (Rx): Hentikan paksa Record Mic (Mic Off) & Volume AudioPlayer = 1.0 (Max).
+/// - RecordConfig menggunakan echoCancel: true, noiseSuppress: true, autoGain: true.
 /// ============================================================================
 class AudioService {
   final AudioRecorder _recorder = AudioRecorder();
@@ -550,6 +765,7 @@ class AudioService {
 
   StreamSubscription<Uint8List>? _recordingSubscription;
   bool _isRecording = false;
+  bool _isTxMuted = false;
 
   static const int sampleRate = 16000;
   static const int numChannels = 1;
@@ -562,11 +778,23 @@ class AudioService {
   AudioService() {
     _player.setReleaseMode(ReleaseMode.stop);
     _player.setPlayerMode(PlayerMode.lowLatency);
+    _player.setVolume(1.0);
   }
 
-  /// Mulai menangkap suara dari microphone (Raw PCM 16-bit Mono 16000Hz)
+  /// MODE TRANSMIT (Tx) - STRICT HALF-DUPLEX:
+  /// 1. Mute speaker (`_player.setVolume(0.0)`) & hentikan pemutaran agar suara speaker
+  ///    tidak bocor masuk ke microphone (Anti-Echo).
+  /// 2. Aktifkan perekaman microphone dengan `echoCancel`, `noiseSuppress`, dan `autoGain`.
   Future<void> startRecording(void Function(Uint8List chunk) onAudioChunk) async {
     if (_isRecording) return;
+
+    // 1. Strict Half-Duplex: Mute AudioPlayer ke 0 & bersihkan buffer playback
+    _isTxMuted = true;
+    _playbackBuffer.clear();
+    try {
+      await _player.setVolume(0.0);
+      await _player.stop();
+    } catch (_) {}
 
     final hasPerm = await _recorder.hasPermission();
     if (!hasPerm) {
@@ -577,14 +805,15 @@ class AudioService {
     _isRecording = true;
     final List<int> accumulator = [];
 
+    // 2. Jalankan stream rekaman dengan DSP Anti-Echo & Noise Suppression aktif
     final Stream<Uint8List> micStream = await _recorder.startStream(
       const RecordConfig(
         encoder: AudioEncoder.pcm16bits,
         sampleRate: sampleRate,
         numChannels: numChannels,
-        autoGain: true,
         echoCancel: true,
         noiseSuppress: true,
+        autoGain: true,
       ),
     );
 
@@ -605,20 +834,43 @@ class AudioService {
     );
   }
 
-  /// Hentikan perekaman microphone saat tombol PTT dilepas
+  /// Hentikan perekaman microphone & kembalikan ke mode Receive (Speaker Volume = 1.0 Max)
   Future<void> stopRecording() async {
     _isRecording = false;
     await _recordingSubscription?.cancel();
     _recordingSubscription = null;
 
-    if (await _recorder.isRecording()) {
-      await _recorder.stop();
+    try {
+      if (await _recorder.isRecording()) {
+        await _recorder.stop();
+      }
+    } catch (_) {}
+
+    // Kembalikan volume AudioPlayer ke 1.0 (Max) agar siap menerima suara masuk
+    _isTxMuted = false;
+    try {
+      await _player.setVolume(1.0);
+    } catch (_) {}
+  }
+
+  /// MODE RECEIVE (Rx) - STRICT HALF-DUPLEX:
+  /// Dipanggil otomatis saat menerima `TX_START` dari anggota lain atau saat terkena Master Override.
+  /// Menghentikan paksa `record` (Mic Off) dan mengembalikan volume `audioplayers` ke 1.0 (Max).
+  Future<void> enterReceiveMode() async {
+    if (_isRecording) {
+      await stopRecording();
+    } else {
+      _isTxMuted = false;
+      try {
+        await _player.setVolume(1.0);
+      } catch (_) {}
     }
   }
 
   /// Memutar data PCM mentah dari paket UDP menggunakan in-memory WAV header
+  /// Hanya memutar apabila tidak sedang dalam mode Transmitting (`!_isRecording && !_isTxMuted`).
   Future<void> playAudioChunk(Uint8List pcmBytes) async {
-    if (pcmBytes.isEmpty || _isRecording) return;
+    if (pcmBytes.isEmpty || _isRecording || _isTxMuted) return;
 
     _playbackBuffer.add(pcmBytes);
 
@@ -628,6 +880,7 @@ class AudioService {
 
     _isPlayingChunk = true;
     try {
+      await _player.setVolume(1.0);
       final rawPcm = _playbackBuffer.takeBytes();
       final wavBytes = _addWavHeader(rawPcm);
       await _player.play(BytesSource(wavBytes));
@@ -1147,8 +1400,6 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
 
   @override
   Widget build(BuildContext context) {
-    // Consumer<UdpNetworkService> memastikan seluruh UI me-refresh otomatis
-    // saat ada klien baru yang terdeteksi dari broadcast UDP setiap 1 detik.
     return Consumer<UdpNetworkService>(
       builder: (context, net, _) {
         final audioService = context.read<AudioService>();
@@ -1193,15 +1444,15 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                           _buildChannelCard(context, net, activeCount),
                           const SizedBox(height: 14),
 
-                          // 4. GRIDVIEW ANGGOTA (HANYA REAL PEERS DARI UDP BROADCAST)
+                          // 4. GRIDVIEW ANGGOTA (REAL PEERS + INDIKATOR TX/RX)
                           _buildMemberGridSection(context, net, realPeers),
                           const SizedBox(height: 18),
 
-                          // 5. TOMBOL PTT RAKSASA DI TENGAH BAWAH
-                          _buildGiantPttButton(net, audioService),
+                          // 5. TOMBOL PTT RAKSASA (FLOOR CONTROL + MASTER OVERRIDE + HALF-DUPLEX)
+                          _buildGiantPttButton(context, net, audioService),
                           const SizedBox(height: 16),
 
-                          // Banner Status Bawah
+                          // Banner Status Bawah (Menampilkan RECEIVING FROM [NAMA] / TRANSMITTING / READY)
                           _buildBottomStatusBanner(net),
                         ],
                       ),
@@ -1219,8 +1470,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
-  /// 2. Card Status Jaringan: Menampilkan `localIp`, peran permanen
-  ///    (`HP MASTER` jika 192.168.43.1, atau `CLIENT`), `lastPingMs`, dan jumlah peer aktif.
+  /// 2. Card Status Jaringan
   Widget _buildNetworkStatusCard(UdpNetworkService net, int activeCount) {
     return Container(
       padding: const EdgeInsets.all(14),
@@ -1312,7 +1562,6 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                 ),
               ),
               const SizedBox(width: 6),
-              // Badge Peran Permanen: MASTER (192.168.43.1) atau CLIENT
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
                 decoration: BoxDecoration(
@@ -1354,7 +1603,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
               ),
               Expanded(
                 child: Text(
-                  'Peer Aktif: $activeCount • Target: ${net.targetedPeers.length} activeClients\n(Unicast)',
+                  'Peer Aktif: $activeCount • Target: ${net.targetedPeers.length} activeClients\n(Half-Duplex • Floor Control)',
                   style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600, height: 1.35),
                 ),
               ),
@@ -1365,7 +1614,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
-  /// 3. Container Channel: Mengubah `_currentChannel` tanpa memutus socket UDP.
+  /// 3. Container Channel Selector
   Widget _buildChannelCard(BuildContext context, UdpNetworkService net, int activeCount) {
     return Container(
       padding: const EdgeInsets.all(14),
@@ -1503,8 +1752,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
-  /// 4. GridView Anggota: HANYA memunculkan perangkat klien nyata dari UDP Broadcast.
-  ///    Jika belum ada perangkat lain terhubung, tampilkan "MENCARI ANGGOTA AKTIF...".
+  /// 4. GridView Anggota (Real Peers Only + Highlight Speaker yang sedang Transmit)
   Widget _buildMemberGridSection(
     BuildContext context,
     UdpNetworkService net,
@@ -1591,8 +1839,6 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
           ],
         ),
         const SizedBox(height: 10),
-
-        // Jika belum ada perangkat klien nyata yang terdeteksi di channel ini:
         if (realPeers.isEmpty)
           Container(
             width: double.infinity,
@@ -1644,6 +1890,8 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
             ),
             itemBuilder: (context, index) {
               final peer = realPeers[index];
+              final isPeerSpeaking = net.activeSpeakerIp == peer.ipAddress || peer.isTransmitting;
+
               return InkWell(
                 onTap: () => net.togglePeerTarget(peer.ipAddress),
                 borderRadius: BorderRadius.circular(14),
@@ -1651,21 +1899,29 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
-                      colors: peer.isTargeted
-                          ? [const Color(0xFF1499C7), const Color(0xFF0A6691)]
-                          : [const Color(0xFF062C4D), const Color(0xFF041D35)],
+                      colors: isPeerSpeaking
+                          ? [const Color(0xFF00C896), const Color(0xFF046E58)]
+                          : peer.isTargeted
+                              ? [const Color(0xFF1499C7), const Color(0xFF0A6691)]
+                              : [const Color(0xFF062C4D), const Color(0xFF041D35)],
                       begin: Alignment.topCenter,
                       end: Alignment.bottomCenter,
                     ),
                     borderRadius: BorderRadius.circular(14),
                     border: Border.all(
-                      color: peer.isTargeted ? cyanBright : cyanBright.withValues(alpha: 0.35),
-                      width: peer.isTargeted ? 1.5 : 1,
+                      color: isPeerSpeaking
+                          ? Colors.greenAccent
+                          : (peer.isTargeted ? cyanBright : cyanBright.withValues(alpha: 0.35)),
+                      width: isPeerSpeaking || peer.isTargeted ? 1.6 : 1,
                     ),
                   ),
                   child: Row(
                     children: [
-                      const Icon(Icons.mic_none, size: 18, color: cyanBright),
+                      Icon(
+                        isPeerSpeaking ? Icons.volume_up : Icons.mic_none,
+                        size: 18,
+                        color: isPeerSpeaking ? Colors.greenAccent : cyanBright,
+                      ),
                       const SizedBox(width: 6),
                       Expanded(
                         child: Column(
@@ -1683,13 +1939,13 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                               ),
                             ),
                             Text(
-                              peer.ipAddress,
+                              isPeerSpeaking ? 'TRANSMITTING' : peer.ipAddress,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: cyanSoft,
+                              style: TextStyle(
+                                color: isPeerSpeaking ? Colors.greenAccent : cyanSoft,
                                 fontSize: 9.5,
-                                fontWeight: FontWeight.w600,
+                                fontWeight: FontWeight.w700,
                               ),
                             ),
                           ],
@@ -1705,20 +1961,62 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
-  /// 5. Tombol PTT Raksasa menggunakan GestureDetector (onLongPress & onLongPressEnd)
-  Widget _buildGiantPttButton(UdpNetworkService net, AudioService audioService) {
+  /// 5. Tombol PTT Raksasa:
+  /// - Menerapkan Floor Control (`TX_START` / `TX_STOP`).
+  /// - Jika `net.isPttLocked == true` (ada anggota lain bicara & perangkat ini CLIENT),
+  ///   tombol PTT terkunci/disable dan menampilkan `"RECEIVING FROM [NAMA]"`.
+  /// - Jika perangkat ini adalah `HP MASTER` (`192.168.43.1`), Master memiliki hak OVERRIDE
+  ///   untuk tetap menekan tombol PTT dan mengambil alih jalur bicara.
+  Widget _buildGiantPttButton(
+    BuildContext context,
+    UdpNetworkService net,
+    AudioService audioService,
+  ) {
     final bool isTx = net.isTransmitting;
+    final bool isRx = net.isReceiving;
+    final bool isLocked = net.isPttLocked;
+    final String speakerName = net.activeSpeakerCallsign ?? 'ANGGOTA';
+
+    String centerLabel;
+    if (isTx) {
+      centerLabel = net.isMaster ? 'MASTER TX' : 'TRANSMITTING';
+    } else if (isRx) {
+      centerLabel = net.isMaster
+          ? 'RX: $speakerName\n(TAP OVERRIDE)'
+          : 'RECEIVING FROM\n$speakerName';
+    } else {
+      centerLabel = net.isMaster ? 'MASTER READY' : 'CLIENT READY';
+    }
 
     return GestureDetector(
       onLongPress: () async {
-        net.setTransmitting(true);
+        // Jika terkunci oleh Floor Control (dan bukan HP MASTER), tolak transmisi
+        if (net.isPttLocked) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              backgroundColor: Colors.redAccent.shade700,
+              duration: const Duration(milliseconds: 1200),
+              content: Text(
+                'JALUR SIBUK: Sedang menerima suara dari $speakerName!',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              ),
+            ),
+          );
+          return;
+        }
+
+        final allowed = await net.startTransmitting();
+        if (!allowed) return;
+
+        // Strict Half-Duplex: AudioPlayer di-mute (0.0) & mulai rekam microphone
         await audioService.startRecording((Uint8List pcmChunk) {
           net.sendRawAudioChunk(pcmChunk);
         });
       },
       onLongPressEnd: (_) async {
+        // Strict Half-Duplex: Hentikan rekam microphone & kembalikan volume AudioPlayer ke 1.0
         await audioService.stopRecording();
-        net.setTransmitting(false);
+        await net.stopTransmitting();
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
@@ -1727,14 +2025,26 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
         decoration: BoxDecoration(
           shape: BoxShape.circle,
           gradient: RadialGradient(
-            colors: isTx
-                ? [cyanBright, const Color(0xFF087CA6), const Color(0xFF042D4A)]
-                : [const Color(0xFF1476A6), const Color(0xFF073A5E), const Color(0xFF031F36)],
+            colors: isLocked
+                ? [const Color(0xFF5A2D38), const Color(0xFF331520), const Color(0xFF1C0B12)]
+                : isTx
+                    ? [cyanBright, const Color(0xFF087CA6), const Color(0xFF042D4A)]
+                    : isRx
+                        ? [const Color(0xFFFFB300), const Color(0xFF9E5800), const Color(0xFF3B1F00)]
+                        : [const Color(0xFF1476A6), const Color(0xFF073A5E), const Color(0xFF031F36)],
           ),
-          border: Border.all(color: cyanBright, width: isTx ? 4 : 2.5),
+          border: Border.all(
+            color: isLocked
+                ? Colors.redAccent
+                : (isRx && net.isMaster ? Colors.amberAccent : cyanBright),
+            width: isTx ? 4 : 2.5,
+          ),
           boxShadow: [
             BoxShadow(
-              color: cyanBright.withValues(alpha: isTx ? 0.75 : 0.35),
+              color: (isLocked
+                      ? Colors.redAccent
+                      : (isRx && net.isMaster ? Colors.amberAccent : cyanBright))
+                  .withValues(alpha: isTx ? 0.75 : 0.35),
               blurRadius: isTx ? 42 : 24,
               spreadRadius: isTx ? 6 : 1,
             ),
@@ -1743,41 +2053,57 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
         child: Stack(
           alignment: Alignment.center,
           children: [
-            const SizedBox(
+            SizedBox(
               width: 190,
               height: 190,
               child: CustomPaint(
-                painter: _CurvedTextPainter(text: 'PUSH TO TALK & HOLD'),
+                painter: _CurvedTextPainter(
+                  text: isLocked
+                      ? 'CHANNEL LOCKED • RX ONLY'
+                      : (isRx && net.isMaster
+                          ? 'HOLD FOR MASTER OVERRIDE'
+                          : 'PUSH TO TALK & HOLD'),
+                ),
               ),
             ),
             Container(
               width: 142,
               height: 142,
+              padding: const EdgeInsets.symmetric(horizontal: 8),
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                gradient: const RadialGradient(
-                  colors: [Color(0xFF1A8EC4), Color(0xFF073B5E)],
+                gradient: RadialGradient(
+                  colors: isLocked
+                      ? [const Color(0xFF6B2232), const Color(0xFF361019)]
+                      : [const Color(0xFF1A8EC4), const Color(0xFF073B5E)],
                 ),
-                border: Border.all(color: cyanSoft.withValues(alpha: 0.65), width: 1.5),
+                border: Border.all(
+                  color: isLocked
+                      ? Colors.redAccent.withValues(alpha: 0.7)
+                      : cyanSoft.withValues(alpha: 0.65),
+                  width: 1.5,
+                ),
               ),
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Icon(
-                    Icons.sensors,
-                    size: 44,
-                    color: isTx ? Colors.white : const Color(0xFF03233B),
+                    isLocked
+                        ? Icons.lock_outline
+                        : (isRx ? Icons.volume_up : Icons.sensors),
+                    size: 40,
+                    color: isTx || isLocked || isRx ? Colors.white : const Color(0xFF03233B),
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    isTx
-                        ? 'TRANSMITTING'
-                        : (net.isMaster ? 'MASTER READY' : 'CLIENT READY'),
+                    centerLabel,
+                    textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.w900,
-                      fontSize: 13.5,
-                      letterSpacing: 0.8,
+                      fontSize: 12,
+                      letterSpacing: 0.6,
+                      height: 1.2,
                     ),
                   ),
                 ],
@@ -1789,29 +2115,52 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
+  /// Banner Status Bawah: Menampilkan status Floor Control secara real-time
   Widget _buildBottomStatusBanner(UdpNetworkService net) {
+    final bool isTx = net.isTransmitting;
+    final bool isRx = net.isReceiving;
+    final bool isLocked = net.isPttLocked;
+    final String speakerName = net.activeSpeakerCallsign ?? 'ANGGOTA';
+
+    String bannerText;
+    if (isTx) {
+      bannerText =
+          'TRANSMITTING VOICE (CH ${net.currentChannel.toString().padLeft(2, '0')}) • SPEAKER MUTED';
+    } else if (isRx) {
+      bannerText = isLocked
+          ? 'RECEIVING FROM $speakerName (PTT LOCKED)'
+          : 'RECEIVING FROM $speakerName (MASTER OVERRIDE READY)';
+    } else {
+      bannerText = net.isMaster ? 'MASTER READY' : 'CLIENT READY';
+    }
+
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(vertical: 14),
+      padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFF28E0FF), Color(0xFF09B6DF)],
+        gradient: LinearGradient(
+          colors: isLocked
+              ? [const Color(0xFFD32F2F), const Color(0xFF880E4F)]
+              : isRx
+                  ? [const Color(0xFFFFB300), const Color(0xFFE65100)]
+                  : [const Color(0xFF28E0FF), const Color(0xFF09B6DF)],
         ),
         borderRadius: BorderRadius.circular(14),
         boxShadow: [
-          BoxShadow(color: cyanBright.withValues(alpha: 0.45), blurRadius: 16),
+          BoxShadow(
+            color: (isLocked ? Colors.redAccent : cyanBright).withValues(alpha: 0.45),
+            blurRadius: 16,
+          ),
         ],
       ),
       child: Text(
-        net.isTransmitting
-            ? 'TRANSMITTING RAW PCM UDP (CH ${net.currentChannel.toString().padLeft(2, '0')})...'
-            : (net.isMaster ? 'MASTER READY' : 'CLIENT READY'),
+        bannerText,
         textAlign: TextAlign.center,
         style: const TextStyle(
           color: Colors.white,
-          fontSize: 16,
+          fontSize: 14.5,
           fontWeight: FontWeight.w900,
-          letterSpacing: 1.2,
+          letterSpacing: 1.0,
         ),
       ),
     );
@@ -1918,7 +2267,7 @@ class _CurvedTextPainter extends CustomPainter {
           text: text[i],
           style: const TextStyle(
             color: Color(0xFF03233B),
-            fontSize: 11.5,
+            fontSize: 11.0,
             fontWeight: FontWeight.w900,
           ),
         ),
@@ -1931,7 +2280,8 @@ class _CurvedTextPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(covariant _CurvedTextPainter oldDelegate) =>
+      oldDelegate.text != text;
 }
 
 /// CustomPainter untuk motif grid transparan pada background navy blue
