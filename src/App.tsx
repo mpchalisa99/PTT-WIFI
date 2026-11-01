@@ -2470,7 +2470,7 @@ export default function App() {
 
               {/* Status LATENCY TINGGI / RENDAH */}
               <div className="px-2 py-0.5 rounded border border-cyan-400/45 bg-[#031b32]/80 font-telemetry text-[9.5px] font-bold leading-tight text-white">
-                <span className={isHighLatency ? 'text-cyan-200' : 'text-emerald-300'}>
+                <span className={isHighLatency ? 'text-cyan-200' : 'text-[#23dcff]'}>
                   {isHighLatency ? 'LAT TINGGI' : 'LAT RENDAH'}
                 </span>
               </div>
@@ -3500,7 +3500,7 @@ export default function App() {
                       </button>
                     </div>
                     {inviteJoinStatus && (
-                      <div className="px-3 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-400 text-emerald-200 font-telemetry text-[11px] font-bold text-center">
+                      <div className="px-3 py-1.5 rounded-lg bg-[#063256]/80 border border-[#23dcff] text-cyan-100 font-telemetry text-[11px] font-bold text-center">
                         {inviteJoinStatus}
                       </div>
                     )}
@@ -3685,7 +3685,7 @@ export default function App() {
                         >
                           {copiedText === currentFile.path ? (
                             <>
-                              <Check className="w-3.5 h-3.5 text-emerald-300" />
+                              <Check className="w-3.5 h-3.5 text-[#23dcff]" />
                               <span>Tersalin!</span>
                             </>
                           ) : (
