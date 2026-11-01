@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { DataConnection } from 'peerjs';
+import QRCode from 'qrcode';
+import jsQR from 'jsqr';
 import {
   Wifi,
   RefreshCw,
@@ -19,6 +21,11 @@ import {
   Smartphone,
   ShieldCheck,
   Code2,
+  Share2,
+  Link2,
+  UserPlus,
+  Camera,
+  Upload,
 } from 'lucide-react';
 import { FLUTTER_SOURCE_FILES } from './data/flutterSourceFiles';
 import { usePWAInstall } from './usePWAInstall';
@@ -46,84 +53,53 @@ interface MeshPacket {
   timestamp: number;
   audioBase64?: string;
   mimeType?: string;
+  peerNodeId?: string;
 }
 
-const DEFAULT_MEMBERS: TacticalMember[] = [
-  {
-    id: 'm-1',
-    callsign: 'YUDHI',
-    ip: '192.168.43.1',
-    role: 'MASTER',
-    statusText: '• ID AW..',
-    isTargeted: true,
-    isTalking: false,
-    pingMs: 18,
-    channel: 12,
-  },
-  {
-    id: 'm-2',
-    callsign: 'EKO',
-    ip: '192.168.43.102',
-    role: 'CLIENT',
-    statusText: 'ALL AKTIF',
-    isTargeted: true,
-    isTalking: false,
-    pingMs: 34,
-    channel: 12,
-  },
-  {
-    id: 'm-3',
-    callsign: 'PUJI',
-    ip: '192.168.43.103',
-    role: 'CLIENT',
-    statusText: 'ALL AKTIF',
-    isTargeted: true,
-    isTalking: false,
-    pingMs: 41,
-    channel: 12,
-  },
-  {
-    id: 'm-4',
-    callsign: 'JEFRY',
-    ip: '192.168.43.104',
-    role: 'CLIENT',
-    statusText: 'ALL AKTIF',
-    isTargeted: true,
-    isTalking: false,
-    pingMs: 29,
-    channel: 12,
-  },
-  {
-    id: 'm-5',
-    callsign: 'YUSUF',
-    ip: '192.168.43.105',
-    role: 'CLIENT',
-    statusText: 'ALL AKTIF',
-    isTargeted: true,
-    isTalking: false,
-    pingMs: 48,
-    channel: 12,
-  },
-  {
-    id: 'm-6',
-    callsign: 'EDWIN',
-    ip: '192.168.43.106',
-    role: 'CLIENT',
-    statusText: 'ALL AKTIF',
-    isTargeted: true,
-    isTalking: false,
-    pingMs: 52,
-    channel: 12,
-  },
-];
-
 const MESH_SLOTS = 6;
+
+// Universal parser for both ?query and #hash invite parameters (prevents 404 Page Not Found)
+function extractInviteParamsFromUrl() {
+  const searchStr = window.location.search.replace(/^\?/, '');
+  const hashStr = window.location.hash.replace(/^#\/?/, '').replace(/^\?/, '');
+  const combined = [searchStr, hashStr].filter(Boolean).join('&');
+  const params = new URLSearchParams(combined);
+
+  const isInvite =
+    params.get('invite') === '1' ||
+    params.get('role') === 'CLIENT' ||
+    Boolean(params.get('hostPeer'));
+  const ch = Number(params.get('ch'));
+  const hostPeer = params.get('hostPeer') || '';
+  const hostCallsign = (params.get('hostCallsign') || params.get('host') || 'MASTER').toUpperCase();
+  const masterIp = params.get('master') || params.get('ip') || '192.168.43.1';
+
+  return {
+    isInvite,
+    channel: ch >= 1 && ch <= 99 ? ch : null,
+    hostPeer,
+    hostCallsign,
+    masterIp,
+    role: params.get('role'),
+  };
+}
 
 export default function App() {
   const { isInstallable, isInstalled, install } = usePWAInstall();
 
+  // Read URL invite parameters once on boot (supports both #hash and ?query)
+  const [urlInviteParams, setUrlInviteParams] = useState(() => extractInviteParamsFromUrl());
+
   // Persistent identity & URL query auto-join support for Barcode scanning
   const [myDeviceId] = useState<string>(() => {
+    const initial = extractInviteParamsFromUrl();
+    if (initial.isInvite) {
+      const sessionSaved = sessionStorage.getItem('diskomlekau_invite_device_id');
+      if (sessionSaved) return sessionSaved;
+      const generatedInvite = `CLI-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+      sessionStorage.setItem('diskomlekau_invite_device_id', generatedInvite);
+      return generatedInvite;
+    }
     const saved = localStorage.getItem('diskomlekau_device_id');
     if (saved) return saved;
     const generated = `DEV-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
@@ -131,38 +107,85 @@ export default function App() {
     return generated;
   });
 
+  const myPeerNodeId = `diskomlekau-node-${myDeviceId.toLowerCase()}`;
+
   const [role, setRole] = useState<'MASTER' | 'CLIENT'>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const urlRole = params.get('role');
-    if (urlRole === 'CLIENT' || urlRole === 'MASTER') return urlRole;
+    if (urlInviteParams.isInvite) return 'CLIENT';
+    if (urlInviteParams.role === 'CLIENT' || urlInviteParams.role === 'MASTER') {
+      return urlInviteParams.role;
+    }
     return (localStorage.getItem('diskomlekau_role') as 'MASTER' | 'CLIENT') || 'MASTER';
   });
 
   const [localIp, setLocalIp] = useState<string>(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('role') === 'CLIENT') {
-      return `192.168.43.${Math.floor(102 + Math.random() * 50)}`;
+    if (urlInviteParams.isInvite) {
+      const sessionIp = sessionStorage.getItem('diskomlekau_invite_ip');
+      if (sessionIp) return sessionIp;
+      const generatedIp = `192.168.43.${Math.floor(102 + Math.random() * 90)}`;
+      sessionStorage.setItem('diskomlekau_invite_ip', generatedIp);
+      return generatedIp;
     }
     return localStorage.getItem('diskomlekau_ip') || '192.168.43.1';
   });
 
   const [channel, setChannel] = useState<number>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const chParam = Number(params.get('ch'));
-    if (chParam >= 1 && chParam <= 99) return chParam;
+    if (urlInviteParams.channel) return urlInviteParams.channel;
     return Number(localStorage.getItem('diskomlekau_channel')) || 12;
   });
 
   const [myCallsign, setMyCallsign] = useState<string>(() => {
-    return localStorage.getItem('diskomlekau_callsign') || 'YUDHI';
+    if (urlInviteParams.isInvite) {
+      return sessionStorage.getItem('diskomlekau_invite_callsign') || '';
+    }
+    return localStorage.getItem('diskomlekau_callsign') || '';
   });
 
-  const [pingMs, setPingMs] = useState<number>(354);
-  const [pingDelta, setPingDelta] = useState<number>(59);
+  const [isSetupCompleted, setIsSetupCompleted] = useState<boolean>(() => {
+    if (urlInviteParams.isInvite) {
+      return Boolean(sessionStorage.getItem('diskomlekau_invite_callsign'));
+    }
+    return Boolean(localStorage.getItem('diskomlekau_callsign'));
+  });
+
+  const [setupCallsignInput, setSetupCallsignInput] = useState<string>(() => {
+    if (urlInviteParams.isInvite) {
+      return sessionStorage.getItem('diskomlekau_invite_callsign') || '';
+    }
+    return localStorage.getItem('diskomlekau_callsign') || '';
+  });
+
+  const [setupIpMode, setSetupIpMode] = useState<'192.168.43.1' | 'CLIENT'>(() => {
+    if (urlInviteParams.isInvite) return 'CLIENT';
+    const savedIp = localStorage.getItem('diskomlekau_ip') || '192.168.43.1';
+    return savedIp === '192.168.43.1' ? '192.168.43.1' : 'CLIENT';
+  });
+
+  // Target Master Host Peer ID from Barcode Invite Link or manual paste
+  const [invitedHostPeer, setInvitedHostPeer] = useState<string>(urlInviteParams.hostPeer);
+  const [invitedHostCallsign, setInvitedHostCallsign] = useState<string>(
+    urlInviteParams.hostCallsign
+  );
+  const [manualInviteInput, setManualInviteInput] = useState<string>('');
+  const [inviteJoinStatus, setInviteJoinStatus] = useState<string | null>(null);
+  const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string>('');
+
+  // In-App Camera Barcode Scanner states (prevents external browser 404 errors)
+  const [barcodeTab, setBarcodeTab] = useState<'show' | 'scan'>('show');
+  const [isSetupScannerOpen, setIsSetupScannerOpen] = useState<boolean>(false);
+  const [isCameraScanning, setIsCameraScanning] = useState<boolean>(false);
+  const [scannerError, setScannerError] = useState<string | null>(null);
+  const scannerVideoRef = useRef<HTMLVideoElement | null>(null);
+  const scannerCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const scannerStreamRef = useRef<MediaStream | null>(null);
+  const scannerRafRef = useRef<number | null>(null);
+
+  const [pingMs, setPingMs] = useState<number>(24);
+  const [pingDelta, setPingDelta] = useState<number>(4);
   const [isRefreshingPing, setIsRefreshingPing] = useState<boolean>(false);
   const [talkAll, setTalkAll] = useState<boolean>(true);
-  const [members, setMembers] = useState<TacticalMember[]>(DEFAULT_MEMBERS);
-  const [selectedMemberId, setSelectedMemberId] = useState<string>('m-4');
+  // Real Peers Only: Starts empty and only populates when real peers announce on the channel
+  const [members, setMembers] = useState<TacticalMember[]>([]);
+  const [selectedMemberId, setSelectedMemberId] = useState<string>('');
   const [isFullScreen, setIsFullScreen] = useState<boolean>(false);
   const [fullScreenStretch, setFullScreenStretch] = useState<boolean>(true);
 
@@ -193,23 +216,49 @@ export default function App() {
   const animFrameRef = useRef<number | null>(null);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const peerRef = useRef<Peer | null>(null);
+  const directNodePeerRef = useRef<Peer | null>(null);
   const peerConnectionsRef = useRef<Map<string, DataConnection>>(new Map());
+  const lastAnnounceReplyRef = useRef<Map<string, number>>(new Map());
 
-  // Sync first member card with myCallsign & localIp
+  // Persist user settings
   useEffect(() => {
-    localStorage.setItem('diskomlekau_callsign', myCallsign);
-    localStorage.setItem('diskomlekau_channel', String(channel));
-    localStorage.setItem('diskomlekau_role', role);
-    localStorage.setItem('diskomlekau_ip', localIp);
+    if (!myCallsign) return;
+    if (urlInviteParams.isInvite) {
+      sessionStorage.setItem('diskomlekau_invite_callsign', myCallsign);
+      sessionStorage.setItem('diskomlekau_invite_ip', localIp);
+    } else {
+      localStorage.setItem('diskomlekau_callsign', myCallsign);
+      localStorage.setItem('diskomlekau_channel', String(channel));
+      localStorage.setItem('diskomlekau_role', role);
+      localStorage.setItem('diskomlekau_ip', localIp);
+    }
+  }, [myCallsign, channel, role, localIp, urlInviteParams.isInvite]);
 
-    setMembers((prev) =>
-      prev.map((m, idx) =>
-        idx === 0
-          ? { ...m, callsign: myCallsign, ip: localIp, role, channel }
-          : m
-      )
-    );
-  }, [myCallsign, channel, role, localIp]);
+  // If joined via Barcode Invite Link, immediately seed the invited Master host into active peers
+  useEffect(() => {
+    if (!isSetupCompleted || !invitedHostPeer || !invitedHostCallsign) return;
+    setMembers((prev) => {
+      const exists = prev.some(
+        (m) => m.peerId === invitedHostPeer || m.callsign === invitedHostCallsign
+      );
+      if (exists) return prev;
+      return [
+        ...prev,
+        {
+          id: invitedHostPeer,
+          callsign: invitedHostCallsign,
+          ip: urlInviteParams.masterIp || '192.168.43.1',
+          role: 'MASTER',
+          statusText: 'MASTER HOST',
+          isTargeted: true,
+          isTalking: false,
+          pingMs: 18,
+          channel,
+          peerId: invitedHostPeer,
+        },
+      ];
+    });
+  }, [isSetupCompleted, invitedHostPeer, invitedHostCallsign, channel, urlInviteParams.masterIp]);
 
   // Request Screen Wake Lock so HP screen stays on in APK/fullscreen mode
   useEffect(() => {
@@ -301,55 +350,10 @@ export default function App() {
     [soundEnabled, playTacticalTone]
   );
 
-  // Handle incoming mesh packets (from WebRTC PeerJS or BroadcastChannel)
-  const handleIncomingMeshPacket = useCallback(
-    (pkt: MeshPacket) => {
-      if (!pkt || pkt.senderId === myDeviceId || pkt.channel !== channel) return;
-
-      if (pkt.type === 'ANNOUNCE') {
-        setMembers((prev) => {
-          const exists = prev.some((m) => m.callsign === pkt.callsign || m.id === pkt.senderId);
-          if (exists) {
-            return prev.map((m) =>
-              m.callsign === pkt.callsign || m.id === pkt.senderId
-                ? { ...m, ip: pkt.ip, role: pkt.role, channel: pkt.channel }
-                : m
-            );
-          }
-          return [
-            ...prev,
-            {
-              id: pkt.senderId,
-              callsign: pkt.callsign,
-              ip: pkt.ip,
-              role: pkt.role,
-              statusText: 'ALL AKTIF',
-              isTargeted: true,
-              isTalking: false,
-              pingMs: 24,
-              channel: pkt.channel,
-            },
-          ];
-        });
-      } else if (pkt.type === 'PTT_START') {
-        setIncomingSpeaker(pkt.callsign);
-        playTacticalTone('rx');
-      } else if (pkt.type === 'PTT_END') {
-        setIncomingSpeaker((curr) => (curr === pkt.callsign ? null : curr));
-      } else if (pkt.type === 'VOICE_CLIP' && pkt.audioBase64) {
-        playIncomingAudioBase64(pkt.audioBase64, pkt.callsign);
-      } else if (pkt.type === 'PONG') {
-        const rtt = Math.max(8, Date.now() - pkt.timestamp);
-        setPingDelta(Math.abs(rtt - pingMs));
-        setPingMs(rtt);
-      }
-    },
-    [myDeviceId, channel, pingMs, playIncomingAudioBase64, playTacticalTone]
-  );
-
   // Send packet to all connected WebRTC peers + local BroadcastChannel
   const broadcastMeshPacket = useCallback(
     (partial: Omit<MeshPacket, 'senderId' | 'callsign' | 'ip' | 'role' | 'channel' | 'timestamp'>) => {
+      if (!myCallsign) return;
       const fullPacket: MeshPacket = {
         ...partial,
         senderId: myDeviceId,
@@ -358,6 +362,7 @@ export default function App() {
         role,
         channel,
         timestamp: Date.now(),
+        peerNodeId: myPeerNodeId,
       };
 
       try {
@@ -376,65 +381,169 @@ export default function App() {
         }
       });
     },
-    [myDeviceId, myCallsign, localIp, role, channel]
+    [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]
   );
 
-  // Setup BroadcastChannel + Deterministic WebRTC PeerJS Room Mesh for Vercel APK
+  // Handle incoming mesh packets (from WebRTC PeerJS or BroadcastChannel)
+  const handleIncomingMeshPacket = useCallback(
+    (pkt: MeshPacket) => {
+      if (!pkt || pkt.senderId === myDeviceId || !pkt.callsign) return;
+      // Filter by currentChannel without closing sockets
+      if (pkt.channel !== channel) return;
+
+      if (pkt.type === 'ANNOUNCE') {
+        setMembers((prev) => {
+          const exists = prev.some(
+            (m) => m.id === pkt.senderId || m.callsign === pkt.callsign
+          );
+          if (exists) {
+            return prev.map((m) =>
+              m.id === pkt.senderId || m.callsign === pkt.callsign
+                ? {
+                    ...m,
+                    id: pkt.senderId,
+                    callsign: pkt.callsign,
+                    ip: pkt.ip,
+                    role: pkt.role,
+                    channel: pkt.channel,
+                    peerId: pkt.peerNodeId || m.peerId,
+                  }
+                : m
+            );
+          }
+          return [
+            ...prev,
+            {
+              id: pkt.senderId,
+              callsign: pkt.callsign,
+              ip: pkt.ip,
+              role: pkt.role,
+              statusText: 'ALL AKTIF',
+              isTargeted: true,
+              isTalking: false,
+              pingMs: 24,
+              channel: pkt.channel,
+              peerId: pkt.peerNodeId,
+            },
+          ];
+        });
+
+        // Instant reply so newly joined Barcode Clients immediately see this device
+        const now = Date.now();
+        const lastReply = lastAnnounceReplyRef.current.get(pkt.senderId) || 0;
+        if (now - lastReply > 1500 && myCallsign) {
+          lastAnnounceReplyRef.current.set(pkt.senderId, now);
+          broadcastMeshPacket({ type: 'ANNOUNCE' });
+        }
+      } else if (pkt.type === 'PTT_START') {
+        setIncomingSpeaker(pkt.callsign);
+        playTacticalTone('rx');
+      } else if (pkt.type === 'PTT_END') {
+        setIncomingSpeaker((curr) => (curr === pkt.callsign ? null : curr));
+      } else if (pkt.type === 'VOICE_CLIP' && pkt.audioBase64) {
+        playIncomingAudioBase64(pkt.audioBase64, pkt.callsign);
+      } else if (pkt.type === 'PING') {
+        broadcastMeshPacket({ type: 'PONG' });
+      } else if (pkt.type === 'PONG') {
+        const rtt = Math.max(8, Date.now() - pkt.timestamp);
+        setPingDelta(Math.abs(rtt - pingMs));
+        setPingMs(rtt);
+      }
+    },
+    [myDeviceId, channel, pingMs, myCallsign, playIncomingAudioBase64, playTacticalTone, broadcastMeshPacket]
+  );
+
+  // Keep latest packet handler in a ref so WebRTC sockets never get destroyed on state updates
+  const packetHandlerRef = useRef(handleIncomingMeshPacket);
   useEffect(() => {
-    // 1. Local BroadcastChannel for same-device / multi-tab instant voice sync
+    packetHandlerRef.current = handleIncomingMeshPacket;
+  }, [handleIncomingMeshPacket]);
+
+  const announcePacketBuilderRef = useRef<() => MeshPacket | null>(() => null);
+  useEffect(() => {
+    announcePacketBuilderRef.current = () => {
+      if (!myCallsign) return null;
+      return {
+        type: 'ANNOUNCE',
+        senderId: myDeviceId,
+        callsign: myCallsign,
+        ip: localIp,
+        role,
+        channel,
+        timestamp: Date.now(),
+        peerNodeId: myPeerNodeId,
+      };
+    };
+  }, [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]);
+
+  // Helper to attach listeners to a PeerJS DataConnection
+  const registerPeerConnection = useCallback((conn: DataConnection) => {
+    conn.on('open', () => {
+      peerConnectionsRef.current.set(conn.peer, conn);
+      setConnectedPeersCount(peerConnectionsRef.current.size);
+      const pkt = announcePacketBuilderRef.current();
+      if (pkt) {
+        try {
+          conn.send(pkt);
+        } catch {
+          // Ignore send error
+        }
+      }
+    });
+    conn.on('data', (data) => {
+      const incoming = data as MeshPacket;
+      packetHandlerRef.current(incoming);
+
+      // If this device is Master/Hub, relay packets to other connected clients on same channel
+      peerConnectionsRef.current.forEach((otherConn, peerKey) => {
+        if (peerKey !== conn.peer && otherConn.open) {
+          try {
+            otherConn.send(incoming);
+          } catch {
+            // Ignore relay error
+          }
+        }
+      });
+    });
+    conn.on('close', () => {
+      peerConnectionsRef.current.delete(conn.peer);
+      setConnectedPeersCount(peerConnectionsRef.current.size);
+    });
+    conn.on('error', () => {
+      peerConnectionsRef.current.delete(conn.peer);
+      setConnectedPeersCount(peerConnectionsRef.current.size);
+    });
+  }, []);
+
+  // Setup persistent BroadcastChannel + Direct Node PeerJS + Mesh Slots (never closes on channel switch)
+  useEffect(() => {
+    // 1. Local BroadcastChannel for same-device / multi-tab instant voice & discovery sync
     if ('BroadcastChannel' in window) {
       const bc = new BroadcastChannel('diskomlekau_tactical_ptt_channel');
       bc.onmessage = (event) => {
-        handleIncomingMeshPacket(event.data as MeshPacket);
+        packetHandlerRef.current(event.data as MeshPacket);
       };
       broadcastChannelRef.current = bc;
     }
 
-    // 2. PeerJS WebRTC Mesh so multiple Android APKs on Vercel auto-discover on same channel
-    let currentSlot = 0;
-    let peerInstance: Peer | null = null;
+    // 2. Direct Node PeerJS (used by Barcode Invite Link `hostPeer=...` so Clients connect 100% directly)
+    const directPeer = new Peer(myPeerNodeId);
+    directNodePeerRef.current = directPeer;
+
+    directPeer.on('connection', (conn) => {
+      registerPeerConnection(conn);
+    });
+
+    // 3. Channel Slot Mesh PeerJS for automatic same-channel discovery
+    let slotPeer: Peer | null = null;
     let isCancelled = false;
 
-    const getSlotPeerId = (ch: number, slot: number) =>
-      `diskomlekau-tactical-v2-ch${ch}-slot${slot}`;
-
-    const connectToOtherSlots = (activePeer: Peer, mySlot: number) => {
-      for (let s = 0; s < MESH_SLOTS; s++) {
-        if (s === mySlot) continue;
-        const targetId = getSlotPeerId(channel, s);
-        if (peerConnectionsRef.current.has(targetId)) continue;
-
-        try {
-          const conn = activePeer.connect(targetId, { reliable: true });
-          conn.on('open', () => {
-            peerConnectionsRef.current.set(targetId, conn);
-            setConnectedPeersCount(peerConnectionsRef.current.size);
-            conn.send({
-              type: 'ANNOUNCE',
-              senderId: myDeviceId,
-              callsign: myCallsign,
-              ip: localIp,
-              role,
-              channel,
-              timestamp: Date.now(),
-            } satisfies MeshPacket);
-          });
-          conn.on('data', (data) => {
-            handleIncomingMeshPacket(data as MeshPacket);
-          });
-          conn.on('close', () => {
-            peerConnectionsRef.current.delete(targetId);
-            setConnectedPeersCount(peerConnectionsRef.current.size);
-          });
-        } catch {
-          // Slot not occupied yet
-        }
-      }
-    };
+    const getSlotPeerId = (slot: number) =>
+      `diskomlekau-tactical-v2-global-slot${slot}`;
 
     const tryBindSlot = (slotIndex: number) => {
       if (isCancelled || slotIndex >= MESH_SLOTS) return;
-      const candidateId = getSlotPeerId(channel, slotIndex);
+      const candidateId = getSlotPeerId(slotIndex);
       const p = new Peer(candidateId);
 
       p.on('open', () => {
@@ -442,33 +551,24 @@ export default function App() {
           p.destroy();
           return;
         }
-        currentSlot = slotIndex;
-        peerInstance = p;
+        slotPeer = p;
         peerRef.current = p;
-        connectToOtherSlots(p, currentSlot);
+        for (let s = 0; s < MESH_SLOTS; s++) {
+          if (s === slotIndex) continue;
+          const targetId = getSlotPeerId(s);
+          if (!peerConnectionsRef.current.has(targetId)) {
+            try {
+              const conn = p.connect(targetId, { reliable: true });
+              registerPeerConnection(conn);
+            } catch {
+              // Slot not occupied
+            }
+          }
+        }
       });
 
       p.on('connection', (conn) => {
-        conn.on('open', () => {
-          peerConnectionsRef.current.set(conn.peer, conn);
-          setConnectedPeersCount(peerConnectionsRef.current.size);
-          conn.send({
-            type: 'ANNOUNCE',
-            senderId: myDeviceId,
-            callsign: myCallsign,
-            ip: localIp,
-            role,
-            channel,
-            timestamp: Date.now(),
-          } satisfies MeshPacket);
-        });
-        conn.on('data', (data) => {
-          handleIncomingMeshPacket(data as MeshPacket);
-        });
-        conn.on('close', () => {
-          peerConnectionsRef.current.delete(conn.peer);
-          setConnectedPeersCount(peerConnectionsRef.current.size);
-        });
+        registerPeerConnection(conn);
       });
 
       p.on('error', (err: { type?: string }) => {
@@ -485,9 +585,33 @@ export default function App() {
       isCancelled = true;
       broadcastChannelRef.current?.close();
       peerConnectionsRef.current.clear();
-      peerInstance?.destroy();
+      directPeer.destroy();
+      slotPeer?.destroy();
     };
-  }, [channel, myDeviceId, myCallsign, localIp, role, handleIncomingMeshPacket]);
+  }, [myPeerNodeId, registerPeerConnection]);
+
+  // Connect & auto-reconnect to invitedHostPeer (from Barcode Invite Link or manual paste)
+  useEffect(() => {
+    if (!invitedHostPeer || invitedHostPeer === myPeerNodeId) return;
+
+    const connectToInvitedHost = () => {
+      const activePeer = directNodePeerRef.current || peerRef.current;
+      if (!activePeer || activePeer.disconnected || activePeer.destroyed) return;
+      const existing = peerConnectionsRef.current.get(invitedHostPeer);
+      if (existing && existing.open) return;
+
+      try {
+        const conn = activePeer.connect(invitedHostPeer, { reliable: true });
+        registerPeerConnection(conn);
+      } catch {
+        // Retry on next tick
+      }
+    };
+
+    connectToInvitedHost();
+    const timer = window.setInterval(connectToInvitedHost, 2000);
+    return () => window.clearInterval(timer);
+  }, [invitedHostPeer, myPeerNodeId, registerPeerConnection]);
 
   // Start Push-To-Talk (`onLongPress` / Hold) -> Captures real microphone audio
   const handlePttStart = async () => {
@@ -630,15 +754,36 @@ export default function App() {
     }, 280);
   };
 
-  // Toggle Role between MASTER (192.168.43.1) and CLIENT (192.168.43.108)
-  const handleToggleRole = () => {
-    if (role === 'MASTER') {
-      setRole('CLIENT');
-      setLocalIp('192.168.43.108');
-    } else {
-      setRole('MASTER');
-      setLocalIp('192.168.43.1');
-    }
+  // Constant 1-second ANNOUNCE broadcast once connected (mirrors Flutter Timer.periodic 1s)
+  useEffect(() => {
+    if (!isSetupCompleted || !myCallsign) return;
+    broadcastMeshPacket({ type: 'ANNOUNCE' });
+    const interval = window.setInterval(() => {
+      broadcastMeshPacket({ type: 'ANNOUNCE' });
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [isSetupCompleted, myCallsign, broadcastMeshPacket]);
+
+  // Permanent role lock based on IP '192.168.43.1'
+  const isMasterDevice = localIp === '192.168.43.1';
+  const permanentRoleLabel = isMasterDevice ? 'HP MASTER' : 'CLIENT';
+
+  const handleSetupConnect = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = setupCallsignInput.trim().toUpperCase();
+    if (!cleaned) return;
+    const assignedIp =
+      setupIpMode === '192.168.43.1'
+        ? '192.168.43.1'
+        : localIp !== '192.168.43.1'
+        ? localIp
+        : `192.168.43.${Math.floor(102 + Math.random() * 50)}`;
+    const lockedRole = assignedIp === '192.168.43.1' ? 'MASTER' : 'CLIENT';
+
+    setLocalIp(assignedIp);
+    setRole(lockedRole);
+    setMyCallsign(cleaned);
+    setIsSetupCompleted(true);
   };
 
   // Open Edit Name modal
@@ -662,9 +807,6 @@ export default function App() {
       setMembers((prev) =>
         prev.map((m) => (m.id === editingMemberId ? { ...m, callsign: cleaned } : m))
       );
-      if (editingMemberId === 'm-1') {
-        setMyCallsign(cleaned);
-      }
     } else {
       setMyCallsign(cleaned);
     }
@@ -672,9 +814,40 @@ export default function App() {
   };
 
   const handleCopyText = (key: string, text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopiedText(key);
-    window.setTimeout(() => setCopiedText(null), 1800);
+    const markCopied = () => {
+      setCopiedText(key);
+      window.setTimeout(() => setCopiedText(null), 2000);
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard
+        .writeText(text)
+        .then(markCopied)
+        .catch(() => {
+          fallbackCopyText(text);
+          markCopied();
+        });
+    } else {
+      fallbackCopyText(text);
+      markCopied();
+    }
+  };
+
+  const fallbackCopyText = (text: string) => {
+    try {
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-9999px';
+      textArea.style.top = '0';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+    } catch {
+      // Ignore fallback error
+    }
   };
 
   const handleDownloadFile = (filename: string, content: string) => {
@@ -688,21 +861,469 @@ export default function App() {
   };
 
   const isHighLatency = pingMs > 150;
-  const targetedClientsCount = Math.max(
-    1,
-    members.filter((m) => m.id !== 'm-1' && (talkAll || m.isTargeted)).length
+  // Filter real peers strictly by currentChannel without closing sockets
+  const activeChannelPeers = members.filter((m) => m.channel === channel);
+  const targetedClientsCount = activeChannelPeers.filter(
+    (m) => talkAll || m.isTargeted
+  ).length;
+
+  // Keep URL hash/search invite parameters in sync if user navigates via hash link
+  useEffect(() => {
+    const onHashOrPop = () => {
+      const parsed = extractInviteParamsFromUrl();
+      if (parsed.isInvite) {
+        setUrlInviteParams(parsed);
+        if (parsed.channel) setChannel(parsed.channel);
+        if (parsed.hostPeer) setInvitedHostPeer(parsed.hostPeer);
+        if (parsed.hostCallsign) setInvitedHostCallsign(parsed.hostCallsign);
+        setSetupIpMode('CLIENT');
+        if (localIp === '192.168.43.1') {
+          setLocalIp(`192.168.43.${Math.floor(102 + Math.random() * 90)}`);
+          setRole('CLIENT');
+        }
+      }
+    };
+    window.addEventListener('hashchange', onHashOrPop);
+    window.addEventListener('popstate', onHashOrPop);
+    return () => {
+      window.removeEventListener('hashchange', onHashOrPop);
+      window.removeEventListener('popstate', onHashOrPop);
+    };
+  }, [localIp]);
+
+  // Use exact active URL with #hash fragment so no web server or WebView ever returns "404 Page not found"
+  const cleanCurrentBaseUrl = `${window.location.origin}${window.location.pathname}`.replace(
+    /\/+$/,
+    ''
   );
-  const sharePairUrl = `${window.location.origin}/?ch=${channel}&role=CLIENT&master=${localIp}`;
+  const sharePairUrl = `${cleanCurrentBaseUrl}/#invite=1&ch=${channel}&role=CLIENT&master=192.168.43.1&hostPeer=${encodeURIComponent(
+    myPeerNodeId
+  )}&hostCallsign=${encodeURIComponent(myCallsign || 'MASTER')}`;
+
+  // Generate real scannable QR Code image whenever sharePairUrl changes
+  useEffect(() => {
+    let active = true;
+    QRCode.toDataURL(sharePairUrl, {
+      width: 260,
+      margin: 1,
+      errorCorrectionLevel: 'M',
+      color: {
+        dark: '#03192e',
+        light: '#ffffff',
+      },
+    })
+      .then((dataUrl) => {
+        if (active) setQrCodeDataUrl(dataUrl);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [sharePairUrl]);
+
+  const handleShareInviteLink = async () => {
+    const shareTitle = `DISKOMLEKAU TACTICAL PTT - CH ${String(channel).padStart(2, '0')}`;
+    const shareText = `Gabung ke Jaringan Walkie-Talkie DISKOMLEKAU TACTICAL PTT (${
+      myCallsign || 'MASTER'
+    } - CHANNEL ${String(channel).padStart(2, '0')}):`;
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: shareTitle,
+          text: shareText,
+          url: sharePairUrl,
+        });
+        return;
+      } catch {
+        // Fallback to copy
+      }
+    }
+    handleCopyText('pairUrl', sharePairUrl);
+  };
+
+  // Universal processor for any scanned QR code string, pasted URL, or Master Node ID
+  const applyScannedOrPastedInvite = useCallback(
+    (rawString: string): boolean => {
+      const raw = rawString.trim();
+      if (!raw) return false;
+
+      try {
+        let parsedCh = channel;
+        let parsedHostPeer = '';
+        let parsedHostCallsign = 'MASTER';
+        let parsedMasterIp = '192.168.43.1';
+
+        if (
+          raw.includes('invite=') ||
+          raw.includes('hostPeer=') ||
+          raw.includes('ch=') ||
+          raw.includes('?') ||
+          raw.includes('#')
+        ) {
+          // Extract query/hash part after # or ?
+          let queryPart = raw;
+          if (raw.includes('#')) {
+            queryPart = raw.split('#')[1].replace(/^\/?\??/, '');
+          } else if (raw.includes('?')) {
+            queryPart = raw.split('?')[1];
+          }
+          const params = new URLSearchParams(queryPart);
+          const chNum = Number(params.get('ch'));
+          if (chNum >= 1 && chNum <= 99) parsedCh = chNum;
+          parsedHostPeer = params.get('hostPeer') || '';
+          parsedHostCallsign = (
+            params.get('hostCallsign') ||
+            params.get('host') ||
+            'MASTER'
+          ).toUpperCase();
+          parsedMasterIp = params.get('master') || params.get('ip') || '192.168.43.1';
+        } else {
+          parsedHostPeer = raw.startsWith('diskomlekau-node-')
+            ? raw.toLowerCase()
+            : `diskomlekau-node-${raw.toLowerCase()}`;
+        }
+
+        setSetupIpMode('CLIENT');
+        if (localIp === '192.168.43.1') {
+          const newClientIp = `192.168.43.${Math.floor(102 + Math.random() * 90)}`;
+          setLocalIp(newClientIp);
+          setRole('CLIENT');
+        }
+
+        setChannel(parsedCh);
+        if (parsedHostPeer) {
+          setInvitedHostPeer(parsedHostPeer);
+          setInvitedHostCallsign(parsedHostCallsign);
+        }
+        setUrlInviteParams({
+          isInvite: true,
+          channel: parsedCh,
+          hostPeer: parsedHostPeer,
+          hostCallsign: parsedHostCallsign,
+          masterIp: parsedMasterIp,
+          role: 'CLIENT',
+        });
+
+        setMembers((prev) => {
+          const exists = prev.some(
+            (m) =>
+              (parsedHostPeer && m.peerId === parsedHostPeer) ||
+              m.callsign === parsedHostCallsign
+          );
+          if (exists) {
+            return prev.map((m) =>
+              (parsedHostPeer && m.peerId === parsedHostPeer) ||
+              m.callsign === parsedHostCallsign
+                ? { ...m, channel: parsedCh, ip: parsedMasterIp, role: 'MASTER' }
+                : m
+            );
+          }
+          return [
+            ...prev,
+            {
+              id: parsedHostPeer || `master-${Date.now()}`,
+              callsign: parsedHostCallsign,
+              ip: parsedMasterIp,
+              role: 'MASTER',
+              statusText: 'MASTER HOST',
+              isTargeted: true,
+              isTalking: false,
+              pingMs: 18,
+              channel: parsedCh,
+              peerId: parsedHostPeer,
+            },
+          ];
+        });
+
+        playTacticalTone('rx');
+        setInviteJoinStatus(
+          `BERHASIL TERHUBUNG KE MASTER ${parsedHostCallsign} (CH ${String(parsedCh).padStart(
+            2,
+            '0'
+          )})`
+        );
+        return true;
+      } catch {
+        setInviteJoinStatus('FORMAT BARCODE / LINK TIDAK VALID');
+        return false;
+      }
+    },
+    [channel, localIp, playTacticalTone]
+  );
+
+  // Stop in-app camera QR scanner stream
+  const stopCameraScanner = useCallback(() => {
+    if (scannerRafRef.current) {
+      cancelAnimationFrame(scannerRafRef.current);
+      scannerRafRef.current = null;
+    }
+    if (scannerStreamRef.current) {
+      scannerStreamRef.current.getTracks().forEach((t) => t.stop());
+      scannerStreamRef.current = null;
+    }
+    setIsCameraScanning(false);
+  }, []);
+
+  // Start in-app live camera QR scanner using jsQR (no external browser needed!)
+  const startCameraScanner = useCallback(async () => {
+    setScannerError(null);
+    stopCameraScanner();
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } },
+      });
+      scannerStreamRef.current = stream;
+      setIsCameraScanning(true);
+
+      const video = scannerVideoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        video.setAttribute('playsinline', 'true');
+        await video.play();
+      }
+
+      const scanFrame = () => {
+        const vid = scannerVideoRef.current;
+        const canvas = scannerCanvasRef.current;
+        if (vid && canvas && vid.readyState === vid.HAVE_ENOUGH_DATA) {
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            canvas.width = vid.videoWidth;
+            canvas.height = vid.videoHeight;
+            ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const code = jsQR(imageData.data, imageData.width, imageData.height, {
+              inversionAttempts: 'dontInvert',
+            });
+            if (code && code.data) {
+              stopCameraScanner();
+              const ok = applyScannedOrPastedInvite(code.data);
+              if (ok) {
+                setIsSetupScannerOpen(false);
+                window.setTimeout(() => {
+                  setInviteJoinStatus(null);
+                  setActiveBottomModal(null);
+                }, 1100);
+              }
+              return;
+            }
+          }
+        }
+        scannerRafRef.current = requestAnimationFrame(scanFrame);
+      };
+
+      scannerRafRef.current = requestAnimationFrame(scanFrame);
+    } catch {
+      setIsCameraScanning(false);
+      setScannerError(
+        'Kamera langsung tidak diizinkan oleh browser/WebView. Gunakan tombol "Ambil Foto / Pilih Gambar Barcode" di bawah.'
+      );
+    }
+  }, [applyScannedOrPastedInvite, stopCameraScanner]);
+
+  // Decode QR code from a captured camera photo or gallery image file
+  const handleScanQrImageFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setScannerError(null);
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        canvas.width = img.width;
+        canvas.height = img.height;
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height);
+        if (code && code.data) {
+          stopCameraScanner();
+          const ok = applyScannedOrPastedInvite(code.data);
+          if (ok) {
+            setIsSetupScannerOpen(false);
+            window.setTimeout(() => {
+              setInviteJoinStatus(null);
+              setActiveBottomModal(null);
+            }, 1100);
+          }
+        } else {
+          setScannerError('Barcode tidak terdeteksi pada gambar. Pastikan QR Code terlihat jelas.');
+        }
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Stop camera stream when modal closes or tab changes
+  useEffect(() => {
+    if (activeBottomModal !== 'barcode' && !isSetupScannerOpen) {
+      stopCameraScanner();
+    } else if (
+      (activeBottomModal === 'barcode' && barcodeTab === 'scan') ||
+      isSetupScannerOpen
+    ) {
+      startCameraScanner();
+    }
+    return () => {
+      stopCameraScanner();
+    };
+  }, [activeBottomModal, barcodeTab, isSetupScannerOpen, startCameraScanner, stopCameraScanner]);
+
+  // Join Master via pasted Invite Link or Master Peer Code inside the Barcode modal
+  const handleManualInviteJoin = (e: React.FormEvent) => {
+    e.preventDefault();
+    const ok = applyScannedOrPastedInvite(manualInviteInput);
+    if (ok) {
+      setManualInviteInput('');
+      window.setTimeout(() => {
+        setInviteJoinStatus(null);
+        setActiveBottomModal(null);
+      }, 1100);
+    }
+  };
+
   const currentFile = FLUTTER_SOURCE_FILES[selectedFileIndex];
 
   const curvedTitle = 'PUSH TO TALK & HOLD';
   const curvedChars = curvedTitle.split('');
 
+  // 1. LAYAR SETUP AWAL (SetupScreen - KONEK NAMA + SCAN BARCODE LANGSUNG)
+  if (!isSetupCompleted) {
+    return (
+      <div className="min-h-[100dvh] w-full tactical-grid-bg text-[#e5faff] flex items-center justify-center p-5 select-none">
+        <div className="w-full max-w-[420px] tactical-panel rounded-3xl p-6 space-y-4 shadow-[0_0_50px_rgba(35,220,255,0.22)]">
+          <div className="flex flex-col items-center text-center space-y-2">
+            <div className="w-16 h-16 rounded-full bg-[#03192e] border-2 border-[#23dcff] shadow-[0_0_20px_rgba(35,220,255,0.35)] flex items-center justify-center">
+              <Radio className="w-8 h-8 text-[#23dcff]" />
+            </div>
+            <h1 className="font-tactical text-[26px] font-extrabold tracking-wider text-white cyan-glow-text">
+              DISKOMLEKAU TACTICAL PTT
+            </h1>
+            <p className="font-telemetry text-[11px] text-cyan-200/90 tracking-wide">
+              REGISTRASI IDENTITAS JARINGAN HOTSPOT LAN
+            </p>
+            {urlInviteParams.isInvite && (
+              <div className="w-full mt-1 px-3 py-2 rounded-xl bg-[#07375c] border border-[#23dcff] text-xs font-telemetry text-white font-bold">
+                TERHUBUNG BARCODE MASTER: {invitedHostCallsign} • CHANNEL{' '}
+                {String(channel).padStart(2, '0')}
+              </div>
+            )}
+          </div>
+
+          {/* Tombol Buka In-App Scanner di SetupScreen agar tidak pernah "Page Not Found" */}
+          <div>
+            <button
+              type="button"
+              onClick={() => setIsSetupScannerOpen((prev) => !prev)}
+              className="w-full py-2.5 px-3 rounded-xl bg-[#052946] hover:bg-[#093b63] border border-[#23dcff] text-white font-telemetry text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Camera className="w-4 h-4 text-[#23dcff]" />
+              <span>
+                {isSetupScannerOpen
+                  ? 'TUTUP KAMERA SCANNER BARCODE'
+                  : 'SCAN BARCODE DARI HP MASTER (TANPA BROWSER)'}
+              </span>
+            </button>
+
+            {isSetupScannerOpen && (
+              <div className="mt-2.5 p-3 rounded-2xl bg-[#021526] border border-[#23dcff] space-y-2.5 text-center">
+                <div className="relative w-full aspect-square max-w-[230px] mx-auto rounded-xl overflow-hidden bg-black border-2 border-[#23dcff]">
+                  <video
+                    ref={scannerVideoRef}
+                    className="w-full h-full object-cover"
+                    muted
+                    playsInline
+                  />
+                  <canvas ref={scannerCanvasRef} className="hidden" />
+                  <div className="absolute inset-5 border-2 border-dashed border-[#23dcff]/80 rounded-xl pointer-events-none" />
+                </div>
+                {scannerError && (
+                  <p className="font-telemetry text-[10.5px] text-amber-300">{scannerError}</p>
+                )}
+                <label className="w-full py-2 px-3 rounded-xl bg-[#07375c] hover:bg-[#0b4b7a] border border-cyan-400/60 text-white font-telemetry text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer">
+                  <Upload className="w-3.5 h-3.5 text-[#23dcff]" />
+                  <span>Ambil Foto / Pilih Gambar Barcode</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={handleScanQrImageFile}
+                    className="hidden"
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+
+          <form onSubmit={handleSetupConnect} className="space-y-4">
+            <div>
+              <label className="block font-telemetry text-xs font-bold text-cyan-100 mb-1.5">
+                MASUKKAN NAMA / CALLSIGN ANDA:
+              </label>
+              <input
+                type="text"
+                required
+                maxLength={12}
+                value={setupCallsignInput}
+                onChange={(e) => setSetupCallsignInput(e.target.value)}
+                placeholder="CONTOH: YUDHI / GARUDA-1"
+                autoFocus
+                className="w-full px-4 py-3 rounded-xl bg-[#021526] border-2 border-[#23dcff]/70 focus:border-[#23dcff] text-white font-telemetry text-base font-extrabold uppercase tracking-wider focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block font-telemetry text-[11px] font-bold text-cyan-200/90 mb-1.5">
+                DETEKSI IP PERANGKAT (KUNCI PERAN PERMANEN):
+              </label>
+              <div className="grid grid-cols-2 gap-2 font-telemetry text-xs">
+                <button
+                  type="button"
+                  onClick={() => setSetupIpMode('192.168.43.1')}
+                  className={`py-2.5 px-3 rounded-xl border font-bold text-left transition-all cursor-pointer ${
+                    setupIpMode === '192.168.43.1'
+                      ? 'bg-[#093b61] border-[#23dcff] text-white shadow-[0_0_12px_rgba(35,220,255,0.3)]'
+                      : 'bg-[#021526] border-cyan-500/30 text-cyan-200/70'
+                  }`}
+                >
+                  <div className="text-[#23dcff] font-extrabold">HP MASTER</div>
+                  <div className="text-[10px]">192.168.43.1 (Host)</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSetupIpMode('CLIENT')}
+                  className={`py-2.5 px-3 rounded-xl border font-bold text-left transition-all cursor-pointer ${
+                    setupIpMode === 'CLIENT'
+                      ? 'bg-[#093b61] border-[#23dcff] text-white shadow-[0_0_12px_rgba(35,220,255,0.3)]'
+                      : 'bg-[#021526] border-cyan-500/30 text-cyan-200/70'
+                  }`}
+                >
+                  <div className="text-[#23dcff] font-extrabold">CLIENT</div>
+                  <div className="text-[10px]">192.168.43.x (Anggota)</div>
+                </button>
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              className="w-full py-3.5 rounded-xl cyan-btn-glow text-[#02182b] font-tactical text-lg font-extrabold tracking-wider flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Wifi className="w-5 h-5" />
+              <span>KONEK JARINGAN</span>
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-[100dvh] w-full bg-[#021322] text-[#e5faff] flex flex-col items-center justify-center overflow-x-hidden select-none">
-      {/* FULL SCREEN HP CONTAINER:
-          Fills 100% width & height on smartphones / WebToApp Android APK,
-          and can stretch full-bleed or phone-proportioned on desktop */}
       <main
         className={`w-full min-h-[100dvh] tactical-grid-bg flex flex-col justify-between relative overflow-hidden transition-all ${
           fullScreenStretch
@@ -710,12 +1331,12 @@ export default function App() {
             : 'max-w-[460px] sm:border-x-2 sm:border-[#23dcff]/45 sm:shadow-[0_0_60px_rgba(0,195,255,0.25)]'
         }`}
       >
-        {/* TOP TELEMETRY STATUS STRIP (Matching screenshot: VERCEL CLOUD MESH • CELLULAR 1.4Mbps 354 ms | ONLINE [FULL]) */}
+        {/* TOP TELEMETRY STATUS STRIP */}
         <header className="px-3.5 pt-2.5 pb-1.5 flex items-center justify-between text-[11px] font-telemetry text-cyan-100/95 border-b border-cyan-400/15 bg-[#03192e]/60 backdrop-blur-xs">
           <div className="flex items-center gap-1.5 truncate">
             <Wifi className="w-3.5 h-3.5 text-[#23dcff] shrink-0" />
             <span className="tracking-tight truncate">
-              VERCEL CLOUD MESH • CELLULAR 1.4Mbps
+              VERCEL CLOUD MESH • UDP LAN HOTSPOT
             </span>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -794,29 +1415,26 @@ export default function App() {
                 <span>Ping</span>
               </button>
 
-              {/* Label Status MASTER / CLIENT */}
-              <button
-                onClick={handleToggleRole}
-                className="min-h-[38px] px-2.5 py-1.5 rounded-lg cyan-btn-glow text-[#021d33] font-extrabold text-xs flex items-center gap-1 shrink-0 cursor-pointer"
-              >
+              {/* Label Status Permanen: MASTER (192.168.43.1) atau CLIENT */}
+              <div className="min-h-[38px] px-2.5 py-1.5 rounded-lg cyan-btn-glow text-[#021d33] font-extrabold text-xs flex items-center gap-1 shrink-0">
                 <Star className="w-3.5 h-3.5 fill-[#021d33]" />
-                <span>{role}</span>
-              </button>
+                <span>{isMasterDevice ? 'MASTER' : 'CLIENT'}</span>
+              </div>
             </div>
 
             <div className="h-[1px] bg-gradient-to-r from-cyan-400/40 via-cyan-300/60 to-cyan-400/20" />
 
-            {/* Teks Informasi Peran & Peer Aktif */}
+            {/* Teks Informasi Peran Permanen & Peer Aktif */}
             <div className="grid grid-cols-12 gap-2 font-telemetry text-[12px] text-white/95 leading-snug pt-0.5">
               <div className="col-span-5">
-                <div className="font-semibold">PERAN: HP {role}</div>
+                <div className="font-semibold">PERAN: {permanentRoleLabel}</div>
                 <div className="text-cyan-100">({localIp})</div>
               </div>
               <div className="col-span-7">
                 <div>
                   Peer Aktif:{' '}
                   <strong className="text-white">
-                    {connectedPeersCount > 0 ? connectedPeersCount : 3}
+                    {activeChannelPeers.length}
                   </strong>{' '}
                   • Target:{' '}
                   <strong className="text-white">
@@ -828,7 +1446,7 @@ export default function App() {
             </div>
           </section>
 
-          {/* 3. CARD CHANNEL SELECTOR */}
+          {/* 3. CARD CHANNEL SELECTOR (Tanpa menutup/memutus koneksi UDP) */}
           <section className="tactical-panel rounded-2xl p-3.5 space-y-2.5">
             <div className="flex items-center justify-between px-1">
               <span className="text-cyan-300 text-xs">▼</span>
@@ -850,7 +1468,7 @@ export default function App() {
                 </div>
               </button>
 
-              {/* Layar Tengah CHANNEL 12 */}
+              {/* Layar Tengah CHANNEL */}
               <div className="flex-1 tactical-panel-inset rounded-2xl py-2.5 px-3 text-center">
                 <div className="font-tactical text-[32px] leading-none font-extrabold tracking-[0.12em] text-white cyan-glow-text">
                   CHANNEL {String(channel).padStart(2, '0')}
@@ -875,7 +1493,7 @@ export default function App() {
             {/* Keterangan bawah card & tombol BARCODE */}
             <div className="flex items-center justify-between pt-0.5">
               <div className="font-tactical text-[14px] font-bold tracking-wider text-white">
-                HP MASTER AKTIF | {members.length} MEMBERS ONLINE
+                {permanentRoleLabel} AKTIF | {activeChannelPeers.length} MEMBERS ONLINE
               </div>
               <button
                 onClick={() => setActiveBottomModal('barcode')}
@@ -887,9 +1505,9 @@ export default function App() {
             </div>
           </section>
 
-          {/* 4. GRID USER / ANGGOTA */}
+          {/* 4. GRID USER / ANGGOTA (REAL PEERS ONLY) */}
           <section className="space-y-2">
-            {/* Baris Atas: Tombol (•) TALK ALL, ID SAYA: YUDHI, dan Edit Nama */}
+            {/* Baris Atas: Tombol (•) TALK ALL, ID SAYA: [CALLSIGN], dan Edit Nama */}
             <div className="flex items-center gap-2.5">
               <button
                 onClick={() => {
@@ -924,67 +1542,70 @@ export default function App() {
               </div>
             </div>
 
-            {/* Baris Bawah: Grid 2x3 berisi tombol untuk user yang online */}
-            <div className="grid grid-cols-3 gap-2">
-              {members.slice(0, 6).map((member, idx) => {
-                const isHighlighted =
-                  selectedMemberId === member.id ||
-                  incomingSpeaker === member.callsign;
-                return (
-                  <div
-                    key={member.id}
-                    onClick={() => {
-                      setSelectedMemberId(member.id);
-                      setMembers((prev) =>
-                        prev.map((m) =>
-                          m.id === member.id
-                            ? { ...m, isTargeted: !m.isTargeted }
-                            : m
-                        )
-                      );
-                    }}
-                    role="button"
-                    tabIndex={0}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
+            {/* Baris Bawah: Hanya menampilkan Real Peers. Jika kosong tampilkan "MENCARI ANGGOTA AKTIF..." */}
+            {activeChannelPeers.length === 0 ? (
+              <div className="tactical-panel rounded-2xl py-5 px-4 text-center space-y-1.5">
+                <div className="flex items-center justify-center gap-2 text-[#23dcff]">
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  <span className="font-tactical text-[16px] font-extrabold tracking-wider text-white">
+                    MENCARI ANGGOTA AKTIF...
+                  </span>
+                </div>
+                <p className="font-telemetry text-[10.5px] text-cyan-200/80">
+                  Menunggu perangkat lain terhubung ke CHANNEL {String(channel).padStart(2, '0')} (Broadcast 1s Aktif)
+                </p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-3 gap-2">
+                {activeChannelPeers.map((member) => {
+                  const isHighlighted =
+                    selectedMemberId === member.id ||
+                    incomingSpeaker === member.callsign ||
+                    member.isTargeted;
+                  return (
+                    <div
+                      key={member.id}
+                      onClick={() => {
                         setSelectedMemberId(member.id);
-                      }
-                    }}
-                    className={`rounded-2xl p-2 flex items-center justify-between gap-1.5 border transition-all cursor-pointer ${
-                      isHighlighted
-                        ? 'bg-gradient-to-b from-[#17a9d9] to-[#0c6c99] border-[#66ecff] shadow-[0_0_16px_rgba(35,220,255,0.45)]'
-                        : 'bg-gradient-to-b from-[#062b4c] to-[#041d35] border-[#23dcff]/45 hover:border-[#23dcff]'
-                    }`}
-                  >
-                    <div className="relative w-7 h-7 rounded-full bg-[#03192e] border border-cyan-400/55 flex items-center justify-center shrink-0">
-                      <Mic className="w-3.5 h-3.5 text-[#23dcff]" />
-                      <span className="w-2 h-2 rounded-full bg-[#23dcff] absolute -top-0.5 -right-0.5" />
-                    </div>
-
-                    <div className="min-w-0 flex-1 leading-tight">
-                      <div className="font-tactical text-[14px] font-bold text-white truncate">
-                        {member.callsign}
-                      </div>
-                      <div className="font-telemetry text-[9.5px] text-cyan-100/90 truncate">
-                        {idx === 0 ? '• ID AW..' : 'ALL AKTIF'}
-                      </div>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openEditNameModal(member);
+                        setMembers((prev) =>
+                          prev.map((m) =>
+                            m.id === member.id
+                              ? { ...m, isTargeted: !m.isTargeted }
+                              : m
+                          )
+                        );
                       }}
-                      aria-label={`Edit nama ${member.callsign}`}
-                      className="w-6 h-6 rounded-full bg-[#031b31]/80 hover:bg-[#073358] border border-cyan-300/45 flex items-center justify-center shrink-0 cursor-pointer"
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          setSelectedMemberId(member.id);
+                        }
+                      }}
+                      className={`rounded-2xl p-2 flex items-center justify-between gap-1.5 border transition-all cursor-pointer ${
+                        isHighlighted
+                          ? 'bg-gradient-to-b from-[#17a9d9] to-[#0c6c99] border-[#66ecff] shadow-[0_0_16px_rgba(35,220,255,0.45)]'
+                          : 'bg-gradient-to-b from-[#062b4c] to-[#041d35] border-[#23dcff]/45 hover:border-[#23dcff]'
+                      }`}
                     >
-                      <Pencil className="w-3 h-3 text-cyan-100" />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
+                      <div className="relative w-7 h-7 rounded-full bg-[#03192e] border border-cyan-400/55 flex items-center justify-center shrink-0">
+                        <Mic className="w-3.5 h-3.5 text-[#23dcff]" />
+                        <span className="w-2 h-2 rounded-full bg-[#23dcff] absolute -top-0.5 -right-0.5" />
+                      </div>
+
+                      <div className="min-w-0 flex-1 leading-tight">
+                        <div className="font-tactical text-[14px] font-bold text-white truncate">
+                          {member.callsign}
+                        </div>
+                        <div className="font-telemetry text-[9.5px] text-cyan-100/90 truncate">
+                          {member.ip}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
 
           {/* 5. TOMBOL PTT UTAMA (CENTER) */}
@@ -1257,34 +1878,185 @@ export default function App() {
                 </form>
               )}
 
-              {/* MODAL 3: BARCODE PAIRING */}
+              {/* MODAL 3: BARCODE PAIRING, IN-APP CAMERA SCANNER & INVITE LINK */}
               {activeBottomModal === 'barcode' && (
-                <div className="text-center space-y-3">
-                  <div className="w-44 h-44 mx-auto bg-white p-3 rounded-2xl flex flex-col items-center justify-center shadow-lg">
-                    <QrCode className="w-36 h-36 text-[#03192e]" />
+                <div className="text-center space-y-3.5">
+                  {/* Tab Switcher: Tampilkan Barcode Saya vs Scan Barcode Master */}
+                  <div className="grid grid-cols-2 gap-1.5 p-1 bg-[#021424] rounded-xl border border-cyan-500/30">
+                    <button
+                      type="button"
+                      onClick={() => setBarcodeTab('show')}
+                      className={`py-2 px-2 rounded-lg font-telemetry text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                        barcodeTab === 'show'
+                          ? 'bg-[#23dcff] text-[#02182b]'
+                          : 'text-cyan-200 hover:bg-cyan-500/10'
+                      }`}
+                    >
+                      <QrCode className="w-4 h-4" />
+                      <span>BARCODE SAYA</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBarcodeTab('scan')}
+                      className={`py-2 px-2 rounded-lg font-telemetry text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer ${
+                        barcodeTab === 'scan'
+                          ? 'bg-[#23dcff] text-[#02182b]'
+                          : 'text-cyan-200 hover:bg-cyan-500/10'
+                      }`}
+                    >
+                      <Camera className="w-4 h-4" />
+                      <span>SCAN BARCODE</span>
+                    </button>
                   </div>
-                  <div className="font-telemetry text-xs text-white font-bold">
-                    CHANNEL {String(channel).padStart(2, '0')} • HOST {localIp}
-                  </div>
-                  <p className="font-telemetry text-[11px] text-cyan-200/85 break-all bg-[#021526] p-2.5 rounded-lg border border-cyan-500/30">
-                    {sharePairUrl}
-                  </p>
-                  <button
-                    onClick={() => handleCopyText('pairUrl', sharePairUrl)}
-                    className="w-full py-2.5 rounded-xl cyan-btn-glow text-[#02182b] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
+
+                  {barcodeTab === 'show' ? (
+                    <>
+                      <div className="w-48 h-48 mx-auto bg-white p-2.5 rounded-2xl flex flex-col items-center justify-center shadow-[0_0_25px_rgba(35,220,255,0.35)] border-2 border-[#23dcff]">
+                        {qrCodeDataUrl ? (
+                          <img
+                            src={qrCodeDataUrl}
+                            alt="QR Code Invite Link"
+                            className="w-full h-full object-contain rounded-lg select-all"
+                          />
+                        ) : (
+                          <QrCode className="w-36 h-36 text-[#03192e]" />
+                        )}
+                      </div>
+
+                      <div className="space-y-0.5">
+                        <div className="font-telemetry text-xs text-white font-extrabold">
+                          BARCODE HOST: {myCallsign} ({localIp}) • CH{' '}
+                          {String(channel).padStart(2, '0')}
+                        </div>
+                        <div className="font-telemetry text-[10.5px] text-cyan-200/85">
+                          Buka menu <strong className="text-white">[Barcode] &rarr; SCAN BARCODE</strong> di HP lain untuk langsung terhubung tanpa browser!
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5 text-left">
+                        <label className="block font-telemetry text-[10.5px] text-cyan-200 font-bold">
+                          LINK INVITE &amp; KODE NODE MASTER:
+                        </label>
+                        <input
+                          type="text"
+                          readOnly
+                          value={sharePairUrl}
+                          onFocus={(e) => e.currentTarget.select()}
+                          className="w-full font-telemetry text-[11px] text-cyan-100 bg-[#021526] px-3 py-2 rounded-lg border border-cyan-500/40 focus:outline-none select-all"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleCopyText('pairUrl', sharePairUrl)}
+                          className="py-2.5 px-3 rounded-xl cyan-btn-glow text-[#02182b] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          {copiedText === 'pairUrl' ? (
+                            <>
+                              <Check className="w-4 h-4" />
+                              <span>Link Tersalin!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-4 h-4" />
+                              <span>Salin Link Invite</span>
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleShareInviteLink}
+                          className="py-2.5 px-3 rounded-xl bg-[#063256] hover:bg-[#0a4678] border border-[#23dcff] text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <Share2 className="w-4 h-4 text-[#23dcff]" />
+                          <span>Bagikan Link</span>
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="space-y-3">
+                      <p className="font-telemetry text-[11px] text-cyan-100">
+                        Arahkan kamera ke Barcode di layar HP Master, atau ambil foto Barcode:
+                      </p>
+
+                      <div className="relative w-56 h-56 mx-auto rounded-2xl overflow-hidden bg-black border-2 border-[#23dcff] shadow-[0_0_25px_rgba(35,220,255,0.3)] flex items-center justify-center">
+                        <video
+                          ref={scannerVideoRef}
+                          className="w-full h-full object-cover"
+                          muted
+                          playsInline
+                        />
+                        <canvas ref={scannerCanvasRef} className="hidden" />
+                        <div className="absolute inset-6 border-2 border-dashed border-[#23dcff] rounded-xl pointer-events-none" />
+                        {!isCameraScanning && (
+                          <div className="absolute inset-0 bg-[#021526]/85 flex flex-col items-center justify-center p-4 text-center">
+                            <Camera className="w-8 h-8 text-[#23dcff] mb-2" />
+                            <button
+                              type="button"
+                              onClick={startCameraScanner}
+                              className="px-3.5 py-2 rounded-xl cyan-btn-glow text-[#02182b] font-telemetry text-xs font-extrabold cursor-pointer"
+                            >
+                              AKTIFKAN KAMERA SCANNER
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      {scannerError && (
+                        <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-400/50 text-amber-200 font-telemetry text-[11px]">
+                          {scannerError}
+                        </div>
+                      )}
+
+                      <label className="w-full py-2.5 px-3 rounded-xl bg-[#063256] hover:bg-[#0a4678] border border-[#23dcff] text-white font-telemetry text-xs font-bold flex items-center justify-center gap-2 cursor-pointer">
+                        <Upload className="w-4 h-4 text-[#23dcff]" />
+                        <span>Ambil Foto / Pilih Gambar Barcode</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          onChange={handleScanQrImageFile}
+                          className="hidden"
+                        />
+                      </label>
+                    </div>
+                  )}
+
+                  {/* Form Gabung Manual via Link Invite / Kode Master */}
+                  <form
+                    onSubmit={handleManualInviteJoin}
+                    className="pt-3 border-t border-cyan-400/25 space-y-2 text-left"
                   >
-                    {copiedText === 'pairUrl' ? (
-                      <>
-                        <Check className="w-4 h-4" />
-                        <span>Link Pairing Tersalin!</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-4 h-4" />
-                        <span>Salin Link Invite Client (CH {channel})</span>
-                      </>
+                    <label className="block font-telemetry text-[11px] font-bold text-[#23dcff]">
+                      ATAU TEMPEL LINK INVITE / KODE NODE MASTER:
+                    </label>
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <Link2 className="w-3.5 h-3.5 text-cyan-300 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={manualInviteInput}
+                          onChange={(e) => setManualInviteInput(e.target.value)}
+                          placeholder="Tempel Link Invite atau Kode Node Master..."
+                          className="w-full pl-8 pr-3 py-2 rounded-xl bg-[#021526] border border-cyan-400/50 text-white font-telemetry text-xs focus:border-[#23dcff] focus:outline-none"
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        className="px-3.5 py-2 rounded-xl bg-[#23dcff] text-[#02182b] font-telemetry text-xs font-extrabold flex items-center gap-1 shrink-0 cursor-pointer"
+                      >
+                        <UserPlus className="w-3.5 h-3.5" />
+                        <span>GABUNG</span>
+                      </button>
+                    </div>
+                    {inviteJoinStatus && (
+                      <div className="px-3 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-400 text-emerald-200 font-telemetry text-[11px] font-bold text-center">
+                        {inviteJoinStatus}
+                      </div>
                     )}
-                  </button>
+                  </form>
                 </div>
               )}
 

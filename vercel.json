@@ -11,7 +11,7 @@
       "headers": [
         {
           "key": "Permissions-Policy",
-          "value": "microphone=(self *), autoplay=(self *), fullscreen=(self *), wake-lock=(self *)"
+          "value": "camera=(self *), microphone=(self *), autoplay=(self *), fullscreen=(self *), wake-lock=(self *)"
         },
         {
           "key": "Cross-Origin-Opener-Policy",

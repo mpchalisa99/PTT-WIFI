@@ -13,7 +13,7 @@ import 'package:record/record.dart';
 import 'package:udp/udp.dart';
 
 /// ============================================================================
-/// 1. ENTRY POINT UTAMA (main) & INISIALISASI MULTIPROVIDER
+/// 1. ENTRY POINT UTAMA (main) & MULTIPROVIDER
 /// ============================================================================
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,17 +26,13 @@ void main() async {
     ),
   );
 
-  // Inisialisasi service Audio & Jaringan UDP LAN Hotspot
   final audioService = AudioService();
   final udpNetworkService = UdpNetworkService();
 
-  // Hubungkan callback paket suara UDP masuk (Port 50001) ke pemutar PCM
+  // Hubungkan paket suara PCM yang masuk dari UDP Port 50001 ke AudioService
   udpNetworkService.onAudioPacketReceived = (Uint8List pcmBytes, String senderIp) {
     audioService.playAudioChunk(pcmBytes);
   };
-
-  // Jalankan deteksi IP lokal & buka socket UDP (Port 50000 & Port 50001)
-  await udpNetworkService.initialize();
 
   runApp(
     MultiProvider(
@@ -71,7 +67,7 @@ class PeerMember {
     required this.ipAddress,
     required this.channel,
     this.isTargeted = true,
-    this.lastPingMs = 24,
+    this.lastPingMs = 18,
     DateTime? lastSeen,
   }) : lastSeen = lastSeen ?? DateTime.now();
 
@@ -83,7 +79,7 @@ class PeerMember {
       ipAddress: (json['ip'] ?? '0.0.0.0').toString(),
       channel: (json['ch'] as num?)?.toInt() ?? 12,
       isTargeted: json['isTargeted'] as bool? ?? true,
-      lastPingMs: (json['ping'] as num?)?.toInt() ?? 24,
+      lastPingMs: (json['ping'] as num?)?.toInt() ?? 18,
       lastSeen: DateTime.now(),
     );
   }
@@ -99,155 +95,189 @@ class PeerMember {
 }
 
 /// ============================================================================
-/// 3. UDP NETWORK SERVICE (Auto-Discovery Port 50000 & Audio Stream Port 50001)
+/// 3. UDP NETWORK SERVICE
+/// - Tanpa Re-bind saat pindah channel (Socket tetap terbuka & stabil)
+/// - Auto-Discovery Broadcast konstan setiap 1 detik (Port 50000)
+/// - Identitas Permanen: IP '192.168.43.1' = HP MASTER, selain itu = CLIENT
+/// - Real Peers Only (Tidak ada data anggota palsu/simulasi)
 /// ============================================================================
 class UdpNetworkService extends ChangeNotifier {
   static const int discoveryPort = 50000;
   static const int audioPort = 50001;
-  static const String masterDefaultIp = '192.168.43.1';
+  static const String masterHotspotIp = '192.168.43.1';
 
   UDP? _discoverySocket;
   UDP? _audioSocket;
   Timer? _heartbeatTimer;
   Timer? _pruneTimer;
 
-  String _localIp = masterDefaultIp;
-  String _myCallsign = 'YUDHI';
-  final String _deviceId = 'NODE-${DateTime.now().millisecondsSinceEpoch % 10000}';
+  bool _isInitialized = false;
+  String _localIp = '0.0.0.0';
+  String _myCallsign = '';
+  final String _deviceId = 'NODE-${DateTime.now().millisecondsSinceEpoch % 100000}';
   int _currentChannel = 12;
-  bool _isMaster = true;
+  bool _isMaster = false;
   bool _talkAll = true;
   bool _isTransmitting = false;
-  int _lastPingMs = 24;
-  int _pingDeltaMs = 4;
+  int _lastPingMs = 18;
+  int _pingDeltaMs = 2;
   int _txSequence = 0;
 
-  /// Daftar anggota online yang ditemukan via UDP Broadcast (key: IP Address)
+  /// Map murni berisi perangkat nyata yang aktif di jaringan Hotspot (key: IP)
   final Map<String, PeerMember> _peers = {};
 
-  /// Callback saat paket suara PCM diterima dari perangkat lain
+  /// Callback saat paket suara PCM diterima dari jaringan
   void Function(Uint8List pcmBytes, String senderIp)? onAudioPacketReceived;
 
+  bool get isInitialized => _isInitialized;
   String get localIp => _localIp;
   String get myCallsign => _myCallsign;
   int get currentChannel => _currentChannel;
   bool get isMaster => _isMaster;
+  String get roleLabel => _isMaster ? 'HP MASTER' : 'CLIENT';
   bool get talkAll => _talkAll;
   bool get isTransmitting => _isTransmitting;
   int get lastPingMs => _lastPingMs;
   int get pingDeltaMs => _pingDeltaMs;
   bool get isHighLatency => _lastPingMs > 150;
 
-  /// Daftar anggota aktif pada channel yang sama
+  /// Hanya mengembalikan daftar klien nyata yang aktif pada channel saat ini
   List<PeerMember> get activeChannelPeers => _peers.values
       .where((p) => p.channel == _currentChannel)
       .toList()
     ..sort((a, b) => a.callsign.compareTo(b.callsign));
 
-  /// Daftar anggota yang menjadi target pengiriman suara Unicast
+  /// Daftar peer tujuan pengiriman paket suara Unicast pada channel aktif
   List<PeerMember> get targetedPeers => activeChannelPeers
       .where((p) => _talkAll || p.isTargeted)
       .toList();
 
-  /// Inisialisasi IP lokal Hotspot dan buka socket UDP Port 50000 & 50001
+  /// Dipanggil dari SetupScreen saat pengguna menekan tombol "KONEK JARINGAN"
+  Future<void> connectWithCallsign(String callsign) async {
+    _myCallsign = callsign.trim().toUpperCase();
+    await initialize();
+  }
+
+  /// Inisialisasi IP lokal & buka socket UDP Port 50000 dan 50001 HANYA SEKALI
   Future<void> initialize() async {
     await _detectLocalHotspotIp();
-    await _bindDiscoverySocket();
-    await _bindAudioSocket();
 
-    // Kirim heartbeat UDP Broadcast setiap 1.5 detik untuk Auto-Discovery
+    // Cegah re-bind jika socket sudah terbuka agar koneksi selalu stabil
+    if (_discoverySocket == null) {
+      await _bindDiscoverySocket();
+    }
+    if (_audioSocket == null) {
+      await _bindAudioSocket();
+    }
+
+    // Kirim UDP Broadcast (ANNOUNCE) secara konstan setiap 1 detik
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(
-      const Duration(milliseconds: 1500),
+      const Duration(seconds: 1),
       (_) => _sendDiscoveryAnnouncement(),
     );
 
-    // Hapus peer yang tidak mengirim sinyal > 7 detik (putus koneksi WiFi)
+    // Bersihkan peer yang tidak mengirim heartbeat > 5 detik (putus WiFi)
     _pruneTimer?.cancel();
     _pruneTimer = Timer.periodic(
-      const Duration(seconds: 3),
+      const Duration(seconds: 2),
       (_) => _pruneStalePeers(),
     );
 
+    _isInitialized = true;
     await _sendDiscoveryAnnouncement();
+    notifyListeners();
   }
 
-  /// Mendeteksi IP lokal perangkat di jaringan WiFi Hotspot (mis. 192.168.43.x)
+  /// Deteksi IP lokal perangkat & kunci permanen status HP MASTER vs CLIENT:
+  /// Jika IP == '192.168.43.1' -> HP MASTER, selain itu -> CLIENT.
   Future<void> _detectLocalHotspotIp() async {
+    String? detectedIp;
     try {
       final info = NetworkInfo();
-      String? wifiIp = await info.getWifiIP();
+      detectedIp = await info.getWifiIP();
 
-      // Fallback scanning NetworkInterface jika HP ini adalah Host Hotspot (ap0/wlan0)
-      if (wifiIp == null || wifiIp.isEmpty || wifiIp == '0.0.0.0') {
-        final interfaces = await NetworkInterface.list(
-          type: InternetAddressType.IPv4,
-          includeLoopback: false,
-        );
-        for (final iface in interfaces) {
-          for (final addr in iface.addresses) {
-            if (addr.address.startsWith('192.168.')) {
-              wifiIp = addr.address;
-              break;
-            }
+      // Cek seluruh NetworkInterface untuk mendeteksi interface Hotspot (ap0/wlan0)
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+      );
+
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (addr.address == masterHotspotIp) {
+            detectedIp = masterHotspotIp;
+            break;
+          }
+          if ((detectedIp == null || detectedIp.isEmpty || detectedIp == '0.0.0.0') &&
+              addr.address.startsWith('192.168.')) {
+            detectedIp = addr.address;
           }
         }
+        if (detectedIp == masterHotspotIp) break;
       }
-
-      _localIp = wifiIp ?? masterDefaultIp;
-      _isMaster = _localIp.endsWith('.1');
-      notifyListeners();
     } catch (e) {
-      debugPrint('Gagal deteksi IP WiFi Hotspot, gunakan default: $e');
-      _localIp = masterDefaultIp;
-      _isMaster = true;
+      debugPrint('Gagal membaca NetworkInterface: $e');
+    }
+
+    _localIp = (detectedIp != null && detectedIp.isNotEmpty)
+        ? detectedIp
+        : masterHotspotIp;
+
+    // Kunci permanen peran berdasarkan IP '192.168.43.1'
+    _isMaster = (_localIp == masterHotspotIp);
+  }
+
+  /// Buka socket UDP Port 50000 sekali saja selama aplikasi berjalan
+  Future<void> _bindDiscoverySocket() async {
+    try {
+      _discoverySocket = await UDP.bind(Endpoint.any(port: const Port(discoveryPort)));
+
+      _discoverySocket!.asStream().listen((Datagram? datagram) {
+        if (datagram == null) return;
+        final senderIp = datagram.address.address;
+
+        // Abaikan paket pantulan dari IP sendiri
+        if (senderIp == _localIp) return;
+
+        try {
+          final Map<String, dynamic> data = jsonDecode(utf8.decode(datagram.data));
+          final String type = (data['type'] ?? '').toString();
+
+          if (type == 'ANNOUNCE') {
+            data['ip'] = senderIp; // Gunakan IP sumber asli dari datagram UDP
+            final incoming = PeerMember.fromJson(data);
+            final existing = _peers[senderIp];
+            if (existing != null) {
+              incoming.isTargeted = existing.isTargeted;
+              incoming.lastPingMs = existing.lastPingMs;
+            }
+            _peers[senderIp] = incoming;
+            notifyListeners();
+          } else if (type == 'PING') {
+            _sendPong(senderIp, (data['ts'] as num).toInt());
+          } else if (type == 'PONG') {
+            final sentTs = (data['ts'] as num).toInt();
+            final rtt = (DateTime.now().millisecondsSinceEpoch - sentTs).clamp(1, 999);
+            _pingDeltaMs = (rtt - _lastPingMs).abs();
+            _lastPingMs = rtt;
+            if (_peers.containsKey(senderIp)) {
+              _peers[senderIp]!.lastPingMs = rtt;
+            }
+            notifyListeners();
+          }
+        } catch (e) {
+          debugPrint('Paket UDP Discovery rusak dari $senderIp: $e');
+        }
+      });
+    } catch (e) {
+      debugPrint('Gagal bind discovery socket port $discoveryPort: $e');
     }
   }
 
-  /// Membuka socket UDP Port 50000 untuk mendengarkan Broadcast Auto-Discovery & Ping
-  Future<void> _bindDiscoverySocket() async {
-    _discoverySocket?.close();
-    _discoverySocket = await UDP.bind(Endpoint.any(port: const Port(discoveryPort)));
-
-    _discoverySocket!.asStream().listen((Datagram? datagram) {
-      if (datagram == null) return;
-      final senderIp = datagram.address.address;
-      if (senderIp == _localIp) return;
-
-      try {
-        final Map<String, dynamic> data = jsonDecode(utf8.decode(datagram.data));
-        final String type = (data['type'] ?? '').toString();
-
-        if (type == 'ANNOUNCE') {
-          final incoming = PeerMember.fromJson(data);
-          final existing = _peers[senderIp];
-          if (existing != null) {
-            incoming.isTargeted = existing.isTargeted;
-            incoming.lastPingMs = existing.lastPingMs;
-          }
-          _peers[senderIp] = incoming;
-          notifyListeners();
-        } else if (type == 'PING') {
-          _sendPong(senderIp, (data['ts'] as num).toInt());
-        } else if (type == 'PONG') {
-          final sentTs = (data['ts'] as num).toInt();
-          final rtt = DateTime.now().millisecondsSinceEpoch - sentTs;
-          _pingDeltaMs = rtt - _lastPingMs;
-          _lastPingMs = rtt.clamp(1, 999);
-          if (_peers.containsKey(senderIp)) {
-            _peers[senderIp]!.lastPingMs = _lastPingMs;
-          }
-          notifyListeners();
-        }
-      } catch (e) {
-        debugPrint('Paket UDP Discovery tidak valid dari $senderIp: $e');
-      }
-    });
-  }
-
-  /// Mengirim paket ANNOUNCE ke alamat Broadcast Subnet Hotspot & Global Broadcast
+  /// Kirim paket ANNOUNCE setiap 1 detik ke Broadcast Subnet & Global Broadcast
   Future<void> _sendDiscoveryAnnouncement() async {
-    if (_discoverySocket == null) return;
+    if (_discoverySocket == null || _myCallsign.isEmpty) return;
 
     final bytes = utf8.encode(
       jsonEncode({
@@ -277,37 +307,44 @@ class UdpNetworkService extends ChangeNotifier {
         bytes,
         Endpoint.broadcast(port: const Port(discoveryPort)),
       );
+    } catch (_) {}
+  }
+
+  /// Buka socket UDP Port 50001 sekali saja & filter paket suara via byte header channel
+  Future<void> _bindAudioSocket() async {
+    try {
+      _audioSocket = await UDP.bind(Endpoint.any(port: const Port(audioPort)));
+
+      _audioSocket!.asStream().listen((Datagram? datagram) {
+        if (datagram == null || datagram.data.length <= 6) return;
+        final senderIp = datagram.address.address;
+        if (senderIp == _localIp) return;
+
+        final bytes = datagram.data;
+        final int packetChannel = bytes[0];
+
+        // Filter channel di level aplikasi tanpa menutup/re-bind socket UDP
+        if (packetChannel != _currentChannel) return;
+
+        final pcmPayload = Uint8List.sublistView(bytes, 6);
+        onAudioPacketReceived?.call(pcmPayload, senderIp);
+      });
     } catch (e) {
-      debugPrint('Gagal mengirim UDP broadcast discovery: $e');
+      debugPrint('Gagal bind audio socket port $audioPort: $e');
     }
   }
 
-  /// Membuka socket UDP Port 50001 untuk menerima stream paket suara PCM mentah
-  Future<void> _bindAudioSocket() async {
-    _audioSocket?.close();
-    _audioSocket = await UDP.bind(Endpoint.any(port: const Port(audioPort)));
-
-    _audioSocket!.asStream().listen((Datagram? datagram) {
-      if (datagram == null || datagram.data.length <= 6) return;
-      final senderIp = datagram.address.address;
-      if (senderIp == _localIp) return;
-
-      final bytes = datagram.data;
-      final packetChannel = bytes[0];
-      if (packetChannel != _currentChannel) return;
-
-      final pcmPayload = Uint8List.sublistView(bytes, 6);
-      onAudioPacketReceived?.call(pcmPayload, senderIp);
-    });
-  }
-
-  /// Mengirimkan potongan byte suara PCM 16-bit ke anggota aktif via UDP Port 50001
+  /// Mengirim potongan suara PCM mentah dengan header 6-byte (Byte 0 = _currentChannel)
   Future<void> sendRawAudioChunk(Uint8List pcmChunk) async {
     if (_audioSocket == null || pcmChunk.isEmpty) return;
 
     _txSequence = (_txSequence + 1) & 0xFFFF;
 
-    // Header 6-Byte: [Channel(1B), Flags(1B), Sequence(2B), Length(2B)]
+    // Header 6-Byte:
+    // Byte 0: _currentChannel (1-99)
+    // Byte 1: Flags (Bit 0 = Master, Bit 1 = TalkAll)
+    // Byte 2-3: Sequence Number (Uint16 Big Endian)
+    // Byte 4-5: Payload Length (Uint16 Big Endian)
     final header = ByteData(6);
     header.setUint8(0, _currentChannel);
     header.setUint8(1, (_isMaster ? 1 : 0) | (_talkAll ? 2 : 0));
@@ -319,24 +356,6 @@ class UdpNetworkService extends ChangeNotifier {
     packet.setRange(6, packet.length, pcmChunk);
 
     final targets = targetedPeers;
-    if (targets.isEmpty) {
-      // Jika belum ada peer terdeteksi di tabel, kirim ke subnet broadcast
-      final parts = _localIp.split('.');
-      final subnetBroadcast = parts.length == 4
-          ? '${parts[0]}.${parts[1]}.${parts[2]}.255'
-          : '192.168.43.255';
-      try {
-        await _audioSocket!.send(
-          packet,
-          Endpoint.unicast(
-            InternetAddress(subnetBroadcast),
-            port: const Port(audioPort),
-          ),
-        );
-      } catch (_) {}
-      return;
-    }
-
     for (final peer in targets) {
       try {
         await _audioSocket!.send(
@@ -346,13 +365,11 @@ class UdpNetworkService extends ChangeNotifier {
             port: const Port(audioPort),
           ),
         );
-      } catch (e) {
-        debugPrint('Gagal kirim paket audio ke ${peer.ipAddress}: $e');
-      }
+      } catch (_) {}
     }
   }
 
-  /// Mengirim paket PING ke seluruh peer aktif untuk memperbarui nilai latensi
+  /// Uji ulang latensi PING ke semua peer aktif
   Future<void> refreshPing() async {
     if (_discoverySocket == null) return;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -388,21 +405,26 @@ class UdpNetworkService extends ChangeNotifier {
   void _pruneStalePeers() {
     final now = DateTime.now();
     final beforeCount = _peers.length;
-    _peers.removeWhere((_, peer) => now.difference(peer.lastSeen).inSeconds > 7);
+    _peers.removeWhere((_, peer) => now.difference(peer.lastSeen).inSeconds > 5);
     if (_peers.length != beforeCount) {
       notifyListeners();
     }
   }
 
+  /// Pindah channel dengan aman: TIDAK menutup/re-bind socket UDP!
+  /// Hanya memperbarui `_currentChannel` dan langsung mengumumkan via Broadcast.
   void setChannel(int newChannel) {
-    _currentChannel = newChannel.clamp(1, 99);
+    final nextChannel = newChannel.clamp(1, 99);
+    if (_currentChannel == nextChannel) return;
+    _currentChannel = nextChannel;
     _sendDiscoveryAnnouncement();
     notifyListeners();
   }
 
   void setCallsign(String newName) {
-    if (newName.trim().isEmpty) return;
-    _myCallsign = newName.trim().toUpperCase();
+    final cleaned = newName.trim().toUpperCase();
+    if (cleaned.isEmpty) return;
+    _myCallsign = cleaned;
     _sendDiscoveryAnnouncement();
     notifyListeners();
   }
@@ -427,9 +449,86 @@ class UdpNetworkService extends ChangeNotifier {
   }
 
   void setTransmitting(bool value) {
+    if (_isTransmitting == value) return;
     _isTransmitting = value;
     _sendDiscoveryAnnouncement();
     notifyListeners();
+  }
+
+  /// Menghasilkan Link Invite Barcode yang berisi IP Host, Channel Aktif, dan Callsign
+  String get inviteLink =>
+      'diskomlekau://join?ip=$_localIp&ch=$_currentChannel&host=${Uri.encodeComponent(_myCallsign)}';
+
+  /// Memproses Link Invite Barcode yang ditempel/di-scan dari perangkat lain
+  /// lalu otomatis menyamakan channel dan mengirim paket ANNOUNCE Unicast langsung ke IP Host
+  Future<bool> joinViaInviteLink(String rawInput) async {
+    final trimmed = rawInput.trim();
+    if (trimmed.isEmpty) return false;
+
+    String targetIp = masterHotspotIp;
+    int targetCh = _currentChannel;
+    String targetCallsign = 'MASTER';
+
+    try {
+      if (trimmed.contains('://') || trimmed.contains('?')) {
+        final uri = Uri.parse(
+          trimmed.startsWith('http') || trimmed.startsWith('diskomlekau://')
+              ? trimmed
+              : 'diskomlekau://join?$trimmed',
+        );
+        targetIp = uri.queryParameters['ip'] ??
+            uri.queryParameters['master'] ??
+            masterHotspotIp;
+        targetCh = int.tryParse(uri.queryParameters['ch'] ?? '') ?? _currentChannel;
+        targetCallsign =
+            (uri.queryParameters['host'] ?? uri.queryParameters['hostCallsign'] ?? 'MASTER')
+                .toUpperCase();
+      } else {
+        targetIp = trimmed;
+      }
+
+      _currentChannel = targetCh.clamp(1, 99);
+
+      if (targetIp != _localIp && targetIp.isNotEmpty) {
+        _peers[targetIp] = PeerMember(
+          id: 'HOST-$targetIp',
+          callsign: targetCallsign,
+          ipAddress: targetIp,
+          channel: _currentChannel,
+          isTargeted: true,
+          lastPingMs: 18,
+          lastSeen: DateTime.now(),
+        );
+
+        // Kirim paket ANNOUNCE langsung (Unicast) ke IP Host dari link invite
+        if (_discoverySocket != null && _myCallsign.isNotEmpty) {
+          final bytes = utf8.encode(
+            jsonEncode({
+              'type': 'ANNOUNCE',
+              'id': _deviceId,
+              'callsign': _myCallsign,
+              'ip': _localIp,
+              'ch': _currentChannel,
+              'ping': _lastPingMs,
+            }),
+          );
+          await _discoverySocket!.send(
+            bytes,
+            Endpoint.unicast(
+              InternetAddress(targetIp),
+              port: const Port(discoveryPort),
+            ),
+          );
+        }
+      }
+
+      await _sendDiscoveryAnnouncement();
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('Format link invite tidak valid: $e');
+      return false;
+    }
   }
 
   @override
@@ -443,7 +542,7 @@ class UdpNetworkService extends ChangeNotifier {
 }
 
 /// ============================================================================
-/// 4. AUDIO SERVICE (Perekam Mic Raw PCM 16-bit 16kHz & Pemutar Stream UDP)
+/// 4. AUDIO SERVICE (Raw PCM 16-bit 16kHz Mono Streaming & Playback)
 /// ============================================================================
 class AudioService {
   final AudioRecorder _recorder = AudioRecorder();
@@ -455,9 +554,7 @@ class AudioService {
   static const int sampleRate = 16000;
   static const int numChannels = 1;
   static const int bitsPerSample = 16;
-
-  /// 1280 bytes = 40ms audio @ 16kHz 16-bit mono (aman di bawah MTU WiFi 1472B)
-  static const int udpChunkSize = 1280;
+  static const int udpChunkSize = 1280; // 40ms @ 16kHz 16-bit mono
 
   final BytesBuilder _playbackBuffer = BytesBuilder(copy: false);
   bool _isPlayingChunk = false;
@@ -467,14 +564,13 @@ class AudioService {
     _player.setPlayerMode(PlayerMode.lowLatency);
   }
 
-  /// Mulai menangkap suara dari microphone (Raw PCM 16-bit Mono 16000Hz) dan
-  /// mengalirkan potongan byte secara terus-menerus ke callback [onAudioChunk].
+  /// Mulai menangkap suara dari microphone (Raw PCM 16-bit Mono 16000Hz)
   Future<void> startRecording(void Function(Uint8List chunk) onAudioChunk) async {
     if (_isRecording) return;
 
     final hasPerm = await _recorder.hasPermission();
     if (!hasPerm) {
-      debugPrint('Izin microphone belum diberikan oleh pengguna.');
+      debugPrint('Izin microphone ditolak.');
       return;
     }
 
@@ -504,12 +600,12 @@ class AudioService {
         }
       },
       onError: (Object err) {
-        debugPrint('Error pada stream microphone: $err');
+        debugPrint('Error stream microphone: $err');
       },
     );
   }
 
-  /// Menghentikan perekaman suara saat tombol PTT dilepas (`onLongPressEnd`).
+  /// Hentikan perekaman microphone saat tombol PTT dilepas
   Future<void> stopRecording() async {
     _isRecording = false;
     await _recordingSubscription?.cancel();
@@ -520,14 +616,12 @@ class AudioService {
     }
   }
 
-  /// Memutar data PCM mentah yang diterima dari jaringan UDP menggunakan
-  /// BytesSource + Header WAV 44-byte di memori RAM (tanpa file perantara).
+  /// Memutar data PCM mentah dari paket UDP menggunakan in-memory WAV header
   Future<void> playAudioChunk(Uint8List pcmBytes) async {
     if (pcmBytes.isEmpty || _isRecording) return;
 
     _playbackBuffer.add(pcmBytes);
 
-    // Kumpulkan minimal 3 paket (~120ms) agar pemutaran bebas patah-patah (jitter)
     if (_playbackBuffer.length < udpChunkSize * 3 || _isPlayingChunk) {
       return;
     }
@@ -538,13 +632,12 @@ class AudioService {
       final wavBytes = _addWavHeader(rawPcm);
       await _player.play(BytesSource(wavBytes));
     } catch (e) {
-      debugPrint('Gagal memutar chunk audio UDP: $e');
+      debugPrint('Gagal memutar paket audio UDP: $e');
     } finally {
       _isPlayingChunk = false;
     }
   }
 
-  /// Membuat header WAV 44-byte di memori untuk membungkus Raw PCM 16-bit 16kHz Mono
   Uint8List _addWavHeader(Uint8List pcmData) {
     final int dataLength = pcmData.length;
     final int fileSize = dataLength + 36;
@@ -566,7 +659,7 @@ class AudioService {
     header.setUint8(14, 0x74); // 't'
     header.setUint8(15, 0x20); // ' '
     header.setUint32(16, 16, Endian.little);
-    header.setUint16(20, 1, Endian.little); // 1 = PCM
+    header.setUint16(20, 1, Endian.little); // PCM = 1
     header.setUint16(22, numChannels, Endian.little);
     header.setUint32(24, sampleRate, Endian.little);
     header.setUint32(28, byteRate, Endian.little);
@@ -592,7 +685,7 @@ class AudioService {
 }
 
 /// ============================================================================
-/// 5. ROOT WIDGET & UI TAKTIKAL "DISKOMLEKAU TACTICAL PTT"
+/// 5. MATERIAL APP & LAYAR SETUP AWAL (SetupScreen)
 /// ============================================================================
 class DiskomlekauTacticalPttApp extends StatelessWidget {
   const DiskomlekauTacticalPttApp({super.key});
@@ -609,11 +702,229 @@ class DiskomlekauTacticalPttApp extends StatelessWidget {
           secondary: Color(0xFF09B6DF),
         ),
       ),
-      home: const TacticalPttHomePage(),
+      // Halaman pertama wajib melalui SetupScreen (Input Callsign)
+      home: const SetupScreen(),
     );
   }
 }
 
+class SetupScreen extends StatefulWidget {
+  const SetupScreen({super.key});
+
+  @override
+  State<SetupScreen> createState() => _SetupScreenState();
+}
+
+class _SetupScreenState extends State<SetupScreen> {
+  final TextEditingController _callsignController = TextEditingController();
+  bool _isConnecting = false;
+  String? _errorText;
+
+  static const Color bgDarkNavy = Color(0xFF041D34);
+  static const Color cyanBright = Color(0xFF23DCFF);
+  static const Color cyanSoft = Color(0xFF7CE8FF);
+
+  Future<void> _handleConnect() async {
+    final callsign = _callsignController.text.trim().toUpperCase();
+    if (callsign.isEmpty) {
+      setState(() => _errorText = 'CALLSIGN / NAMA WAJIB DIISI!');
+      return;
+    }
+
+    setState(() {
+      _errorText = null;
+      _isConnecting = true;
+    });
+
+    final net = context.read<UdpNetworkService>();
+    await net.connectWithCallsign(callsign);
+
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => const TacticalPttHomePage(),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _callsignController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: bgDarkNavy,
+      body: CustomPaint(
+        painter: _TacticalGridPainter(),
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+              child: Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF072D4F), Color(0xFF041C33)],
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                  ),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: cyanBright.withValues(alpha: 0.65), width: 1.5),
+                  boxShadow: [
+                    BoxShadow(color: cyanBright.withValues(alpha: 0.2), blurRadius: 24),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 76,
+                      height: 76,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: const Color(0xFF03192E),
+                        border: Border.all(color: cyanBright, width: 2),
+                        boxShadow: [
+                          BoxShadow(color: cyanBright.withValues(alpha: 0.35), blurRadius: 16),
+                        ],
+                      ),
+                      child: const Icon(Icons.sensors, size: 40, color: cyanBright),
+                    ),
+                    const SizedBox(height: 18),
+                    const Text(
+                      'DISKOMLEKAU TACTICAL PTT',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1.4,
+                        shadows: [Shadow(color: cyanBright, blurRadius: 12)],
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'REGISTRASI IDENTITAS JARINGAN HOTSPOT LAN',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: cyanSoft,
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: 0.8,
+                      ),
+                    ),
+                    const SizedBox(height: 24),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        'MASUKKAN NAMA / CALLSIGN ANDA:',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.9),
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _callsignController,
+                      autofocus: true,
+                      textCapitalization: TextCapitalization.characters,
+                      maxLength: 12,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                        letterSpacing: 1.5,
+                      ),
+                      decoration: InputDecoration(
+                        counterText: '',
+                        hintText: 'CONTOH: YUDHI / GARUDA-1',
+                        hintStyle: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.35),
+                          fontSize: 14,
+                        ),
+                        errorText: _errorText,
+                        filled: true,
+                        fillColor: const Color(0xFF021526),
+                        prefixIcon: const Icon(Icons.person_outline, color: cyanBright),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: BorderSide(color: cyanBright.withValues(alpha: 0.5), width: 1.4),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: cyanBright, width: 2),
+                        ),
+                        errorBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: Colors.redAccent, width: 1.5),
+                        ),
+                        focusedErrorBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                          borderSide: const BorderSide(color: Colors.redAccent, width: 2),
+                        ),
+                      ),
+                      onSubmitted: (_) => _handleConnect(),
+                    ),
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: cyanBright,
+                          foregroundColor: const Color(0xFF02182B),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          elevation: 8,
+                        ),
+                        onPressed: _isConnecting ? null : _handleConnect,
+                        child: _isConnecting
+                            ? const SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2.5,
+                                  color: Color(0xFF02182B),
+                                ),
+                              )
+                            : const Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(Icons.wifi_tethering, size: 20),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    'KONEK JARINGAN',
+                                    style: TextStyle(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 1.2,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// ============================================================================
+/// 6. HALAMAN UTAMA DASHBOARD PTT (TacticalPttHomePage)
+/// ============================================================================
 class TacticalPttHomePage extends StatefulWidget {
   const TacticalPttHomePage({super.key});
 
@@ -628,21 +939,8 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
   static const Color cyanBright = Color(0xFF23DCFF);
   static const Color cyanSoft = Color(0xFF7CE8FF);
 
-  /// Daftar anggota contoh saat diuji pada 1 perangkat; otomatis digantikan
-  /// oleh daftar `activeChannelPeers` begitu ada perangkat lain terhubung ke Hotspot.
-  final List<PeerMember> _fallbackMembers = [
-    PeerMember(id: 'M1', callsign: 'YUDHI', ipAddress: '192.168.43.1', channel: 12),
-    PeerMember(id: 'M2', callsign: 'EKO', ipAddress: '192.168.43.102', channel: 12),
-    PeerMember(id: 'M3', callsign: 'PUJI', ipAddress: '192.168.43.103', channel: 12),
-    PeerMember(id: 'M4', callsign: 'JEFRY', ipAddress: '192.168.43.104', channel: 12),
-    PeerMember(id: 'M5', callsign: 'YUSUF', ipAddress: '192.168.43.105', channel: 12),
-    PeerMember(id: 'M6', callsign: 'EDWIN', ipAddress: '192.168.43.106', channel: 12),
-  ];
-
-  void _showEditCallsignDialog(BuildContext context, UdpNetworkService net, {PeerMember? member}) {
-    final controller = TextEditingController(
-      text: member != null ? member.callsign : net.myCallsign,
-    );
+  void _showEditCallsignDialog(BuildContext context, UdpNetworkService net) {
+    final controller = TextEditingController(text: net.myCallsign);
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -651,9 +949,9 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
           borderRadius: BorderRadius.circular(16),
           side: const BorderSide(color: cyanBright, width: 1.5),
         ),
-        title: Text(
-          member != null ? 'UBAH CALLSIGN ANGGOTA' : 'EDIT CALLSIGN SAYA',
-          style: const TextStyle(color: cyanBright, fontWeight: FontWeight.bold, fontSize: 15),
+        title: const Text(
+          'EDIT CALLSIGN SAYA',
+          style: TextStyle(color: cyanBright, fontWeight: FontWeight.bold, fontSize: 15),
         ),
         content: TextField(
           controller: controller,
@@ -661,7 +959,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
           textCapitalization: TextCapitalization.characters,
           style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
           decoration: InputDecoration(
-            hintText: 'Masukkan Callsign',
+            hintText: 'Masukkan Callsign Baru',
             hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.4)),
             enabledBorder: OutlineInputBorder(
               borderSide: BorderSide(color: cyanBright.withValues(alpha: 0.5)),
@@ -681,12 +979,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
             onPressed: () {
               final value = controller.text.trim().toUpperCase();
               if (value.isNotEmpty) {
-                if (member != null) {
-                  setState(() => member.callsign = value);
-                } else {
-                  net.setCallsign(value);
-                  setState(() => _fallbackMembers[0].callsign = value);
-                }
+                net.setCallsign(value);
               }
               Navigator.pop(ctx);
             },
@@ -701,6 +994,9 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
   }
 
   void _showBarcodeModal(BuildContext context, UdpNetworkService net) {
+    final inviteController = TextEditingController();
+    final link = net.inviteLink;
+
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -710,32 +1006,134 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
           side: const BorderSide(color: cyanBright, width: 1.5),
         ),
         title: const Text(
-          'BARCODE PAIRING HOTSPOT',
+          'BARCODE & LINK INVITE JARINGAN',
           textAlign: TextAlign.center,
           style: TextStyle(color: cyanBright, fontWeight: FontWeight.bold, fontSize: 15),
         ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: cyanBright, width: 2),
+                ),
+                child: const Icon(Icons.qr_code_2, size: 150, color: Color(0xFF03192E)),
               ),
-              child: const Icon(Icons.qr_code_2, size: 160, color: Color(0xFF03192E)),
-            ),
-            const SizedBox(height: 12),
-            Text(
-              'HOST: ${net.localIp} • CH ${net.currentChannel}',
-              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              'UDP Broadcast Discovery Port: ${UdpNetworkService.discoveryPort}',
-              style: const TextStyle(color: cyanSoft, fontSize: 11),
-            ),
-          ],
+              const SizedBox(height: 10),
+              Text(
+                'ID: ${net.myCallsign} (${net.roleLabel})',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'IP: ${net.localIp} • CHANNEL ${net.currentChannel.toString().padLeft(2, '0')}',
+                style: const TextStyle(color: cyanSoft, fontSize: 12),
+              ),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF021526),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: cyanBright.withValues(alpha: 0.45)),
+                ),
+                child: SelectableText(
+                  link,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: cyanSoft, fontSize: 11, fontWeight: FontWeight.w600),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: cyanBright,
+                    foregroundColor: const Color(0xFF021627),
+                  ),
+                  onPressed: () async {
+                    await Clipboard.setData(ClipboardData(text: link));
+                    if (ctx.mounted) {
+                      ScaffoldMessenger.of(ctx).showSnackBar(
+                        const SnackBar(
+                          content: Text('Link Invite berhasil disalin ke Clipboard!'),
+                          duration: Duration(seconds: 2),
+                        ),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.copy, size: 16),
+                  label: const Text(
+                    'SALIN LINK INVITE',
+                    style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Divider(color: cyanBright.withValues(alpha: 0.3)),
+              const SizedBox(height: 8),
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'TEMPEL LINK INVITE / IP MASTER:',
+                  style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                ),
+              ),
+              const SizedBox(height: 6),
+              TextField(
+                controller: inviteController,
+                style: const TextStyle(color: Colors.white, fontSize: 12),
+                decoration: InputDecoration(
+                  hintText: 'diskomlekau://join?ip=192.168.43.1&ch=12...',
+                  hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.35), fontSize: 11),
+                  filled: true,
+                  fillColor: const Color(0xFF021526),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: BorderSide(color: cyanBright.withValues(alpha: 0.5)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(10),
+                    borderSide: const BorderSide(color: cyanBright, width: 1.5),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: cyanBright, width: 1.4),
+                    foregroundColor: cyanBright,
+                  ),
+                  onPressed: () async {
+                    final ok = await net.joinViaInviteLink(inviteController.text);
+                    if (ctx.mounted && ok) {
+                      Navigator.pop(ctx);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                            'Terhubung ke Link Invite pada CHANNEL ${net.currentChannel.toString().padLeft(2, '0')}!',
+                          ),
+                        ),
+                      );
+                    }
+                  },
+                  icon: const Icon(Icons.link, size: 16),
+                  label: const Text(
+                    'GABUNG VIA LINK INVITE',
+                    style: TextStyle(fontWeight: FontWeight.w900, fontSize: 12),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(
@@ -749,15 +1147,13 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
 
   @override
   Widget build(BuildContext context) {
-    // Consumer<UdpNetworkService> memastikan UI otomatis me-refresh seketika
-    // saat perangkat baru terhubung ke WiFi Hotspot dan terdeteksi via UDP.
+    // Consumer<UdpNetworkService> memastikan seluruh UI me-refresh otomatis
+    // saat ada klien baru yang terdeteksi dari broadcast UDP setiap 1 detik.
     return Consumer<UdpNetworkService>(
       builder: (context, net, _) {
         final audioService = context.read<AudioService>();
-        final List<PeerMember> peers = net.activeChannelPeers.isNotEmpty
-            ? net.activeChannelPeers
-            : _fallbackMembers;
-        final int activeCount = peers.length;
+        final List<PeerMember> realPeers = net.activeChannelPeers;
+        final int activeCount = realPeers.length;
 
         return Scaffold(
           backgroundColor: bgDarkNavy,
@@ -797,8 +1193,8 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                           _buildChannelCard(context, net, activeCount),
                           const SizedBox(height: 14),
 
-                          // 4. GRIDVIEW ANGGOTA (activeChannelPeers)
-                          _buildMemberGridSection(context, net, peers),
+                          // 4. GRIDVIEW ANGGOTA (HANYA REAL PEERS DARI UDP BROADCAST)
+                          _buildMemberGridSection(context, net, realPeers),
                           const SizedBox(height: 18),
 
                           // 5. TOMBOL PTT RAKSASA DI TENGAH BAWAH
@@ -823,8 +1219,8 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
-  /// 2. Container Card Status Jaringan: Menampilkan `localIp`, `isMaster` (Peran),
-  ///    `lastPingMs`, dan jumlah anggota aktif dari provider.
+  /// 2. Card Status Jaringan: Menampilkan `localIp`, peran permanen
+  ///    (`HP MASTER` jika 192.168.43.1, atau `CLIENT`), `lastPingMs`, dan jumlah peer aktif.
   Widget _buildNetworkStatusCard(UdpNetworkService net, int activeCount) {
     return Container(
       padding: const EdgeInsets.all(14),
@@ -870,7 +1266,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
               ),
               const SizedBox(width: 6),
               Text(
-                '(+${net.pingDeltaMs.abs()}ms)',
+                '(+${net.pingDeltaMs}ms)',
                 style: const TextStyle(color: cyanSoft, fontSize: 11.5),
               ),
               const SizedBox(width: 8),
@@ -916,6 +1312,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                 ),
               ),
               const SizedBox(width: 6),
+              // Badge Peran Permanen: MASTER (192.168.43.1) atau CLIENT
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
                 decoration: BoxDecoration(
@@ -925,7 +1322,11 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.star, size: 14, color: Color(0xFF022038)),
+                    Icon(
+                      net.isMaster ? Icons.star : Icons.devices,
+                      size: 14,
+                      color: const Color(0xFF022038),
+                    ),
                     const SizedBox(width: 4),
                     Text(
                       net.isMaster ? 'MASTER' : 'CLIENT',
@@ -947,13 +1348,13 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
             children: [
               Expanded(
                 child: Text(
-                  'PERAN: ${net.isMaster ? "HP MASTER" : "HP CLIENT"}\n(${net.localIp})',
+                  'PERAN: ${net.roleLabel}\n(${net.localIp})',
                   style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600, height: 1.35),
                 ),
               ),
               Expanded(
                 child: Text(
-                  'Peer Aktif: $activeCount • Target: ${net.targetedPeers.isEmpty ? activeCount : net.targetedPeers.length} activeClients\n(Unicast)',
+                  'Peer Aktif: $activeCount • Target: ${net.targetedPeers.length} activeClients\n(Unicast)',
                   style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600, height: 1.35),
                 ),
               ),
@@ -964,7 +1365,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
-  /// 3. Container Channel: Tombol panah kiri/kanan untuk mengubah `currentChannel` di provider.
+  /// 3. Container Channel: Mengubah `_currentChannel` tanpa memutus socket UDP.
   Widget _buildChannelCard(BuildContext context, UdpNetworkService net, int activeCount) {
     return Container(
       padding: const EdgeInsets.all(14),
@@ -1028,9 +1429,9 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                         ),
                       ),
                       const SizedBox(height: 4),
-                      Text(
-                        'MASTER HOST - ${net.localIp}',
-                        style: const TextStyle(
+                      const Text(
+                        'MASTER HOST - 192.168.43.1',
+                        style: TextStyle(
                           color: cyanSoft,
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
@@ -1066,7 +1467,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                'HP MASTER AKTIF | $activeCount MEMBERS ONLINE',
+                '${net.roleLabel} AKTIF | $activeCount MEMBERS ONLINE',
                 style: const TextStyle(
                   color: Colors.white,
                   fontWeight: FontWeight.w800,
@@ -1102,11 +1503,12 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     );
   }
 
-  /// 4. GridView Anggota: Menampilkan daftar `activeChannelPeers`.
+  /// 4. GridView Anggota: HANYA memunculkan perangkat klien nyata dari UDP Broadcast.
+  ///    Jika belum ada perangkat lain terhubung, tampilkan "MENCARI ANGGOTA AKTIF...".
   Widget _buildMemberGridSection(
     BuildContext context,
     UdpNetworkService net,
-    List<PeerMember> peers,
+    List<PeerMember> realPeers,
   ) {
     return Column(
       children: [
@@ -1189,90 +1591,121 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
           ],
         ),
         const SizedBox(height: 10),
-        GridView.builder(
-          shrinkWrap: true,
-          physics: const NeverScrollableScrollPhysics(),
-          itemCount: peers.length,
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 3,
-            mainAxisSpacing: 8,
-            crossAxisSpacing: 8,
-            childAspectRatio: 2.15,
-          ),
-          itemBuilder: (context, index) {
-            final peer = peers[index];
-            return InkWell(
-              onTap: () {
-                net.togglePeerTarget(peer.ipAddress);
-                setState(() => peer.isTargeted = !peer.isTargeted);
-              },
-              borderRadius: BorderRadius.circular(14),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: peer.isTargeted
-                        ? [const Color(0xFF1499C7), const Color(0xFF0A6691)]
-                        : [const Color(0xFF062C4D), const Color(0xFF041D35)],
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                  ),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: peer.isTargeted ? cyanBright : cyanBright.withValues(alpha: 0.35),
-                    width: peer.isTargeted ? 1.5 : 1,
+
+        // Jika belum ada perangkat klien nyata yang terdeteksi di channel ini:
+        if (realPeers.isEmpty)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 16),
+            decoration: _tacticalCardDecoration(),
+            child: Column(
+              children: [
+                const SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.2,
+                    color: cyanBright,
                   ),
                 ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.mic_none, size: 18, color: cyanBright),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            peer.callsign,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.w900,
-                              fontSize: 13,
+                const SizedBox(height: 12),
+                const Text(
+                  'MENCARI ANGGOTA AKTIF...',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w900,
+                    fontSize: 14,
+                    letterSpacing: 1.1,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Menunggu perangkat lain terhubung ke WiFi Hotspot pada CHANNEL ${net.currentChannel.toString().padLeft(2, '0')} (UDP Port 50000)',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: cyanSoft,
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          )
+        else
+          GridView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: realPeers.length,
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3,
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 2.15,
+            ),
+            itemBuilder: (context, index) {
+              final peer = realPeers[index];
+              return InkWell(
+                onTap: () => net.togglePeerTarget(peer.ipAddress),
+                borderRadius: BorderRadius.circular(14),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: peer.isTargeted
+                          ? [const Color(0xFF1499C7), const Color(0xFF0A6691)]
+                          : [const Color(0xFF062C4D), const Color(0xFF041D35)],
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                    ),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: peer.isTargeted ? cyanBright : cyanBright.withValues(alpha: 0.35),
+                      width: peer.isTargeted ? 1.5 : 1,
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.mic_none, size: 18, color: cyanBright),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              peer.callsign,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.w900,
+                                fontSize: 13,
+                              ),
                             ),
-                          ),
-                          const Text(
-                            'ALL AKTIF',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: cyanSoft,
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
+                            Text(
+                              peer.ipAddress,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: cyanSoft,
+                                fontSize: 9.5,
+                                fontWeight: FontWeight.w600,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ),
-                    InkWell(
-                      onTap: () => _showEditCallsignDialog(context, net, member: peer),
-                      child: const Icon(Icons.edit, size: 13, color: Colors.white),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            );
-          },
-        ),
+              );
+            },
+          ),
       ],
     );
   }
 
-  /// 5. Tombol PTT Raksasa di tengah bawah menggunakan GestureDetector:
-  ///    - onLongPress: Ubah state `isTransmitting` menjadi true, jalankan
-  ///      `AudioService.startRecording` dan teruskan byte-nya ke `UdpNetworkService.sendRawAudioChunk`.
-  ///    - onLongPressEnd: Hentikan rekaman dan ubah state `isTransmitting` ke false.
+  /// 5. Tombol PTT Raksasa menggunakan GestureDetector (onLongPress & onLongPressEnd)
   Widget _buildGiantPttButton(UdpNetworkService net, AudioService audioService) {
     final bool isTx = net.isTransmitting;
 
@@ -1337,7 +1770,9 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    isTx ? 'TRANSMITTING' : 'MASTER READY',
+                    isTx
+                        ? 'TRANSMITTING'
+                        : (net.isMaster ? 'MASTER READY' : 'CLIENT READY'),
                     style: const TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.w900,
@@ -1368,7 +1803,9 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
         ],
       ),
       child: Text(
-        net.isTransmitting ? 'TRANSMITTING RAW PCM UDP...' : 'MASTER READY',
+        net.isTransmitting
+            ? 'TRANSMITTING RAW PCM UDP (CH ${net.currentChannel.toString().padLeft(2, '0')})...'
+            : (net.isMaster ? 'MASTER READY' : 'CLIENT READY'),
         textAlign: TextAlign.center,
         style: const TextStyle(
           color: Colors.white,
@@ -1452,7 +1889,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
   }
 }
 
-/// CustomPainter untuk teks melingkar "PUSH TO TALK & HOLD" pada tombol PTT
+/// CustomPainter untuk teks melingkar "PUSH TO TALK & HOLD"
 class _CurvedTextPainter extends CustomPainter {
   final String text;
   const _CurvedTextPainter({required this.text});
