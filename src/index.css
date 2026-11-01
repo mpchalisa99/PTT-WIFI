@@ -24,64 +24,51 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Tactical Blue + Military Green background with subtle radar grid pattern */
+/* Tactical dark navy background with subtle square grid pattern matching reference */
 .tactical-grid-bg {
-  background-color: #041d2c;
+  background-color: #052642;
   background-image:
-    radial-gradient(circle at 50% 10%, rgba(35, 220, 255, 0.20), transparent 50%),
-    radial-gradient(circle at 85% 48%, rgba(74, 222, 128, 0.16), transparent 52%),
-    radial-gradient(circle at 15% 84%, rgba(101, 163, 13, 0.18), transparent 50%),
-    linear-gradient(to right, rgba(74, 222, 128, 0.065) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(35, 220, 255, 0.065) 1px, transparent 1px),
-    linear-gradient(165deg, #062f52 0%, #163623 52%, #041b2d 100%);
-  background-size: 100% 100%, 100% 100%, 100% 100%, 24px 24px, 24px 24px, 100% 100%;
+    radial-gradient(circle at 50% 18%, rgba(0, 198, 255, 0.16), transparent 60%),
+    linear-gradient(to right, rgba(0, 195, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(0, 195, 255, 0.07) 1px, transparent 1px),
+    linear-gradient(180deg, #062f52 0%, #041d34 55%, #031629 100%);
+  background-size: 100% 100%, 28px 28px, 28px 28px, 100% 100%;
 }
 
 .tactical-panel {
-  background: linear-gradient(155deg, rgba(6, 43, 73, 0.92) 0%, rgba(22, 54, 35, 0.90) 54%, rgba(4, 27, 46, 0.94) 100%);
-  border: 1.5px solid rgba(56, 224, 180, 0.55);
-  box-shadow:
-    0 0 16px rgba(0, 195, 255, 0.14),
-    0 0 12px rgba(74, 222, 128, 0.12),
-    inset 0 1px 0 rgba(134, 239, 172, 0.24);
+  background: linear-gradient(180deg, rgba(6, 43, 73, 0.88) 0%, rgba(3, 25, 45, 0.94) 100%);
+  border: 1.5px solid rgba(33, 206, 255, 0.45);
+  box-shadow: 0 0 18px rgba(0, 195, 255, 0.14), inset 0 1px 0 rgba(130, 235, 255, 0.2);
 }
 
 .tactical-panel-inset {
-  background: linear-gradient(180deg, #021627 0%, #102a1c 100%);
-  border: 1px solid rgba(74, 222, 128, 0.45);
+  background: linear-gradient(180deg, #021627 0%, #04213a 100%);
+  border: 1px solid rgba(25, 195, 255, 0.35);
   box-shadow: inset 0 3px 10px rgba(0, 0, 0, 0.65);
 }
 
 .cyan-glow-text {
-  text-shadow:
-    0 0 12px rgba(34, 211, 238, 0.55),
-    0 0 20px rgba(74, 222, 128, 0.35);
+  text-shadow: 0 0 12px rgba(34, 211, 238, 0.55);
 }
 
 .cyan-btn-glow {
-  background: linear-gradient(135deg, #23dcff 0%, #10b981 52%, #4d7c0f 100%);
-  box-shadow:
-    0 0 18px rgba(35, 220, 255, 0.42),
-    0 0 14px rgba(74, 222, 128, 0.35),
-    inset 0 1px 1px rgba(255, 255, 255, 0.5);
+  background: linear-gradient(180deg, #27dcff 0%, #06b6d4 100%);
+  box-shadow: 0 0 20px rgba(6, 182, 212, 0.55), inset 0 1px 1px rgba(255, 255, 255, 0.45);
 }
 
 .ptt-ring-outer {
-  background: radial-gradient(circle at 50% 35%, #23dcff 0%, #10b981 42%, #244b2c 74%, #04253b 100%);
+  background: radial-gradient(circle at 50% 35%, #116f9e 0%, #063859 62%, #032239 100%);
   box-shadow:
-    0 0 28px rgba(17, 209, 255, 0.4),
-    0 0 34px rgba(74, 222, 128, 0.32),
-    inset 0 2px 6px rgba(187, 247, 208, 0.48),
+    0 0 36px rgba(17, 209, 255, 0.38),
+    inset 0 2px 6px rgba(135, 238, 255, 0.45),
     inset 0 -6px 14px rgba(0, 10, 20, 0.8);
 }
 
 .ptt-ring-active {
-  background: radial-gradient(circle at 50% 35%, #86efac 0%, #22e3ff 45%, #15803d 78%, #043e63 100%);
+  background: radial-gradient(circle at 50% 35%, #22e3ff 0%, #0887b8 60%, #043e63 100%);
   box-shadow:
-    0 0 42px rgba(74, 222, 128, 0.85),
-    0 0 55px rgba(34, 227, 255, 0.75),
-    inset 0 2px 10px rgba(255, 255, 255, 0.75),
+    0 0 55px rgba(34, 227, 255, 0.85),
+    inset 0 2px 10px rgba(255, 255, 255, 0.65),
     inset 0 -6px 14px rgba(0, 20, 40, 0.85);
 }
-
 

@@ -301,7 +301,7 @@ class AudioService {
     title: 'main.dart',
     category: 'Core UI',
     description:
-      'Entry point MultiProvider dan UI utama TACTICAL NET-COMM SUBDISRUDAL yang otomatis me-refresh saat ada perangkat baru terhubung ke Hotspot.',
+      'Entry point MultiProvider dan UI utama TACTICAL WI-COMM SUBDISRUDAL yang otomatis me-refresh saat ada perangkat baru terhubung ke Hotspot.',
     code: `import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -351,7 +351,7 @@ class DiskomlekauTacticalPttApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'TACTICAL NET-COMM SUBDISRUDAL',
+      title: 'TACTICAL WI-COMM SUBDISRUDAL',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF041D34),
@@ -410,11 +410,11 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                       child: Column(
                         children: [
-                          // 1. Teks judul "TACTICAL NET-COMM SUBDISRUDAL"
+                          // 1. Teks judul "TACTICAL WI-COMM SUBDISRUDAL"
                           const Padding(
                             padding: EdgeInsets.symmetric(vertical: 8),
                             child: Text(
-                              'TACTICAL NET-COMM SUBDISRUDAL',
+                              'TACTICAL WI-COMM SUBDISRUDAL',
                               textAlign: TextAlign.center,
                               style: TextStyle(
                                 color: Color(0xFFE5FAFF),
