@@ -1214,7 +1214,7 @@ class DiskomlekauTacticalPttApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'DISKOMLEKAU TACTICAL PTT',
+      title: 'TACTICAL NET-COMM SUBDISRUDAL',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF041D34),
@@ -1316,7 +1316,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     ),
                     const SizedBox(height: 18),
                     const Text(
-                      'DISKOMLEKAU TACTICAL PTT',
+                      'TACTICAL NET-COMM SUBDISRUDAL',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         color: Colors.white,
@@ -1686,11 +1686,11 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
                       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
                       child: Column(
                         children: [
-                          // 1. TEKS JUDUL "DISKOMLEKAU TACTICAL PTT"
+                          // 1. TEKS JUDUL "TACTICAL NET-COMM SUBDISRUDAL"
                           const Padding(
                             padding: EdgeInsets.symmetric(vertical: 8),
                             child: Text(
-                              'DISKOMLEKAU TACTICAL PTT',
+                              'TACTICAL NET-COMM SUBDISRUDAL',
                               textAlign: TextAlign.center,
                               style: TextStyle(
                                 color: Color(0xFFE5FAFF),

@@ -27,6 +27,11 @@ import {
   UserPlus,
   Camera,
   Upload,
+  MessageSquare,
+  Send,
+  Trash2,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { FLUTTER_SOURCE_FILES } from './data/flutterSourceFiles';
 import { usePWAInstall } from './usePWAInstall';
@@ -60,6 +65,17 @@ interface PeerSyncEntry {
   channel: number;
 }
 
+interface TacticalChatMessage {
+  id: string;
+  senderId: string;
+  callsign: string;
+  ip: string;
+  role: 'MASTER' | 'CLIENT';
+  channel: number;
+  text: string;
+  timestamp: number;
+}
+
 interface MeshPacket {
   packetId?: string;
   type:
@@ -67,6 +83,7 @@ interface MeshPacket {
     | 'PEER_LIST_SYNC'
     | 'PEER_LEAVE'
     | 'VOICE_CLIP'
+    | 'CHAT_MSG'
     | 'PTT_START'
     | 'PTT_END'
     | 'TX_START'
@@ -82,6 +99,7 @@ interface MeshPacket {
   timestamp: number;
   audioBase64?: string;
   mimeType?: string;
+  chatText?: string;
   peerNodeId?: string;
   peerList?: PeerSyncEntry[];
 }
@@ -251,15 +269,34 @@ export default function App() {
   const [echoTestMode, setEchoTestMode] = useState<boolean>(true);
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
 
-  // Bottom Navigation Modal States
+  // Bottom Navigation Modal States & On-Screen Tactical Chat States
   const [activeBottomModal, setActiveBottomModal] = useState<
-    null | 'channels' | 'editName' | 'barcode' | 'settings'
+    null | 'channels' | 'chat' | 'editName' | 'barcode' | 'settings'
   >(null);
   const [settingsTab, setSettingsTab] = useState<'audio' | 'apkGuide' | 'flutterCode'>('audio');
   const [editingMemberId, setEditingMemberId] = useState<string | null>(null);
   const [nameInput, setNameInput] = useState<string>('');
   const [selectedFileIndex, setSelectedFileIndex] = useState<number>(0);
   const [copiedText, setCopiedText] = useState<string | null>(null);
+
+  // Real-Time On-Screen Tactical Chat State
+  const [chatMessages, setChatMessages] = useState<TacticalChatMessage[]>(() => {
+    try {
+      const saved = localStorage.getItem('tactical_wicomm_chat_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed.slice(-80);
+      }
+    } catch {
+      // Ignore storage error
+    }
+    return [];
+  });
+  const [chatInput, setChatInput] = useState<string>('');
+  const [isOnScreenChatOpen, setIsOnScreenChatOpen] = useState<boolean>(true);
+  const [unreadChatCount, setUnreadChatCount] = useState<number>(0);
+  const onScreenChatEndRef = useRef<HTMLDivElement | null>(null);
+  const modalChatEndRef = useRef<HTMLDivElement | null>(null);
 
   // Audio, WebRTC, Offline Hotspot LAN & WSS Cloud Mesh refs
   const audioCtxRef = useRef<AudioContext | null>(null);
@@ -298,6 +335,20 @@ export default function App() {
     localStorage.setItem('diskomlekau_role', role);
     localStorage.setItem('diskomlekau_ip', localIp);
   }, [myCallsign, channel, role, localIp]);
+
+  // Persist tactical chat messages & auto-scroll to latest message
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        'tactical_wicomm_chat_v1',
+        JSON.stringify(chatMessages.slice(-80))
+      );
+    } catch {
+      // Ignore quota error
+    }
+    onScreenChatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    modalChatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages]);
 
   // Request Screen Wake Lock so HP screen stays on in APK/fullscreen mode
   useEffect(() => {
@@ -916,6 +967,23 @@ export default function App() {
           return;
         }
         playIncomingAudioBase64(pkt.audioBase64, pkt.callsign);
+      } else if (pkt.type === 'CHAT_MSG' && pkt.chatText) {
+        const newMsg: TacticalChatMessage = {
+          id: pkt.packetId || `${pkt.senderId}-${pkt.timestamp}`,
+          senderId: pkt.senderId,
+          callsign: pkt.callsign,
+          ip: pkt.ip,
+          role: pkt.role,
+          channel: pkt.channel,
+          text: pkt.chatText,
+          timestamp: pkt.timestamp || Date.now(),
+        };
+        setChatMessages((prev) => {
+          if (prev.some((m) => m.id === newMsg.id)) return prev;
+          return [...prev.slice(-79), newMsg];
+        });
+        setUnreadChatCount((c) => (isOnScreenChatOpen ? 0 : c + 1));
+        playTacticalTone('rx');
       } else if (pkt.type === 'PING') {
         broadcastMeshPacket({ type: 'PONG' });
       } else if (pkt.type === 'PONG') {
@@ -932,6 +1000,7 @@ export default function App() {
       role,
       pingMs,
       myCallsign,
+      isOnScreenChatOpen,
       forceStopLocalRecording,
       playIncomingAudioBase64,
       playTacticalTone,
@@ -1537,6 +1606,40 @@ export default function App() {
     setActiveBottomModal(null);
   };
 
+  // Send Tactical Chat Message (On-Screen & Modal)
+  const handleSendChatMessage = (e?: React.FormEvent, presetText?: string) => {
+    if (e) e.preventDefault();
+    const rawText = presetText !== undefined ? presetText : chatInput;
+    const trimmed = rawText.trim();
+    if (!trimmed || !myCallsign) return;
+
+    const newMsg: TacticalChatMessage = {
+      id: `${myDeviceId}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      senderId: myDeviceId,
+      callsign: myCallsign,
+      ip: detectedLanIpRef.current || localIp,
+      role: localIp === '192.168.43.1' || role === 'MASTER' ? 'MASTER' : 'CLIENT',
+      channel,
+      text: trimmed,
+      timestamp: Date.now(),
+    };
+
+    setChatMessages((prev) => [...prev.slice(-79), newMsg]);
+    if (presetText === undefined) {
+      setChatInput('');
+    }
+    playTacticalTone('start');
+
+    broadcastMeshPacket({
+      type: 'CHAT_MSG',
+      chatText: trimmed,
+    });
+  };
+
+  const handleClearChannelChat = () => {
+    setChatMessages((prev) => prev.filter((m) => m.channel !== channel));
+  };
+
   const handleCopyText = (key: string, text: string) => {
     const markCopied = () => {
       setCopiedText(key);
@@ -1661,8 +1764,8 @@ export default function App() {
 
   const handleShareInviteLink = async () => {
     const targetPayload = offlineAnswerToken || sharePairUrl;
-    const shareTitle = `DISKOMLEKAU TACTICAL PTT - CH ${String(channel).padStart(2, '0')}`;
-    const shareText = `Gabung ke Jaringan Walkie-Talkie DISKOMLEKAU TACTICAL PTT (${
+    const shareTitle = `TACTICAL NET-COMM SUBDISRUDAL - CH ${String(channel).padStart(2, '0')}`;
+    const shareText = `Gabung ke Jaringan Walkie-Talkie TACTICAL NET-COMM SUBDISRUDAL (${
       myCallsign || 'MASTER'
     } - CHANNEL ${String(channel).padStart(2, '0')}):`;
     if (navigator.share) {
@@ -2167,14 +2270,14 @@ export default function App() {
   // 1. LAYAR SETUP AWAL (SetupScreen - KONEK NAMA + SCAN BARCODE LANGSUNG)
   if (!isSetupCompleted) {
     return (
-      <div className="min-h-[100dvh] w-full tactical-grid-bg text-[#e5faff] flex items-center justify-center p-5 select-none">
-        <div className="w-full max-w-[420px] tactical-panel rounded-3xl p-6 space-y-4 shadow-[0_0_50px_rgba(35,220,255,0.22)]">
-          <div className="flex flex-col items-center text-center space-y-2">
-            <div className="w-16 h-16 rounded-full bg-[#03192e] border-2 border-[#23dcff] shadow-[0_0_20px_rgba(35,220,255,0.35)] flex items-center justify-center">
-              <Radio className="w-8 h-8 text-[#23dcff]" />
+      <div className="h-[100dvh] max-h-[100dvh] w-full tactical-grid-bg text-[#e5faff] flex items-center justify-center p-4 overflow-hidden select-none">
+        <div className="w-full max-w-[420px] tactical-panel rounded-3xl p-5 space-y-3.5 shadow-[0_0_50px_rgba(35,220,255,0.22)]">
+          <div className="flex flex-col items-center text-center space-y-1.5">
+            <div className="w-14 h-14 rounded-full bg-[#03192e] border-2 border-[#23dcff] shadow-[0_0_20px_rgba(35,220,255,0.35)] flex items-center justify-center">
+              <Radio className="w-7 h-7 text-[#23dcff]" />
             </div>
-            <h1 className="font-tactical text-[26px] font-extrabold tracking-wider text-white cyan-glow-text">
-              DISKOMLEKAU TACTICAL PTT
+            <h1 className="font-tactical text-[25px] font-extrabold tracking-wider text-white cyan-glow-text leading-tight">
+              TACTICAL NET-COMM SUBDISRUDAL
             </h1>
             <p className="font-telemetry text-[11px] text-cyan-200/90 tracking-wide">
               REGISTRASI IDENTITAS JARINGAN HOTSPOT LAN
@@ -2295,30 +2398,30 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-[100dvh] w-full bg-[#021322] text-[#e5faff] flex flex-col items-center justify-center overflow-x-hidden select-none">
+    <div className="h-[100dvh] max-h-[100dvh] w-full bg-[#021322] text-[#e5faff] flex flex-col items-center justify-center overflow-hidden select-none">
       <main
-        className={`w-full min-h-[100dvh] tactical-grid-bg flex flex-col justify-between relative overflow-hidden transition-all ${
+        className={`w-full h-[100dvh] max-h-[100dvh] tactical-grid-bg flex flex-col justify-between relative overflow-hidden transition-all ${
           fullScreenStretch
             ? 'max-w-full'
             : 'max-w-[460px] sm:border-x-2 sm:border-[#23dcff]/45 sm:shadow-[0_0_60px_rgba(0,195,255,0.25)]'
         }`}
       >
         {/* TOP TELEMETRY STATUS STRIP */}
-        <header className="px-3.5 pt-2.5 pb-1.5 flex items-center justify-between text-[11px] font-telemetry text-cyan-100/95 border-b border-cyan-400/15 bg-[#03192e]/60 backdrop-blur-xs">
+        <header className="px-3 py-1 flex items-center justify-between text-[10px] font-telemetry text-cyan-100/95 border-b border-cyan-400/15 bg-[#03192e]/60 backdrop-blur-xs shrink-0">
           <div className="flex items-center gap-1.5 truncate">
-            <Wifi className="w-3.5 h-3.5 text-[#23dcff] shrink-0" />
+            <Wifi className="w-3 h-3 text-[#23dcff] shrink-0" />
             <span className="tracking-tight truncate">
               VERCEL CLOUD MESH • UDP LAN HOTSPOT
             </span>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
             <span>{pingMs} ms</span>
             <span className="text-cyan-400/50">|</span>
             <span className="text-cyan-200 font-bold">ONLINE</span>
             <button
               onClick={handleToggleFullScreen}
               title="Layar Penuh HP (Fullscreen)"
-              className="px-2 py-0.5 rounded border border-cyan-400/60 text-[10px] font-bold text-cyan-100 bg-cyan-950/80 hover:bg-[#23dcff] hover:text-[#02182b] transition-colors flex items-center gap-1 cursor-pointer"
+              className="px-1.5 py-0.5 rounded border border-cyan-400/60 text-[9.5px] font-bold text-cyan-100 bg-cyan-950/80 hover:bg-[#23dcff] hover:text-[#02182b] transition-colors flex items-center gap-1 cursor-pointer"
             >
               {isFullScreen ? (
                 <Minimize2 className="w-2.5 h-2.5" />
@@ -2330,44 +2433,44 @@ export default function App() {
           </div>
         </header>
 
-        {/* MAIN VERTICAL TACTICAL STACK */}
-        <div className="flex-1 w-full max-w-[540px] mx-auto px-3.5 py-2 flex flex-col justify-evenly gap-2.5">
-          {/* 1. HEADER TEKS: DISKOMLEKAU TACTICAL PTT */}
-          <div className="text-center py-0.5">
-            <h1 className="font-tactical text-[28px] sm:text-[32px] leading-none font-extrabold tracking-[0.06em] text-[#e9fcff] cyan-glow-text">
-              DISKOMLEKAU TACTICAL PTT
+        {/* MAIN VERTICAL TACTICAL STACK - FITS 100% IN ONE PHONE SCREEN */}
+        <div className="flex-1 min-h-0 w-full max-w-[540px] mx-auto px-3 py-1 flex flex-col justify-between gap-1.5 overflow-hidden">
+          {/* 1. HEADER TEKS: TACTICAL NET-COMM SUBDISRUDAL (UKURAN HURUF TETAP) */}
+          <div className="text-center shrink-0">
+            <h1 className="font-tactical text-[25px] sm:text-[30px] leading-none font-extrabold tracking-[0.06em] text-[#e9fcff] cyan-glow-text">
+              TACTICAL NET-COMM SUBDISRUDAL
             </h1>
           </div>
 
-          {/* 2. CARD STATUS JARINGAN (TOP PANEL) */}
-          <section className="tactical-panel rounded-2xl p-3.5 space-y-2.5">
-            <div className="flex items-center justify-between gap-2">
+          {/* 2. CARD STATUS JARINGAN (TOP PANEL - COMPACT) */}
+          <section className="tactical-panel rounded-xl px-2.5 py-1.5 space-y-1 shrink-0">
+            <div className="flex items-center justify-between gap-1.5">
               {/* Indikator Sinyal 4 Bar */}
-              <div className="px-2.5 py-2 rounded-lg bg-[#03192e] border border-cyan-400/40 flex items-end gap-1 shrink-0">
-                <span className="w-1 h-2 rounded-xs bg-[#23dcff]" />
-                <span className="w-1 h-3 rounded-xs bg-[#23dcff]" />
-                <span className="w-1 h-4 rounded-xs bg-[#23dcff]" />
+              <div className="px-2 py-1 rounded-lg bg-[#03192e] border border-cyan-400/40 flex items-end gap-0.5 shrink-0">
+                <span className="w-1 h-1.5 rounded-xs bg-[#23dcff]" />
+                <span className="w-1 h-2.5 rounded-xs bg-[#23dcff]" />
+                <span className="w-1 h-3.5 rounded-xs bg-[#23dcff]" />
                 <span
-                  className={`w-1 h-5 rounded-xs ${
+                  className={`w-1 h-4 rounded-xs ${
                     !isHighLatency ? 'bg-[#23dcff]' : 'bg-cyan-900/70'
                   }`}
                 />
               </div>
 
               {/* PING: [X] ms */}
-              <div className="font-telemetry leading-tight shrink-0">
-                <div className="text-[12px] font-bold text-white">PING:</div>
-                <div className="text-[15px] font-extrabold text-white">
+              <div className="font-telemetry leading-none shrink-0">
+                <div className="text-[10px] font-bold text-cyan-200">PING:</div>
+                <div className="text-[13px] font-extrabold text-white">
                   {pingMs} ms
                 </div>
               </div>
 
-              <div className="font-telemetry text-[12px] text-cyan-200/90 shrink-0">
+              <div className="font-telemetry text-[10.5px] text-cyan-200/90 shrink-0">
                 (+{pingDelta}ms)
               </div>
 
               {/* Status LATENCY TINGGI / RENDAH */}
-              <div className="px-2.5 py-1 rounded-md border border-cyan-400/45 bg-[#031b32]/80 font-telemetry text-[11px] font-bold leading-tight text-white">
+              <div className="px-2 py-0.5 rounded border border-cyan-400/45 bg-[#031b32]/80 font-telemetry text-[9.5px] font-bold leading-tight text-white">
                 <div>LATENCY</div>
                 <div className={isHighLatency ? 'text-cyan-200' : 'text-emerald-300'}>
                   {isHighLatency ? 'TINGGI' : 'RENDAH'}
@@ -2377,10 +2480,10 @@ export default function App() {
               {/* Tombol Refresh Ping */}
               <button
                 onClick={handleRefreshPing}
-                className="min-h-[38px] px-2.5 py-1.5 rounded-lg bg-[#05233e] hover:bg-[#09355c] border border-cyan-400/55 flex items-center gap-1 text-xs font-bold text-white transition-colors shrink-0 cursor-pointer"
+                className="px-2 py-1 rounded-lg bg-[#05233e] hover:bg-[#09355c] border border-cyan-400/55 flex items-center gap-1 text-[10.5px] font-bold text-white transition-colors shrink-0 cursor-pointer"
               >
                 <RefreshCw
-                  className={`w-3.5 h-3.5 text-[#23dcff] ${
+                  className={`w-3 h-3 text-[#23dcff] ${
                     isRefreshingPing ? 'animate-spin' : ''
                   }`}
                 />
@@ -2388,64 +2491,56 @@ export default function App() {
               </button>
 
               {/* Label Status Permanen: MASTER (192.168.43.1) atau CLIENT */}
-              <div className="min-h-[38px] px-2.5 py-1.5 rounded-lg cyan-btn-glow text-[#021d33] font-extrabold text-xs flex items-center gap-1 shrink-0">
-                <Star className="w-3.5 h-3.5 fill-[#021d33]" />
+              <div className="px-2 py-1 rounded-lg cyan-btn-glow text-[#021d33] font-extrabold text-[10.5px] flex items-center gap-1 shrink-0">
+                <Star className="w-3 h-3 fill-[#021d33]" />
                 <span>{isMasterDevice ? 'MASTER' : 'CLIENT'}</span>
               </div>
             </div>
 
             <div className="h-[1px] bg-gradient-to-r from-cyan-400/40 via-cyan-300/60 to-cyan-400/20" />
 
-            {/* Teks Informasi Peran Permanen & Peer Aktif */}
-            <div className="grid grid-cols-12 gap-2 font-telemetry text-[12px] text-white/95 leading-snug pt-0.5">
-              <div className="col-span-5">
-                <div className="font-semibold">PERAN: {permanentRoleLabel}</div>
-                <div className="text-cyan-100">({localIp})</div>
+            {/* Teks Informasi Peran Permanen & Peer Aktif (1 Baris Ringkas) */}
+            <div className="flex items-center justify-between gap-2 font-telemetry text-[10px] text-white/95 leading-none">
+              <div className="truncate">
+                <span className="font-semibold">PERAN: {permanentRoleLabel}</span>{' '}
+                <span className="text-cyan-200">({detectedLanIpRef.current || localIp})</span>
               </div>
-              <div className="col-span-7">
-                <div>
-                  Peer Aktif:{' '}
-                  <strong className="text-white">
-                    {activeChannelPeers.length}
-                  </strong>{' '}
-                  • Target:{' '}
-                  <strong className="text-white">
-                    {targetedClientsCount} activeClients
-                  </strong>
-                </div>
-                <div className="text-cyan-100">(Unicast)</div>
+              <div className="truncate text-right shrink-0">
+                Peer: <strong className="text-white">{activeChannelPeers.length}</strong> • Target:{' '}
+                <strong className="text-white">{targetedClientsCount}</strong>{' '}
+                <span className="text-cyan-200">(Unicast)</span>
               </div>
             </div>
           </section>
 
-          {/* 3. CARD CHANNEL SELECTOR (Tanpa menutup/memutus koneksi UDP) */}
-          <section className="tactical-panel rounded-2xl p-3.5 space-y-2.5">
+          {/* 3. CARD CHANNEL SELECTOR (COMPACT) */}
+          <section className="tactical-panel rounded-xl px-2.5 py-1.5 space-y-1 shrink-0">
             <div className="flex items-center justify-between px-1">
-              <span className="text-cyan-300 text-xs">▼</span>
-              <h2 className="font-tactical text-[15px] font-bold tracking-[0.08em] text-white text-center">
+              <span className="text-cyan-300 text-[10px]">▼</span>
+              <h2 className="font-tactical text-[12.5px] font-bold tracking-[0.08em] text-white text-center leading-none">
                 CHANNEL SELECTOR - CLOUD &amp; HOTSPOT SYNC
               </h2>
-              <span className="text-cyan-300 text-xs">▼</span>
+              <span className="text-cyan-300 text-[10px]">▼</span>
             </div>
 
-            <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center justify-between gap-2.5">
               {/* Knob Kiri (Channel - 1) */}
               <button
                 onClick={() => setChannel((c) => (c > 1 ? c - 1 : 99))}
                 aria-label="Channel Sebelumnya"
-                className="w-14 h-14 rounded-full bg-gradient-to-b from-[#0b476e] to-[#031c32] border-2 border-[#23dcff]/70 shadow-[0_0_15px_rgba(35,220,255,0.28)] flex items-center justify-center active:scale-95 transition-transform shrink-0 cursor-pointer"
+                className="w-10 h-10 rounded-full bg-gradient-to-b from-[#0b476e] to-[#031c32] border-2 border-[#23dcff]/70 shadow-[0_0_12px_rgba(35,220,255,0.28)] flex items-center justify-center active:scale-95 transition-transform shrink-0 cursor-pointer"
               >
-                <div className="w-9 h-9 rounded-full border border-cyan-300/40 bg-[#052946] relative">
-                  <span className="w-1 h-3 bg-white rounded-full absolute bottom-1.5 right-2 rotate-[-35deg]" />
+                <div className="w-6.5 h-6.5 rounded-full border border-cyan-300/40 bg-[#052946] relative">
+                  <span className="w-1 h-2 bg-white rounded-full absolute bottom-1 right-1.5 rotate-[-35deg]" />
                 </div>
               </button>
 
               {/* Layar Tengah CHANNEL */}
-              <div className="flex-1 tactical-panel-inset rounded-2xl py-2.5 px-3 text-center">
-                <div className="font-tactical text-[32px] leading-none font-extrabold tracking-[0.12em] text-white cyan-glow-text">
+              <div className="flex-1 tactical-panel-inset rounded-xl py-1 px-2 text-center">
+                <div className="font-tactical text-[24px] leading-none font-extrabold tracking-[0.12em] text-white cyan-glow-text">
                   CHANNEL {String(channel).padStart(2, '0')}
                 </div>
-                <div className="font-telemetry text-[12px] text-cyan-200 tracking-wider mt-1">
+                <div className="font-telemetry text-[10px] text-cyan-200 tracking-wider mt-0.5 leading-none">
                   MASTER HOST - 192.168.43.1
                 </div>
               </div>
@@ -2454,33 +2549,33 @@ export default function App() {
               <button
                 onClick={() => setChannel((c) => (c < 99 ? c + 1 : 1))}
                 aria-label="Channel Berikutnya"
-                className="w-14 h-14 rounded-full bg-gradient-to-b from-[#0b476e] to-[#031c32] border-2 border-[#23dcff]/70 shadow-[0_0_15px_rgba(35,220,255,0.28)] flex items-center justify-center active:scale-95 transition-transform shrink-0 cursor-pointer"
+                className="w-10 h-10 rounded-full bg-gradient-to-b from-[#0b476e] to-[#031c32] border-2 border-[#23dcff]/70 shadow-[0_0_12px_rgba(35,220,255,0.28)] flex items-center justify-center active:scale-95 transition-transform shrink-0 cursor-pointer"
               >
-                <div className="w-9 h-9 rounded-full border border-cyan-300/40 bg-[#052946] relative">
-                  <span className="w-1 h-3 bg-white rounded-full absolute bottom-1.5 left-2 rotate-[35deg]" />
+                <div className="w-6.5 h-6.5 rounded-full border border-cyan-300/40 bg-[#052946] relative">
+                  <span className="w-1 h-2 bg-white rounded-full absolute bottom-1 left-1.5 rotate-[35deg]" />
                 </div>
               </button>
             </div>
 
             {/* Keterangan bawah card & tombol BARCODE */}
             <div className="flex items-center justify-between pt-0.5">
-              <div className="font-tactical text-[14px] font-bold tracking-wider text-white">
+              <div className="font-tactical text-[12px] font-bold tracking-wider text-white leading-none">
                 {permanentRoleLabel} AKTIF | {activeChannelPeers.length} MEMBERS ONLINE
               </div>
               <button
                 onClick={() => setActiveBottomModal('barcode')}
-                className="min-h-[36px] px-3 py-1 rounded-lg bg-[#052542] hover:bg-[#093862] border border-[#23dcff]/65 flex items-center gap-1.5 text-xs font-bold text-white transition-colors cursor-pointer"
+                className="px-2.5 py-1 rounded-lg bg-[#052542] hover:bg-[#093862] border border-[#23dcff]/65 flex items-center gap-1 text-[10.5px] font-bold text-white transition-colors cursor-pointer"
               >
-                <QrCode className="w-4 h-4 text-[#23dcff]" />
+                <QrCode className="w-3.5 h-3.5 text-[#23dcff]" />
                 <span>BARCODE</span>
               </button>
             </div>
           </section>
 
-          {/* 4. GRID USER / ANGGOTA (REAL PEERS ONLY) */}
-          <section className="space-y-2">
+          {/* 4. GRID USER / ANGGOTA (REAL PEERS ONLY - COMPACT) */}
+          <section className="space-y-1 shrink-0">
             {/* Baris Atas: Tombol (•) TALK ALL, ID SAYA: [CALLSIGN], dan Edit Nama */}
-            <div className="flex items-center gap-2.5">
+            <div className="flex items-center gap-2">
               <button
                 onClick={() => {
                   const next = !talkAll;
@@ -2489,26 +2584,26 @@ export default function App() {
                     setMembers((prev) => prev.map((m) => ({ ...m, isTargeted: true })));
                   }
                 }}
-                className={`min-h-[44px] px-4 py-2 rounded-full font-tactical text-[16px] font-bold tracking-wider flex items-center gap-2 transition-all shrink-0 cursor-pointer ${
+                className={`px-3 py-1 rounded-full font-tactical text-[13.5px] font-bold tracking-wider flex items-center gap-1.5 transition-all shrink-0 cursor-pointer ${
                   talkAll
                     ? 'cyan-btn-glow text-white border border-white/50'
                     : 'bg-[#052542] text-cyan-200 border border-cyan-400/50'
                 }`}
               >
-                <Radio className="w-4 h-4" />
+                <Radio className="w-3.5 h-3.5" />
                 <span>TALK ALL</span>
               </button>
 
-              <div className="flex-1 tactical-panel rounded-full px-3.5 py-1.5 flex items-center justify-between gap-2 min-h-[44px]">
-                <div className="font-telemetry text-xs truncate">
+              <div className="flex-1 tactical-panel rounded-full px-3 py-1 flex items-center justify-between gap-2">
+                <div className="font-telemetry text-[11px] truncate">
                   <span className="text-cyan-200/90">ID SAYA: </span>
                   <strong className="text-white font-bold">{myCallsign}</strong>
                 </div>
                 <button
                   onClick={() => openEditNameModal()}
-                  className="px-2.5 py-1 rounded-full bg-[#041d34] hover:bg-[#083156] border border-cyan-400/50 flex items-center gap-1 text-[11px] font-medium text-cyan-100 shrink-0 cursor-pointer"
+                  className="px-2 py-0.5 rounded-full bg-[#041d34] hover:bg-[#083156] border border-cyan-400/50 flex items-center gap-1 text-[10px] font-medium text-cyan-100 shrink-0 cursor-pointer"
                 >
-                  <Pencil className="w-3 h-3 text-[#23dcff]" />
+                  <Pencil className="w-2.5 h-2.5 text-[#23dcff]" />
                   <span>Edit Nama</span>
                 </button>
               </div>
@@ -2516,36 +2611,29 @@ export default function App() {
 
             {/* Baris Bawah: Hanya menampilkan Real Peers yang terhubung via WebRTC DataChannel */}
             {activeChannelPeers.length === 0 ? (
-              <div className="tactical-panel rounded-2xl py-3.5 px-4 text-center space-y-2">
-                <div className="flex items-center justify-center gap-2 text-[#23dcff]">
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                  <span className="font-tactical text-[16px] font-extrabold tracking-wider text-white">
-                    Mencari Anggota...
-                  </span>
+              <div className="tactical-panel rounded-xl py-1.5 px-3 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <RefreshCw className="w-3.5 h-3.5 text-[#23dcff] animate-spin shrink-0" />
+                  <div className="truncate">
+                    <span className="font-tactical text-[13px] font-extrabold tracking-wider text-white">
+                      Mencari Anggota...
+                    </span>
+                    <span className="ml-1.5 font-telemetry text-[9.5px] text-cyan-200/80">
+                      ({myPeerNodeId})
+                    </span>
+                  </div>
                 </div>
-                <p className="font-telemetry text-[10.5px] text-cyan-200/80">
-                  Node: <strong className="text-white">{myPeerNodeId}</strong> •{' '}
-                  {isHotspotLanHubConnected
-                    ? 'Hotspot LAN Hub (Port 50002) Terhubung'
-                    : isMasterDevice
-                    ? 'Menunggu Client (Cloud / Hotspot P2P)'
-                    : 'Auto-Discovery Cloud & Hotspot LAN Aktif'}
-                </p>
-                <div className="flex items-center justify-center gap-2 pt-0.5">
+                <div className="flex items-center gap-1.5 shrink-0">
                   <button
                     type="button"
                     onClick={() => {
                       setBarcodeTab('show');
                       setActiveBottomModal('barcode');
                     }}
-                    className="px-3 py-1.5 rounded-lg bg-[#052542] hover:bg-[#093862] border border-[#23dcff]/70 font-telemetry text-[10.5px] font-bold text-white flex items-center gap-1.5 cursor-pointer"
+                    className="px-2 py-1 rounded-lg bg-[#052542] hover:bg-[#093862] border border-[#23dcff]/70 font-telemetry text-[9.5px] font-bold text-white flex items-center gap-1 cursor-pointer"
                   >
-                    <QrCode className="w-3.5 h-3.5 text-[#23dcff]" />
-                    <span>
-                      {offlineAnswerToken
-                        ? 'Tampilkan Barcode Balasan'
-                        : 'Barcode Hotspot Offline'}
-                    </span>
+                    <QrCode className="w-3 h-3 text-[#23dcff]" />
+                    <span>{offlineAnswerToken ? 'Balasan' : 'QR Offline'}</span>
                   </button>
                   <button
                     type="button"
@@ -2553,17 +2641,15 @@ export default function App() {
                       setBarcodeTab('scan');
                       setActiveBottomModal('barcode');
                     }}
-                    className="px-3 py-1.5 rounded-lg cyan-btn-glow text-[#02182b] font-telemetry text-[10.5px] font-extrabold flex items-center gap-1.5 cursor-pointer"
+                    className="px-2 py-1 rounded-lg cyan-btn-glow text-[#02182b] font-telemetry text-[9.5px] font-extrabold flex items-center gap-1 cursor-pointer"
                   >
-                    <Camera className="w-3.5 h-3.5" />
-                    <span>
-                      {isMasterDevice ? 'Scan Balasan Client' : 'Scan Barcode Master'}
-                    </span>
+                    <Camera className="w-3 h-3" />
+                    <span>{isMasterDevice ? 'Scan Client' : 'Scan Master'}</span>
                   </button>
                 </div>
               </div>
             ) : (
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-3 gap-1.5 max-h-[54px] overflow-y-auto">
                 {activeChannelPeers.map((member) => {
                   const isHighlighted =
                     selectedMemberId === member.id ||
@@ -2589,22 +2675,22 @@ export default function App() {
                           setSelectedMemberId(member.id);
                         }
                       }}
-                      className={`rounded-2xl p-2 flex items-center justify-between gap-1.5 border transition-all cursor-pointer ${
+                      className={`rounded-xl px-2 py-1 flex items-center justify-between gap-1 border transition-all cursor-pointer ${
                         isHighlighted
-                          ? 'bg-gradient-to-b from-[#17a9d9] to-[#0c6c99] border-[#66ecff] shadow-[0_0_16px_rgba(35,220,255,0.45)]'
+                          ? 'bg-gradient-to-b from-[#17a9d9] to-[#0c6c99] border-[#66ecff] shadow-[0_0_12px_rgba(35,220,255,0.45)]'
                           : 'bg-gradient-to-b from-[#062b4c] to-[#041d35] border-[#23dcff]/45 hover:border-[#23dcff]'
                       }`}
                     >
-                      <div className="relative w-7 h-7 rounded-full bg-[#03192e] border border-cyan-400/55 flex items-center justify-center shrink-0">
-                        <Mic className="w-3.5 h-3.5 text-[#23dcff]" />
-                        <span className="w-2 h-2 rounded-full bg-[#23dcff] absolute -top-0.5 -right-0.5" />
+                      <div className="relative w-5.5 h-5.5 rounded-full bg-[#03192e] border border-cyan-400/55 flex items-center justify-center shrink-0">
+                        <Mic className="w-3 h-3 text-[#23dcff]" />
+                        <span className="w-1.5 h-1.5 rounded-full bg-[#23dcff] absolute -top-0.5 -right-0.5" />
                       </div>
 
                       <div className="min-w-0 flex-1 leading-tight">
-                        <div className="font-tactical text-[14px] font-bold text-white truncate">
+                        <div className="font-tactical text-[12.5px] font-bold text-white truncate">
                           {member.callsign}
                         </div>
-                        <div className="font-telemetry text-[9.5px] text-cyan-100/90 truncate">
+                        <div className="font-telemetry text-[8.5px] text-cyan-100/90 truncate">
                           {member.ip}
                         </div>
                       </div>
@@ -2615,28 +2701,126 @@ export default function App() {
             )}
           </section>
 
-          {/* 5. TOMBOL PTT UTAMA (CENTER) */}
-          <section className="py-1.5 flex items-center justify-center gap-3">
-            {/* Indikator Gelombang Suara Kiri */}
-            <div className="flex items-center gap-1">
-              {[6, 7, 8, 9, 11, 13, 15, 17, 19, 21].map((h, i) => (
-                <span
-                  key={`lw-${i}`}
-                  style={{
-                    height: isTransmitting
-                      ? `${Math.max(6, ((h * micLevel) / 60) % 30)}px`
-                      : `${h * 0.65}px`,
-                  }}
-                  className={`w-1 rounded-full transition-all duration-75 ${
-                    isTransmitting || incomingSpeaker
-                      ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
-                      : 'bg-[#23dcff]/55'
+          {/* 5. TOMBOL PTT UTAMA (CENTER) + BANNER STATUS */}
+          <section className="flex flex-col items-center gap-1 shrink-0">
+            <div className="flex items-center justify-center gap-2.5">
+              {/* Indikator Gelombang Suara Kiri */}
+              <div className="flex items-center gap-0.5">
+                {[6, 7, 8, 9, 11, 13, 15, 17, 19, 21].map((h, i) => (
+                  <span
+                    key={`lw-${i}`}
+                    style={{
+                      height: isTransmitting
+                        ? `${Math.max(5, ((h * micLevel) / 65) % 24)}px`
+                        : `${h * 0.55}px`,
+                    }}
+                    className={`w-1 rounded-full transition-all duration-75 ${
+                      isTransmitting || incomingSpeaker
+                        ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
+                        : 'bg-[#23dcff]/55'
+                    }`}
+                  />
+                ))}
+              </div>
+
+              {/* Tombol Lingkaran PTT (Push-To-Talk & Hold) - Proporsional 1 Layar HP */}
+              <button
+                type="button"
+                disabled={isPttLocked}
+                onMouseDown={isPttLocked ? undefined : handlePttStart}
+                onMouseUp={isPttLocked ? undefined : handlePttEnd}
+                onMouseLeave={isPttLocked ? undefined : handlePttEnd}
+                onTouchStart={(e) => {
+                  e.preventDefault();
+                  if (!isPttLocked) handlePttStart();
+                }}
+                onTouchEnd={(e) => {
+                  e.preventDefault();
+                  if (!isPttLocked) handlePttEnd();
+                }}
+                className={`relative w-34 h-34 sm:w-38 sm:h-38 rounded-full border-[3px] flex items-center justify-center transition-transform duration-150 select-none ${
+                  isPttLocked
+                    ? 'bg-[#1a1318] border-red-500/80 opacity-85 cursor-not-allowed'
+                    : isTransmitting
+                    ? 'ptt-ring-active border-white scale-[0.97] cursor-pointer'
+                    : 'ptt-ring-outer border-[#2fe0ff] active:scale-95 cursor-pointer'
+                }`}
+              >
+                {/* Teks Melingkar "PUSH TO TALK & HOLD" */}
+                <div className="absolute inset-0 pointer-events-none">
+                  {curvedChars.map((char, index) => {
+                    const total = curvedChars.length;
+                    const spreadDeg = 112;
+                    const startAngle = -spreadDeg / 2;
+                    const angle = startAngle + (index / (total - 1)) * spreadDeg;
+                    return (
+                      <span
+                        key={index}
+                        style={{
+                          transform: `rotate(${angle}deg)`,
+                        }}
+                        className="absolute left-1/2 top-1.5 -ml-[4px] h-[62px] sm:h-[70px] origin-bottom font-tactical text-[9.5px] font-extrabold text-[#02192d] tracking-wider"
+                      >
+                        {char}
+                      </span>
+                    );
+                  })}
+                </div>
+
+                {/* Lingkaran Dalam Tombol PTT */}
+                <div
+                  className={`w-23 h-23 sm:w-26 sm:h-26 rounded-full border-2 flex flex-col items-center justify-center px-2 text-center transition-all ${
+                    isPttLocked
+                      ? 'bg-gradient-to-b from-[#3d121d] to-[#1c080d] border-red-400/80'
+                      : isTransmitting
+                      ? 'bg-gradient-to-b from-[#33e6ff] to-[#066c96] border-white shadow-inner'
+                      : 'bg-gradient-to-b from-[#178bbf] via-[#0a4c73] to-[#052942] border-[#6beaff]/65 shadow-[inset_0_3px_10px_rgba(255,255,255,0.25)]'
                   }`}
-                />
-              ))}
+                >
+                  <Radio
+                    className={`w-7 h-7 sm:w-8 sm:h-8 mb-0.5 ${
+                      isPttLocked
+                        ? 'text-red-300 animate-pulse'
+                        : isTransmitting
+                        ? 'text-[#021b30] animate-pulse'
+                        : 'text-[#03233b]'
+                    }`}
+                  />
+                  <span className="font-tactical text-[11px] sm:text-[12.5px] font-extrabold tracking-wider text-white drop-shadow leading-tight">
+                    {isTransmitting
+                      ? 'TRANSMITTING'
+                      : incomingSpeaker
+                      ? isPttLocked
+                        ? `LOCKED • RX ${incomingSpeaker}`
+                        : `OVERRIDE READY`
+                      : isMasterDevice
+                      ? 'MASTER READY'
+                      : 'CLIENT READY'}
+                  </span>
+                </div>
+              </button>
+
+              {/* Indikator Gelombang Suara Kanan */}
+              <div className="flex items-center gap-0.5">
+                {[21, 19, 17, 15, 13, 11, 9, 8, 7, 6].map((h, i) => (
+                  <span
+                    key={`rw-${i}`}
+                    style={{
+                      height: isTransmitting
+                        ? `${Math.max(5, ((h * micLevel) / 65) % 24)}px`
+                        : `${h * 0.55}px`,
+                    }}
+                    className={`w-1 rounded-full transition-all duration-75 ${
+                      isTransmitting || incomingSpeaker
+                        ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
+                        : 'bg-[#23dcff]/55'
+                    }`}
+                  />
+                ))}
+              </div>
             </div>
 
-            {/* Tombol Lingkaran Raksasa PTT (Push-To-Talk & Hold) */}
+            {/* BANNER STATUS BAWAH ("MASTER READY" / "RECEIVING FROM [NAMA]") */}
             <button
               type="button"
               disabled={isPttLocked}
@@ -2651,149 +2835,168 @@ export default function App() {
                 e.preventDefault();
                 if (!isPttLocked) handlePttEnd();
               }}
-              className={`relative w-48 h-48 sm:w-52 sm:h-52 rounded-full border-[3px] flex items-center justify-center transition-transform duration-150 select-none ${
+              className={`w-full py-1.5 rounded-xl font-tactical text-[15px] font-extrabold tracking-[0.08em] text-white text-center transition-all ${
                 isPttLocked
-                  ? 'bg-[#1a1318] border-red-500/80 opacity-85 cursor-not-allowed'
-                  : isTransmitting
-                  ? 'ptt-ring-active border-white scale-[0.97] cursor-pointer'
-                  : 'ptt-ring-outer border-[#2fe0ff] active:scale-95 cursor-pointer'
+                  ? 'bg-red-950/90 border border-red-400/80 text-red-100 cursor-not-allowed'
+                  : 'cyan-btn-glow shadow-[0_0_18px_rgba(35,220,255,0.4)] cursor-pointer'
               }`}
             >
-              {/* Teks Melingkar "PUSH TO TALK & HOLD" */}
-              <div className="absolute inset-0 pointer-events-none">
-                {curvedChars.map((char, index) => {
-                  const total = curvedChars.length;
-                  const spreadDeg = 112;
-                  const startAngle = -spreadDeg / 2;
-                  const angle = startAngle + (index / (total - 1)) * spreadDeg;
-                  return (
-                    <span
-                      key={index}
-                      style={{
-                        transform: `rotate(${angle}deg)`,
-                      }}
-                      className="absolute left-1/2 top-2 -ml-[5px] h-[86px] sm:h-[94px] origin-bottom font-tactical text-[11.5px] font-extrabold text-[#02192d] tracking-wider"
-                    >
-                      {char}
-                    </span>
-                  );
-                })}
-              </div>
-
-              {/* Lingkaran Dalam Tombol PTT */}
-              <div
-                className={`w-32 h-32 sm:w-36 sm:h-36 rounded-full border-2 flex flex-col items-center justify-center px-3 text-center transition-all ${
-                  isPttLocked
-                    ? 'bg-gradient-to-b from-[#3d121d] to-[#1c080d] border-red-400/80'
-                    : isTransmitting
-                    ? 'bg-gradient-to-b from-[#33e6ff] to-[#066c96] border-white shadow-inner'
-                    : 'bg-gradient-to-b from-[#178bbf] via-[#0a4c73] to-[#052942] border-[#6beaff]/65 shadow-[inset_0_3px_10px_rgba(255,255,255,0.25)]'
-                }`}
-              >
-                <Radio
-                  className={`w-10 h-10 sm:w-11 sm:h-11 mb-1 ${
-                    isPttLocked
-                      ? 'text-red-300 animate-pulse'
-                      : isTransmitting
-                      ? 'text-[#021b30] animate-pulse'
-                      : 'text-[#03233b]'
-                  }`}
-                />
-                <span className="font-tactical text-[13px] sm:text-[15px] font-extrabold tracking-wider text-white drop-shadow leading-tight">
-                  {isTransmitting
-                    ? 'TRANSMITTING'
-                    : incomingSpeaker
-                    ? isPttLocked
-                      ? `LOCKED • RX ${incomingSpeaker}`
-                      : `OVERRIDE READY`
-                    : isMasterDevice
-                    ? 'MASTER READY'
-                    : 'CLIENT READY'}
-                </span>
-              </div>
+              {isTransmitting
+                ? 'TRANSMITTING VOICE STREAM...'
+                : incomingSpeaker
+                ? isMasterDevice
+                  ? `RECEIVING FROM ${incomingSpeaker} (TEKAN UNTUK OVERRIDE)`
+                  : `RECEIVING FROM ${incomingSpeaker} (PTT LOCKED)`
+                : isMasterDevice
+                ? 'MASTER READY'
+                : 'CLIENT READY'}
             </button>
-
-            {/* Indikator Gelombang Suara Kanan */}
-            <div className="flex items-center gap-1">
-              {[21, 19, 17, 15, 13, 11, 9, 8, 7, 6].map((h, i) => (
-                <span
-                  key={`rw-${i}`}
-                  style={{
-                    height: isTransmitting
-                      ? `${Math.max(6, ((h * micLevel) / 60) % 30)}px`
-                      : `${h * 0.65}px`,
-                  }}
-                  className={`w-1 rounded-full transition-all duration-75 ${
-                    isTransmitting || incomingSpeaker
-                      ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
-                      : 'bg-[#23dcff]/55'
-                  }`}
-                />
-              ))}
-            </div>
           </section>
 
-          {/* BANNER STATUS BAWAH ("MASTER READY" / "RECEIVING FROM [NAMA]") */}
-          <button
-            type="button"
-            disabled={isPttLocked}
-            onMouseDown={isPttLocked ? undefined : handlePttStart}
-            onMouseUp={isPttLocked ? undefined : handlePttEnd}
-            onMouseLeave={isPttLocked ? undefined : handlePttEnd}
-            onTouchStart={(e) => {
-              e.preventDefault();
-              if (!isPttLocked) handlePttStart();
-            }}
-            onTouchEnd={(e) => {
-              e.preventDefault();
-              if (!isPttLocked) handlePttEnd();
-            }}
-            className={`w-full py-3 rounded-2xl font-tactical text-[19px] font-extrabold tracking-[0.08em] text-white text-center transition-all ${
-              isPttLocked
-                ? 'bg-red-950/90 border-2 border-red-400/80 text-red-100 cursor-not-allowed'
-                : 'cyan-btn-glow shadow-[0_0_25px_rgba(35,220,255,0.45)] cursor-pointer'
-            }`}
-          >
-            {isTransmitting
-              ? 'TRANSMITTING VOICE STREAM...'
-              : incomingSpeaker
-              ? isMasterDevice
-                ? `RECEIVING FROM ${incomingSpeaker} (TEKAN UNTUK OVERRIDE)`
-                : `RECEIVING FROM ${incomingSpeaker} (PTT LOCKED)`
-              : isMasterDevice
-              ? 'MASTER READY'
-              : 'CLIENT READY'}
-          </button>
+          {/* 5B. FITUR CHAT TAKTIKAL LANGSUNG DI LAYAR UTAMA (FLEXIBLE ON-SCREEN CHAT) */}
+          <section className="flex-1 min-h-0 tactical-panel rounded-xl px-2.5 py-1.5 flex flex-col justify-between gap-1 border border-[#23dcff]/55 overflow-hidden">
+            <div className="flex items-center justify-between gap-1.5 shrink-0">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <MessageSquare className="w-3.5 h-3.5 text-[#23dcff] shrink-0" />
+                <span className="font-tactical text-[12.5px] font-extrabold tracking-wider text-white truncate">
+                  LIVE CHAT • CH {String(channel).padStart(2, '0')}
+                </span>
+                {unreadChatCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded-full bg-[#23dcff] text-[#02182b] font-telemetry text-[9px] font-extrabold">
+                    {unreadChatCount}
+                  </span>
+                )}
+              </div>
+
+              {/* Tombol Pesan Cepat (Quick Presets) sebaris di header chat agar hemat tempat */}
+              <div className="flex items-center gap-1 overflow-x-auto">
+                {['SIAP 86!', 'MONITOR', 'AMAN', 'SOS'].map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => handleSendChatMessage(undefined, preset)}
+                    className="px-1.5 py-0.5 rounded bg-[#04223b] hover:bg-[#08385e] border border-cyan-400/45 font-telemetry text-[9px] font-bold text-cyan-100 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {preset}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUnreadChatCount(0);
+                    setActiveBottomModal('chat');
+                  }}
+                  className="px-1.5 py-0.5 rounded bg-[#052542] hover:bg-[#093862] border border-[#23dcff]/60 font-telemetry text-[9px] font-bold text-[#23dcff] whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Full
+                </button>
+              </div>
+            </div>
+
+            {/* Area Riwayat Pesan Chat di Layar (Otomatis menyesuaikan tinggi sisa layar HP) */}
+            <div className="flex-1 min-h-[38px] overflow-y-auto rounded-lg bg-[#021220]/90 border border-cyan-400/25 px-2 py-1 space-y-1 font-telemetry text-[10px]">
+              {chatMessages.filter((m) => m.channel === channel).length === 0 ? (
+                <div className="h-full flex items-center justify-center text-center text-cyan-300/60 text-[9.5px]">
+                  <span>Belum ada chat di CH {String(channel).padStart(2, '0')} — ketik pesan atau tekan preset di atas.</span>
+                </div>
+              ) : (
+                chatMessages
+                  .filter((m) => m.channel === channel)
+                  .map((msg) => {
+                    const isMine = msg.senderId === myDeviceId;
+                    const timeStr = new Date(msg.timestamp).toLocaleTimeString('id-ID', {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    });
+                    return (
+                      <div
+                        key={msg.id}
+                        className={`px-2 py-1 rounded-lg border leading-tight ${
+                          isMine
+                            ? 'bg-[#08385e]/90 border-[#23dcff]/70 text-white ml-3'
+                            : 'bg-[#041f36]/90 border-cyan-500/35 text-cyan-50 mr-3'
+                        }`}
+                      >
+                        <span className="font-extrabold text-[#23dcff] text-[9.5px] mr-1.5">
+                          [{timeStr}] {isMine ? `${msg.callsign}` : msg.callsign}:
+                        </span>
+                        <span className="text-[10.5px] font-semibold break-words text-white">
+                          {msg.text}
+                        </span>
+                      </div>
+                    );
+                  })
+              )}
+              <div ref={onScreenChatEndRef} />
+            </div>
+
+            {/* Input Kirim Pesan Langsung di Layar */}
+            <form onSubmit={(e) => handleSendChatMessage(e)} className="flex items-center gap-1.5 shrink-0">
+              <input
+                type="text"
+                maxLength={200}
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder={`Kirim chat ke CH ${String(channel).padStart(2, '0')}...`}
+                className="flex-1 px-2.5 py-1 rounded-lg bg-[#021424] border border-[#23dcff]/65 focus:border-[#23dcff] text-white font-telemetry text-[11px] focus:outline-none"
+              />
+              <button
+                type="submit"
+                className="px-2.5 py-1 rounded-lg cyan-btn-glow text-[#02182b] font-telemetry text-[10.5px] font-extrabold flex items-center gap-1 shrink-0 cursor-pointer"
+              >
+                <Send className="w-3 h-3" />
+                <span>KIRIM</span>
+              </button>
+            </form>
+          </section>
         </div>
 
-        {/* 6. BOTTOM NAVIGATION BAR: [Channels], [Edit Nama], [Barcode], [Settings] */}
-        <nav className="w-full bg-[#021526]/95 border-t border-cyan-400/35 px-2 py-2.5 grid grid-cols-4 gap-1 shrink-0">
+        {/* 6. BOTTOM NAVIGATION BAR: [Channels], [Chat], [Edit Nama], [Barcode], [Settings] */}
+        <nav className="w-full bg-[#021526]/95 border-t border-cyan-400/35 px-1.5 py-1.5 grid grid-cols-5 gap-1 shrink-0">
           <button
             onClick={() => setActiveBottomModal('channels')}
-            className="flex flex-col items-center justify-center py-1 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
+            className="flex flex-col items-center justify-center py-0.5 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
           >
-            <Radio className="w-5 h-5 text-[#23dcff] mb-1" />
-            <span className="font-telemetry text-[11px] font-semibold">
+            <Radio className="w-4 h-4 text-[#23dcff] mb-0.5" />
+            <span className="font-telemetry text-[10px] font-semibold">
               [Channels]
             </span>
           </button>
 
           <button
-            onClick={() => openEditNameModal()}
-            className="flex flex-col items-center justify-center py-1 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
+            onClick={() => {
+              setUnreadChatCount(0);
+              setActiveBottomModal('chat');
+            }}
+            className="relative flex flex-col items-center justify-center py-0.5 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
           >
-            <Pencil className="w-5 h-5 text-[#23dcff] mb-1" />
-            <span className="font-telemetry text-[11px] font-semibold">
+            <MessageSquare className="w-4 h-4 text-[#23dcff] mb-0.5" />
+            {unreadChatCount > 0 && (
+              <span className="absolute top-0 right-3 w-3.5 h-3.5 rounded-full bg-[#23dcff] text-[#02182b] font-telemetry text-[8.5px] font-extrabold flex items-center justify-center">
+                {unreadChatCount}
+              </span>
+            )}
+            <span className="font-telemetry text-[10px] font-semibold">
+              [Chat]
+            </span>
+          </button>
+
+          <button
+            onClick={() => openEditNameModal()}
+            className="flex flex-col items-center justify-center py-0.5 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
+          >
+            <Pencil className="w-4 h-4 text-[#23dcff] mb-0.5" />
+            <span className="font-telemetry text-[10px] font-semibold">
               [Edit Nama]
             </span>
           </button>
 
           <button
             onClick={() => setActiveBottomModal('barcode')}
-            className="flex flex-col items-center justify-center py-1 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
+            className="flex flex-col items-center justify-center py-0.5 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
           >
-            <QrCode className="w-5 h-5 text-[#23dcff] mb-1" />
-            <span className="font-telemetry text-[11px] font-semibold">
+            <QrCode className="w-4 h-4 text-[#23dcff] mb-0.5" />
+            <span className="font-telemetry text-[10px] font-semibold">
               [Barcode]
             </span>
           </button>
@@ -2803,17 +3006,17 @@ export default function App() {
               setSettingsTab('audio');
               setActiveBottomModal('settings');
             }}
-            className="flex flex-col items-center justify-center py-1 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
+            className="flex flex-col items-center justify-center py-0.5 text-cyan-100 hover:text-[#23dcff] transition-colors cursor-pointer"
           >
-            <Settings className="w-5 h-5 text-[#23dcff] mb-1" />
-            <span className="font-telemetry text-[11px] font-semibold">
+            <Settings className="w-4 h-4 text-[#23dcff] mb-0.5" />
+            <span className="font-telemetry text-[10px] font-semibold">
               [Settings]
             </span>
           </button>
         </nav>
 
         {/* ===================================================================
-            MODAL OVERLAYS ([Channels], [Edit Nama], [Barcode], [Settings])
+            MODAL OVERLAYS ([Channels], [Chat], [Edit Nama], [Barcode], [Settings])
            =================================================================== */}
         {activeBottomModal && (
           <div className="fixed inset-0 bg-[#010d18]/90 backdrop-blur-md z-50 flex items-center justify-center p-4">
@@ -2822,6 +3025,8 @@ export default function App() {
                 <h3 className="font-tactical text-lg font-bold tracking-wider text-[#23dcff]">
                   {activeBottomModal === 'channels' &&
                     'PILIH FREKUENSI CHANNEL PTT'}
+                  {activeBottomModal === 'chat' &&
+                    `RUANG CHAT TAKTIKAL • CH ${String(channel).padStart(2, '0')}`}
                   {activeBottomModal === 'editName' &&
                     (editingMemberId
                       ? 'UBAH CALLSIGN ANGGOTA'
@@ -2838,6 +3043,107 @@ export default function App() {
                   <X className="w-5 h-5" />
                 </button>
               </div>
+
+              {/* MODAL CHAT TAKTIKAL LAYAR PENUH */}
+              {activeBottomModal === 'chat' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-[11px] font-telemetry text-cyan-200">
+                    <span>
+                      ID: <strong className="text-white">{myCallsign}</strong> ({permanentRoleLabel})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleClearChannelChat}
+                      className="px-2.5 py-1 rounded-lg bg-red-950/60 hover:bg-red-900/70 border border-red-400/50 text-red-200 flex items-center gap-1 text-[10.5px] font-bold cursor-pointer"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>Bersihkan Chat</span>
+                    </button>
+                  </div>
+
+                  <div className="h-72 overflow-y-auto rounded-xl bg-[#021220] border border-cyan-400/35 p-3 space-y-2 font-telemetry text-xs">
+                    {chatMessages.filter((m) => m.channel === channel).length === 0 ? (
+                      <div className="h-full flex flex-col items-center justify-center text-center text-cyan-300/60 text-xs">
+                        <MessageSquare className="w-8 h-8 text-[#23dcff]/50 mb-2" />
+                        <span>Belum ada percakapan di CHANNEL {String(channel).padStart(2, '0')}.</span>
+                        <span className="text-[10.5px] mt-1">
+                          Pesan terkirim secara instan melalui Wi-Fi / Hotspot Offline maupun Cloud Mesh.
+                        </span>
+                      </div>
+                    ) : (
+                      chatMessages
+                        .filter((m) => m.channel === channel)
+                        .map((msg) => {
+                          const isMine = msg.senderId === myDeviceId;
+                          const timeStr = new Date(msg.timestamp).toLocaleTimeString('id-ID', {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit',
+                          });
+                          return (
+                            <div
+                              key={msg.id}
+                              className={`p-2.5 rounded-xl border ${
+                                isMine
+                                  ? 'bg-[#08385e] border-[#23dcff] text-white ml-6'
+                                  : 'bg-[#041f36] border-cyan-500/40 text-cyan-50 mr-6'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between gap-2 text-[10px] text-cyan-300 mb-1">
+                                <span className="font-extrabold text-[#23dcff]">
+                                  {isMine ? `${msg.callsign} (SAYA)` : msg.callsign} [{msg.role}] • {msg.ip}
+                                </span>
+                                <span>{timeStr}</span>
+                              </div>
+                              <div className="text-xs font-semibold break-words text-white">
+                                {msg.text}
+                              </div>
+                            </div>
+                          );
+                        })
+                    )}
+                    <div ref={modalChatEndRef} />
+                  </div>
+
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                    {[
+                      'SIAP 86!',
+                      'MONITOR POSISI',
+                      'LAPOR SITUASI AMAN',
+                      'GANTI CHANNEL',
+                      ' DARURAT / SOS',
+                    ].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => handleSendChatMessage(undefined, preset)}
+                        className="px-2.5 py-1 rounded-lg bg-[#04223b] hover:bg-[#08385e] border border-cyan-400/45 font-telemetry text-[10.5px] font-bold text-cyan-100 whitespace-nowrap shrink-0 cursor-pointer"
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
+
+                  <form onSubmit={(e) => handleSendChatMessage(e)} className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      maxLength={200}
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      autoFocus
+                      placeholder={`Tulis pesan taktikal ke CH ${String(channel).padStart(2, '0')}...`}
+                      className="flex-1 px-3.5 py-2.5 rounded-xl bg-[#021424] border border-[#23dcff] text-white font-telemetry text-xs focus:outline-none"
+                    />
+                    <button
+                      type="submit"
+                      className="px-4 py-2.5 rounded-xl cyan-btn-glow text-[#02182b] font-telemetry text-xs font-extrabold flex items-center gap-1.5 shrink-0 cursor-pointer"
+                    >
+                      <Send className="w-4 h-4" />
+                      <span>KIRIM</span>
+                    </button>
+                  </form>
+                </div>
+              )}
 
               {/* MODAL 1: CHANNELS */}
               {activeBottomModal === 'channels' && (
