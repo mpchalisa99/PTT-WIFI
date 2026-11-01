@@ -43,9 +43,19 @@ interface TacticalMember {
   peerId?: string;
 }
 
+interface PeerSyncEntry {
+  peerId: string;
+  senderId: string;
+  callsign: string;
+  ip: string;
+  role: 'MASTER' | 'CLIENT';
+  channel: number;
+}
+
 interface MeshPacket {
   type:
     | 'ANNOUNCE'
+    | 'PEER_LIST_SYNC'
     | 'VOICE_CLIP'
     | 'PTT_START'
     | 'PTT_END'
@@ -63,9 +73,10 @@ interface MeshPacket {
   audioBase64?: string;
   mimeType?: string;
   peerNodeId?: string;
+  peerList?: PeerSyncEntry[];
 }
 
-const MESH_SLOTS = 6;
+const MASTER_PEER_ID = 'PTT-MASTER-01';
 
 // Universal parser for both ?query and #hash invite parameters (prevents 404 Page Not Found)
 function extractInviteParamsFromUrl() {
@@ -99,24 +110,14 @@ export default function App() {
   // Read URL invite parameters once on boot (supports both #hash and ?query)
   const [urlInviteParams, setUrlInviteParams] = useState(() => extractInviteParamsFromUrl());
 
-  // Persistent identity & URL query auto-join support for Barcode scanning
+  // Persistent device ID stored in localStorage
   const [myDeviceId] = useState<string>(() => {
-    const initial = extractInviteParamsFromUrl();
-    if (initial.isInvite) {
-      const sessionSaved = sessionStorage.getItem('diskomlekau_invite_device_id');
-      if (sessionSaved) return sessionSaved;
-      const generatedInvite = `CLI-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
-      sessionStorage.setItem('diskomlekau_invite_device_id', generatedInvite);
-      return generatedInvite;
-    }
     const saved = localStorage.getItem('diskomlekau_device_id');
     if (saved) return saved;
-    const generated = `DEV-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+    const generated = Math.random().toString(36).substring(2, 6).toUpperCase();
     localStorage.setItem('diskomlekau_device_id', generated);
     return generated;
   });
-
-  const myPeerNodeId = `diskomlekau-node-${myDeviceId.toLowerCase()}`;
 
   const [role, setRole] = useState<'MASTER' | 'CLIENT'>(() => {
     if (urlInviteParams.isInvite) return 'CLIENT';
@@ -128,11 +129,9 @@ export default function App() {
 
   const [localIp, setLocalIp] = useState<string>(() => {
     if (urlInviteParams.isInvite) {
-      const sessionIp = sessionStorage.getItem('diskomlekau_invite_ip');
-      if (sessionIp) return sessionIp;
-      const generatedIp = `192.168.43.${Math.floor(102 + Math.random() * 90)}`;
-      sessionStorage.setItem('diskomlekau_invite_ip', generatedIp);
-      return generatedIp;
+      const savedIp = localStorage.getItem('diskomlekau_ip');
+      if (savedIp && savedIp !== '192.168.43.1') return savedIp;
+      return `192.168.43.${Math.floor(102 + Math.random() * 90)}`;
     }
     return localStorage.getItem('diskomlekau_ip') || '192.168.43.1';
   });
@@ -143,31 +142,37 @@ export default function App() {
   });
 
   const [myCallsign, setMyCallsign] = useState<string>(() => {
-    if (urlInviteParams.isInvite) {
-      return sessionStorage.getItem('diskomlekau_invite_callsign') || '';
-    }
     return localStorage.getItem('diskomlekau_callsign') || '';
   });
 
   const [isSetupCompleted, setIsSetupCompleted] = useState<boolean>(() => {
-    if (urlInviteParams.isInvite) {
-      return Boolean(sessionStorage.getItem('diskomlekau_invite_callsign'));
-    }
     return Boolean(localStorage.getItem('diskomlekau_callsign'));
   });
 
   const [setupCallsignInput, setSetupCallsignInput] = useState<string>(() => {
-    if (urlInviteParams.isInvite) {
-      return sessionStorage.getItem('diskomlekau_invite_callsign') || '';
-    }
     return localStorage.getItem('diskomlekau_callsign') || '';
   });
 
   const [setupIpMode, setSetupIpMode] = useState<'192.168.43.1' | 'CLIENT'>(() => {
     if (urlInviteParams.isInvite) return 'CLIENT';
+    const savedRole = localStorage.getItem('diskomlekau_role');
+    if (savedRole === 'CLIENT') return 'CLIENT';
+    if (savedRole === 'MASTER') return '192.168.43.1';
     const savedIp = localStorage.getItem('diskomlekau_ip') || '192.168.43.1';
     return savedIp === '192.168.43.1' ? '192.168.43.1' : 'CLIENT';
   });
+
+  // Cloud Handshake PeerJS ID:
+  // - Master registers static ID: 'PTT-MASTER-01'
+  // - Client registers unique ID: 'PTT-CLIENT-[CALLSIGN]-[ID]'
+  const sanitizedCallsignForPeer = (myCallsign || 'UNIT')
+    .replace(/[^A-Z0-9]/gi, '')
+    .toUpperCase() || 'UNIT';
+  const cleanShortDeviceId = myDeviceId.replace(/[^A-Z0-9]/gi, '').toUpperCase() || '01';
+  const myPeerNodeId =
+    role === 'MASTER' || localIp === '192.168.43.1'
+      ? MASTER_PEER_ID
+      : `PTT-CLIENT-${sanitizedCallsignForPeer}-${cleanShortDeviceId}`;
 
   // Target Master Host Peer ID from Barcode Invite Link or manual paste
   const [invitedHostPeer, setInvitedHostPeer] = useState<string>(urlInviteParams.hostPeer);
@@ -228,46 +233,19 @@ export default function App() {
   const directNodePeerRef = useRef<Peer | null>(null);
   const peerConnectionsRef = useRef<Map<string, DataConnection>>(new Map());
   const lastAnnounceReplyRef = useRef<Map<string, number>>(new Map());
+  const membersRef = useRef<TacticalMember[]>([]);
+  useEffect(() => {
+    membersRef.current = members;
+  }, [members]);
 
-  // Persist user settings
+  // Persist user identity & role permanently in localStorage
   useEffect(() => {
     if (!myCallsign) return;
-    if (urlInviteParams.isInvite) {
-      sessionStorage.setItem('diskomlekau_invite_callsign', myCallsign);
-      sessionStorage.setItem('diskomlekau_invite_ip', localIp);
-    } else {
-      localStorage.setItem('diskomlekau_callsign', myCallsign);
-      localStorage.setItem('diskomlekau_channel', String(channel));
-      localStorage.setItem('diskomlekau_role', role);
-      localStorage.setItem('diskomlekau_ip', localIp);
-    }
-  }, [myCallsign, channel, role, localIp, urlInviteParams.isInvite]);
-
-  // If joined via Barcode Invite Link, immediately seed the invited Master host into active peers
-  useEffect(() => {
-    if (!isSetupCompleted || !invitedHostPeer || !invitedHostCallsign) return;
-    setMembers((prev) => {
-      const exists = prev.some(
-        (m) => m.peerId === invitedHostPeer || m.callsign === invitedHostCallsign
-      );
-      if (exists) return prev;
-      return [
-        ...prev,
-        {
-          id: invitedHostPeer,
-          callsign: invitedHostCallsign,
-          ip: urlInviteParams.masterIp || '192.168.43.1',
-          role: 'MASTER',
-          statusText: 'MASTER HOST',
-          isTargeted: true,
-          isTalking: false,
-          pingMs: 18,
-          channel,
-          peerId: invitedHostPeer,
-        },
-      ];
-    });
-  }, [isSetupCompleted, invitedHostPeer, invitedHostCallsign, channel, urlInviteParams.masterIp]);
+    localStorage.setItem('diskomlekau_callsign', myCallsign);
+    localStorage.setItem('diskomlekau_channel', String(channel));
+    localStorage.setItem('diskomlekau_role', role);
+    localStorage.setItem('diskomlekau_ip', localIp);
+  }, [myCallsign, channel, role, localIp]);
 
   // Request Screen Wake Lock so HP screen stays on in APK/fullscreen mode
   useEffect(() => {
@@ -428,61 +406,237 @@ export default function App() {
     [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]
   );
 
-  // Handle incoming mesh packets (from WebRTC PeerJS or BroadcastChannel)
+  // Build and broadcast PEER_LIST_SYNC from Master ('PTT-MASTER-01') to all connected Clients
+  const broadcastPeerListSync = useCallback(
+    (overrideMembers?: TacticalMember[]) => {
+      if (role !== 'MASTER' && localIp !== '192.168.43.1') return;
+      if (!myCallsign) return;
+
+      const currentList = overrideMembers ?? membersRef.current;
+      const syncList: PeerSyncEntry[] = [
+        {
+          peerId: MASTER_PEER_ID,
+          senderId: myDeviceId,
+          callsign: myCallsign,
+          ip: localIp,
+          role: 'MASTER',
+          channel,
+        },
+        ...currentList
+          .filter((m) => m.id !== myDeviceId && m.peerId !== MASTER_PEER_ID)
+          .map((m) => ({
+            peerId: m.peerId || m.id,
+            senderId: m.id,
+            callsign: m.callsign,
+            ip: m.ip,
+            role: m.role,
+            channel: m.channel,
+          })),
+      ];
+
+      broadcastMeshPacket({
+        type: 'PEER_LIST_SYNC',
+        peerList: syncList,
+      });
+    },
+    [role, localIp, myCallsign, myDeviceId, channel, broadcastMeshPacket]
+  );
+
+  // Helper to attach listeners to a PeerJS DataConnection
+  const registerPeerConnection = useCallback(
+    (conn: DataConnection) => {
+      if (!conn) return;
+
+      conn.on('open', () => {
+        peerConnectionsRef.current.set(conn.peer, conn);
+        setConnectedPeersCount(peerConnectionsRef.current.size);
+
+        const pkt = announcePacketBuilderRef.current();
+        if (pkt) {
+          try {
+            conn.send(pkt);
+          } catch {
+            // Ignore send error
+          }
+        }
+      });
+
+      conn.on('data', (data) => {
+        const incoming = data as MeshPacket;
+        if (!incoming) return;
+        if (!incoming.peerNodeId && conn.peer) {
+          incoming.peerNodeId = conn.peer;
+        }
+        packetHandlerRef.current(incoming);
+
+        // If this device is Master ('PTT-MASTER-01'), relay voice/control packets to other connected clients
+        if (
+          incoming.type !== 'ANNOUNCE' &&
+          incoming.type !== 'PEER_LIST_SYNC' &&
+          (localIp === '192.168.43.1' || role === 'MASTER')
+        ) {
+          peerConnectionsRef.current.forEach((otherConn, peerKey) => {
+            if (peerKey !== conn.peer && otherConn.open) {
+              try {
+                otherConn.send(incoming);
+              } catch {
+                // Ignore relay error
+              }
+            }
+          });
+        }
+      });
+
+      const handleDisconnect = () => {
+        peerConnectionsRef.current.delete(conn.peer);
+        setConnectedPeersCount(peerConnectionsRef.current.size);
+        setMembers((prev) => {
+          const next = prev.filter(
+            (m) => m.peerId !== conn.peer && m.id !== conn.peer
+          );
+          if (next.length !== prev.length) {
+            window.setTimeout(() => broadcastPeerListSync(next), 50);
+          }
+          return next;
+        });
+      };
+
+      conn.on('close', handleDisconnect);
+      conn.on('error', handleDisconnect);
+    },
+    [localIp, role, broadcastPeerListSync]
+  );
+
+  // Handle incoming mesh packets (from WebRTC PeerJS DataChannel or local BroadcastChannel)
   const handleIncomingMeshPacket = useCallback(
     (pkt: MeshPacket) => {
       if (!pkt || pkt.senderId === myDeviceId || !pkt.callsign) return;
-      // Filter by currentChannel without closing sockets
-      if (pkt.channel !== channel) return;
 
-      const amIMaster = localIp === '192.168.43.1';
-      const senderIsMaster = pkt.ip === '192.168.43.1' || pkt.role === 'MASTER' || Boolean(pkt.isMaster);
+      const amIMaster = localIp === '192.168.43.1' || role === 'MASTER';
+      const senderIsMaster =
+        pkt.ip === '192.168.43.1' ||
+        pkt.role === 'MASTER' ||
+        pkt.peerNodeId === MASTER_PEER_ID ||
+        Boolean(pkt.isMaster);
 
       if (pkt.type === 'ANNOUNCE') {
+        const senderPeerId = pkt.peerNodeId || pkt.senderId;
         setMembers((prev) => {
           const exists = prev.some(
-            (m) => m.id === pkt.senderId || m.callsign === pkt.callsign
+            (m) => m.id === pkt.senderId || m.peerId === senderPeerId
           );
-          if (exists) {
-            return prev.map((m) =>
-              m.id === pkt.senderId || m.callsign === pkt.callsign
-                ? {
-                    ...m,
-                    id: pkt.senderId,
-                    callsign: pkt.callsign,
-                    ip: pkt.ip,
-                    role: pkt.role,
-                    channel: pkt.channel,
-                    peerId: pkt.peerNodeId || m.peerId,
-                  }
-                : m
-            );
+          const next = exists
+            ? prev.map((m) =>
+                m.id === pkt.senderId || m.peerId === senderPeerId
+                  ? {
+                      ...m,
+                      id: pkt.senderId,
+                      callsign: pkt.callsign,
+                      ip: pkt.ip,
+                      role: pkt.role,
+                      channel: pkt.channel,
+                      peerId: senderPeerId,
+                    }
+                  : m
+              )
+            : [
+                ...prev,
+                {
+                  id: pkt.senderId,
+                  callsign: pkt.callsign,
+                  ip: pkt.ip,
+                  role: pkt.role,
+                  statusText: pkt.role === 'MASTER' ? 'MASTER HOST' : 'P2P AKTIF',
+                  isTargeted: true,
+                  isTalking: false,
+                  pingMs: 24,
+                  channel: pkt.channel,
+                  peerId: senderPeerId,
+                },
+              ];
+
+          if (amIMaster) {
+            window.setTimeout(() => broadcastPeerListSync(next), 60);
           }
-          return [
-            ...prev,
-            {
-              id: pkt.senderId,
-              callsign: pkt.callsign,
-              ip: pkt.ip,
-              role: pkt.role,
-              statusText: 'ALL AKTIF',
-              isTargeted: true,
-              isTalking: false,
-              pingMs: 24,
-              channel: pkt.channel,
-              peerId: pkt.peerNodeId,
-            },
-          ];
+          return next;
         });
 
-        // Instant reply so newly joined Barcode Clients immediately see this device
+        // Instant reply so newly connected peer immediately registers our identity
         const now = Date.now();
         const lastReply = lastAnnounceReplyRef.current.get(pkt.senderId) || 0;
         if (now - lastReply > 1500 && myCallsign) {
           lastAnnounceReplyRef.current.set(pkt.senderId, now);
           broadcastMeshPacket({ type: 'ANNOUNCE' });
         }
-      } else if (pkt.type === 'TX_START' || pkt.type === 'PTT_START') {
+        return;
+      }
+
+      if (pkt.type === 'PEER_LIST_SYNC' && Array.isArray(pkt.peerList)) {
+        // Synchronize peer list from PTT-MASTER-01 and establish direct P2P DataChannels to all peers
+        const incomingPeers = pkt.peerList.filter(
+          (entry) =>
+            entry.senderId !== myDeviceId && entry.peerId !== myPeerNodeId
+        );
+
+        setMembers((prev) => {
+          const updated: TacticalMember[] = [...prev];
+          incomingPeers.forEach((entry) => {
+            const idx = updated.findIndex(
+              (m) => m.id === entry.senderId || m.peerId === entry.peerId
+            );
+            if (idx >= 0) {
+              updated[idx] = {
+                ...updated[idx],
+                id: entry.senderId,
+                callsign: entry.callsign,
+                ip: entry.ip,
+                role: entry.role,
+                channel: entry.channel,
+                peerId: entry.peerId,
+              };
+            } else {
+              updated.push({
+                id: entry.senderId,
+                callsign: entry.callsign,
+                ip: entry.ip,
+                role: entry.role,
+                statusText: entry.role === 'MASTER' ? 'MASTER HOST' : 'P2P AKTIF',
+                isTargeted: true,
+                isTalking: false,
+                pingMs: 24,
+                channel: entry.channel,
+                peerId: entry.peerId,
+              });
+            }
+          });
+          return updated;
+        });
+
+        // Form direct P2P mesh connections with all other peers discovered via PEER_LIST_SYNC
+        const activePeer = directNodePeerRef.current || peerRef.current;
+        if (activePeer && !activePeer.disconnected && !activePeer.destroyed) {
+          incomingPeers.forEach((entry) => {
+            if (!entry.peerId || entry.peerId === myPeerNodeId) return;
+            const existingConn = peerConnectionsRef.current.get(entry.peerId);
+            if (!existingConn || !existingConn.open) {
+              try {
+                const p2pConn = activePeer.connect(entry.peerId, {
+                  reliable: true,
+                });
+                registerPeerConnection(p2pConn);
+              } catch {
+                // Ignore if peer is already connecting
+              }
+            }
+          });
+        }
+        return;
+      }
+
+      // Filter channel-specific packets (voice / PTT floor control / ping) without closing sockets
+      if (pkt.channel !== channel) return;
+
+      if (pkt.type === 'TX_START' || pkt.type === 'PTT_START') {
         // MASTER OVERRIDE: If I am Master and currently transmitting, ignore Client TX_START
         if (amIMaster && isTransmittingRef.current && !senderIsMaster) {
           return;
@@ -510,14 +664,18 @@ export default function App() {
     },
     [
       myDeviceId,
+      myPeerNodeId,
       channel,
       localIp,
+      role,
       pingMs,
       myCallsign,
       forceStopLocalRecording,
       playIncomingAudioBase64,
       playTacticalTone,
       broadcastMeshPacket,
+      broadcastPeerListSync,
+      registerPeerConnection,
     ]
   );
 
@@ -544,48 +702,13 @@ export default function App() {
     };
   }, [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]);
 
-  // Helper to attach listeners to a PeerJS DataConnection
-  const registerPeerConnection = useCallback((conn: DataConnection) => {
-    conn.on('open', () => {
-      peerConnectionsRef.current.set(conn.peer, conn);
-      setConnectedPeersCount(peerConnectionsRef.current.size);
-      const pkt = announcePacketBuilderRef.current();
-      if (pkt) {
-        try {
-          conn.send(pkt);
-        } catch {
-          // Ignore send error
-        }
-      }
-    });
-    conn.on('data', (data) => {
-      const incoming = data as MeshPacket;
-      packetHandlerRef.current(incoming);
-
-      // If this device is Master/Hub, relay packets to other connected clients on same channel
-      peerConnectionsRef.current.forEach((otherConn, peerKey) => {
-        if (peerKey !== conn.peer && otherConn.open) {
-          try {
-            otherConn.send(incoming);
-          } catch {
-            // Ignore relay error
-          }
-        }
-      });
-    });
-    conn.on('close', () => {
-      peerConnectionsRef.current.delete(conn.peer);
-      setConnectedPeersCount(peerConnectionsRef.current.size);
-    });
-    conn.on('error', () => {
-      peerConnectionsRef.current.delete(conn.peer);
-      setConnectedPeersCount(peerConnectionsRef.current.size);
-    });
-  }, []);
-
-  // Setup persistent BroadcastChannel + Direct Node PeerJS + Mesh Slots (never closes on channel switch)
+  // Cloud Handshake Signaling (PeerJS Public Cloud) + Auto-Reconnect Watchdog (2.5s):
+  // - Master registers static ID: 'PTT-MASTER-01'
+  // - Client registers unique ID: 'PTT-CLIENT-[CALLSIGN]-[ID]' and connects to 'PTT-MASTER-01'
   useEffect(() => {
-    // 1. Local BroadcastChannel for same-device / multi-tab instant voice & discovery sync
+    if (!isSetupCompleted || !myCallsign) return;
+
+    // 1. Local BroadcastChannel for same-browser multi-tab sync
     if ('BroadcastChannel' in window) {
       const bc = new BroadcastChannel('diskomlekau_tactical_ptt_channel');
       bc.onmessage = (event) => {
@@ -594,92 +717,120 @@ export default function App() {
       broadcastChannelRef.current = bc;
     }
 
-    // 2. Direct Node PeerJS (used by Barcode Invite Link `hostPeer=...` so Clients connect 100% directly)
-    const directPeer = new Peer(myPeerNodeId);
-    directNodePeerRef.current = directPeer;
-
-    directPeer.on('connection', (conn) => {
-      registerPeerConnection(conn);
-    });
-
-    // 3. Channel Slot Mesh PeerJS for automatic same-channel discovery
-    let slotPeer: Peer | null = null;
     let isCancelled = false;
+    const isMasterRole = role === 'MASTER' || localIp === '192.168.43.1';
+    const targetPeerId = isMasterRole ? MASTER_PEER_ID : myPeerNodeId;
 
-    const getSlotPeerId = (slot: number) =>
-      `diskomlekau-tactical-v2-global-slot${slot}`;
+    const peer = new Peer(targetPeerId);
+    directNodePeerRef.current = peer;
+    peerRef.current = peer;
 
-    const tryBindSlot = (slotIndex: number) => {
-      if (isCancelled || slotIndex >= MESH_SLOTS) return;
-      const candidateId = getSlotPeerId(slotIndex);
-      const p = new Peer(candidateId);
+    const connectClientToMaster = () => {
+      if (isCancelled || isMasterRole) return;
+      if (peer.disconnected || peer.destroyed) return;
 
-      p.on('open', () => {
-        if (isCancelled) {
-          p.destroy();
-          return;
+      // Connect to static Master ID 'PTT-MASTER-01'
+      const existingMasterConn = peerConnectionsRef.current.get(MASTER_PEER_ID);
+      if (!existingMasterConn || !existingMasterConn.open) {
+        try {
+          const conn = peer.connect(MASTER_PEER_ID, { reliable: true });
+          registerPeerConnection(conn);
+        } catch {
+          // Will retry on next 2.5s watchdog tick
         }
-        slotPeer = p;
-        peerRef.current = p;
-        for (let s = 0; s < MESH_SLOTS; s++) {
-          if (s === slotIndex) continue;
-          const targetId = getSlotPeerId(s);
-          if (!peerConnectionsRef.current.has(targetId)) {
-            try {
-              const conn = p.connect(targetId, { reliable: true });
-              registerPeerConnection(conn);
-            } catch {
-              // Slot not occupied
-            }
+      }
+
+      // If invited via custom Barcode hostPeer, ensure connection to it as well
+      if (
+        invitedHostPeer &&
+        invitedHostPeer !== MASTER_PEER_ID &&
+        invitedHostPeer !== targetPeerId
+      ) {
+        const existingInviteConn = peerConnectionsRef.current.get(invitedHostPeer);
+        if (!existingInviteConn || !existingInviteConn.open) {
+          try {
+            const inviteConn = peer.connect(invitedHostPeer, { reliable: true });
+            registerPeerConnection(inviteConn);
+          } catch {
+            // Will retry on next 2.5s watchdog tick
           }
         }
-      });
-
-      p.on('connection', (conn) => {
-        registerPeerConnection(conn);
-      });
-
-      p.on('error', (err: { type?: string }) => {
-        if (err.type === 'unavailable-id') {
-          p.destroy();
-          tryBindSlot(slotIndex + 1);
-        }
-      });
-    };
-
-    tryBindSlot(0);
-
-    return () => {
-      isCancelled = true;
-      broadcastChannelRef.current?.close();
-      peerConnectionsRef.current.clear();
-      directPeer.destroy();
-      slotPeer?.destroy();
-    };
-  }, [myPeerNodeId, registerPeerConnection]);
-
-  // Connect & auto-reconnect to invitedHostPeer (from Barcode Invite Link or manual paste)
-  useEffect(() => {
-    if (!invitedHostPeer || invitedHostPeer === myPeerNodeId) return;
-
-    const connectToInvitedHost = () => {
-      const activePeer = directNodePeerRef.current || peerRef.current;
-      if (!activePeer || activePeer.disconnected || activePeer.destroyed) return;
-      const existing = peerConnectionsRef.current.get(invitedHostPeer);
-      if (existing && existing.open) return;
-
-      try {
-        const conn = activePeer.connect(invitedHostPeer, { reliable: true });
-        registerPeerConnection(conn);
-      } catch {
-        // Retry on next tick
       }
     };
 
-    connectToInvitedHost();
-    const timer = window.setInterval(connectToInvitedHost, 2000);
-    return () => window.clearInterval(timer);
-  }, [invitedHostPeer, myPeerNodeId, registerPeerConnection]);
+    peer.on('open', () => {
+      if (isCancelled) {
+        peer.destroy();
+        return;
+      }
+      if (!isMasterRole) {
+        connectClientToMaster();
+      }
+    });
+
+    peer.on('connection', (conn) => {
+      registerPeerConnection(conn);
+    });
+
+    // Auto-reconnect listener when signaling connection drops
+    peer.on('disconnected', () => {
+      if (!isCancelled && !peer.destroyed) {
+        try {
+          peer.reconnect();
+        } catch {
+          // Watchdog will retry
+        }
+      }
+    });
+
+    peer.on('error', () => {
+      if (!isCancelled && peer.disconnected && !peer.destroyed) {
+        try {
+          peer.reconnect();
+        } catch {
+          // Watchdog will retry
+        }
+      }
+    });
+
+    // 2.5-second Watchdog Interval:
+    // - Reconnects signaling server if disconnected
+    // - Re-establishes DataChannel to 'PTT-MASTER-01' for Clients if dropped
+    // - Broadcasts ANNOUNCE / PEER_LIST_SYNC to keep P2P mesh synchronized
+    const watchdogTimer = window.setInterval(() => {
+      if (isCancelled) return;
+      if (peer.disconnected && !peer.destroyed) {
+        try {
+          peer.reconnect();
+        } catch {
+          // Ignore reconnect error
+        }
+      }
+      if (!isMasterRole) {
+        connectClientToMaster();
+      } else {
+        broadcastPeerListSync();
+      }
+    }, 2500);
+
+    return () => {
+      isCancelled = true;
+      window.clearInterval(watchdogTimer);
+      broadcastChannelRef.current?.close();
+      peerConnectionsRef.current.clear();
+      setConnectedPeersCount(0);
+      peer.destroy();
+    };
+  }, [
+    isSetupCompleted,
+    myCallsign,
+    role,
+    localIp,
+    myPeerNodeId,
+    invitedHostPeer,
+    registerPeerConnection,
+    broadcastPeerListSync,
+  ]);
 
   // Permanent role lock based on IP '192.168.43.1'
   const isMasterDevice = localIp === '192.168.43.1';
@@ -1062,10 +1213,12 @@ export default function App() {
           ).toUpperCase();
           parsedMasterIp = params.get('master') || params.get('ip') || '192.168.43.1';
         } else {
-          parsedHostPeer = raw.startsWith('diskomlekau-node-')
-            ? raw.toLowerCase()
-            : `diskomlekau-node-${raw.toLowerCase()}`;
+          parsedHostPeer = raw.toUpperCase().startsWith('PTT-')
+            ? raw.toUpperCase()
+            : MASTER_PEER_ID;
         }
+
+        const targetHostPeer = parsedHostPeer || MASTER_PEER_ID;
 
         setSetupIpMode('CLIENT');
         if (localIp === '192.168.43.1') {
@@ -1075,56 +1228,33 @@ export default function App() {
         }
 
         setChannel(parsedCh);
-        if (parsedHostPeer) {
-          setInvitedHostPeer(parsedHostPeer);
-          setInvitedHostCallsign(parsedHostCallsign);
-        }
+        setInvitedHostPeer(targetHostPeer);
+        setInvitedHostCallsign(parsedHostCallsign);
         setUrlInviteParams({
           isInvite: true,
           channel: parsedCh,
-          hostPeer: parsedHostPeer,
+          hostPeer: targetHostPeer,
           hostCallsign: parsedHostCallsign,
           masterIp: parsedMasterIp,
           role: 'CLIENT',
         });
 
-        setMembers((prev) => {
-          const exists = prev.some(
-            (m) =>
-              (parsedHostPeer && m.peerId === parsedHostPeer) ||
-              m.callsign === parsedHostCallsign
-          );
-          if (exists) {
-            return prev.map((m) =>
-              (parsedHostPeer && m.peerId === parsedHostPeer) ||
-              m.callsign === parsedHostCallsign
-                ? { ...m, channel: parsedCh, ip: parsedMasterIp, role: 'MASTER' }
-                : m
-            );
+        // Immediately initiate real WebRTC DataChannel handshake to targetHostPeer / PTT-MASTER-01
+        const activePeer = directNodePeerRef.current || peerRef.current;
+        if (activePeer && !activePeer.disconnected && !activePeer.destroyed) {
+          try {
+            const conn = activePeer.connect(targetHostPeer, { reliable: true });
+            registerPeerConnection(conn);
+          } catch {
+            // 2.5s watchdog will retry automatically
           }
-          return [
-            ...prev,
-            {
-              id: parsedHostPeer || `master-${Date.now()}`,
-              callsign: parsedHostCallsign,
-              ip: parsedMasterIp,
-              role: 'MASTER',
-              statusText: 'MASTER HOST',
-              isTargeted: true,
-              isTalking: false,
-              pingMs: 18,
-              channel: parsedCh,
-              peerId: parsedHostPeer,
-            },
-          ];
-        });
+        }
 
         playTacticalTone('rx');
         setInviteJoinStatus(
-          `BERHASIL TERHUBUNG KE MASTER ${parsedHostCallsign} (CH ${String(parsedCh).padStart(
-            2,
-            '0'
-          )})`
+          `MENGHUBUNGKAN WEBRTC DATACHANNEL KE ${targetHostPeer} (CH ${String(
+            parsedCh
+          ).padStart(2, '0')})...`
         );
         return true;
       } catch {
@@ -1132,7 +1262,7 @@ export default function App() {
         return false;
       }
     },
-    [channel, localIp, playTacticalTone]
+    [channel, localIp, playTacticalTone, registerPeerConnection]
   );
 
   // Stop in-app camera QR scanner stream
@@ -1363,7 +1493,7 @@ export default function App() {
 
             <div>
               <label className="block font-telemetry text-[11px] font-bold text-cyan-200/90 mb-1.5">
-                DETEKSI IP PERANGKAT (KUNCI PERAN PERMANEN):
+                PILIH PERAN JARINGAN (CLOUD HANDSHAKE PEERJS):
               </label>
               <div className="grid grid-cols-2 gap-2 font-telemetry text-xs">
                 <button
@@ -1376,7 +1506,7 @@ export default function App() {
                   }`}
                 >
                   <div className="text-[#23dcff] font-extrabold">HP MASTER</div>
-                  <div className="text-[10px]">192.168.43.1 (Host)</div>
+                  <div className="text-[10px]">ID: PTT-MASTER-01</div>
                 </button>
                 <button
                   type="button"
@@ -1388,7 +1518,7 @@ export default function App() {
                   }`}
                 >
                   <div className="text-[#23dcff] font-extrabold">CLIENT</div>
-                  <div className="text-[10px]">192.168.43.x (Anggota)</div>
+                  <div className="text-[10px]">ID: PTT-CLIENT-[NAMA]</div>
                 </button>
               </div>
             </div>
@@ -1626,17 +1756,20 @@ export default function App() {
               </div>
             </div>
 
-            {/* Baris Bawah: Hanya menampilkan Real Peers. Jika kosong tampilkan "MENCARI ANGGOTA AKTIF..." */}
+            {/* Baris Bawah: Hanya menampilkan Real Peers yang terhubung via WebRTC DataChannel */}
             {activeChannelPeers.length === 0 ? (
               <div className="tactical-panel rounded-2xl py-5 px-4 text-center space-y-1.5">
                 <div className="flex items-center justify-center gap-2 text-[#23dcff]">
                   <RefreshCw className="w-4 h-4 animate-spin" />
                   <span className="font-tactical text-[16px] font-extrabold tracking-wider text-white">
-                    MENCARI ANGGOTA AKTIF...
+                    Mencari Anggota...
                   </span>
                 </div>
                 <p className="font-telemetry text-[10.5px] text-cyan-200/80">
-                  Menunggu perangkat lain terhubung ke CHANNEL {String(channel).padStart(2, '0')} (Broadcast 1s Aktif)
+                  Node: <strong className="text-white">{myPeerNodeId}</strong> •{' '}
+                  {isMasterDevice
+                    ? 'Menunggu Handshake Client ke PTT-MASTER-01'
+                    : 'Auto-Handshake & Watchdog 2.5s ke PTT-MASTER-01'}
                 </p>
               </div>
             ) : (
@@ -1947,16 +2080,16 @@ export default function App() {
                 </div>
               )}
 
-              {/* MODAL 2: EDIT NAMA */}
+              {/* MODAL 2: EDIT NAMA & PERAN (HP MASTER / CLIENT) */}
               {activeBottomModal === 'editName' && (
                 <form onSubmit={handleSaveName} className="space-y-4">
                   <div>
                     <label className="block text-xs font-semibold text-cyan-200 mb-1.5">
-                      CALLSIGN TAKTIKAL (MAKS 10 KARAKTER)
+                      CALLSIGN TAKTIKAL (MAKS 12 KARAKTER)
                     </label>
                     <input
                       type="text"
-                      maxLength={10}
+                      maxLength={12}
                       value={nameInput}
                       onChange={(e) => setNameInput(e.target.value)}
                       autoFocus
@@ -1964,20 +2097,79 @@ export default function App() {
                       placeholder="CONTOH: YUDHI"
                     />
                   </div>
-                  <div className="flex justify-end gap-2">
+
+                  {!editingMemberId && (
+                    <div className="space-y-1.5">
+                      <label className="block text-xs font-semibold text-cyan-200">
+                        PERAN JARINGAN PEERJS:
+                      </label>
+                      <div className="grid grid-cols-2 gap-2 font-telemetry text-xs">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setRole('MASTER');
+                            setLocalIp('192.168.43.1');
+                            setSetupIpMode('192.168.43.1');
+                          }}
+                          className={`py-2 px-3 rounded-xl border font-bold text-left cursor-pointer ${
+                            role === 'MASTER'
+                              ? 'bg-[#093b61] border-[#23dcff] text-white'
+                              : 'bg-[#021526] border-cyan-500/30 text-cyan-200/70'
+                          }`}
+                        >
+                          <div className="text-[#23dcff] font-extrabold">HP MASTER</div>
+                          <div className="text-[10px]">PTT-MASTER-01</div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setRole('CLIENT');
+                            if (localIp === '192.168.43.1') {
+                              setLocalIp(
+                                `192.168.43.${Math.floor(102 + Math.random() * 90)}`
+                              );
+                            }
+                            setSetupIpMode('CLIENT');
+                          }}
+                          className={`py-2 px-3 rounded-xl border font-bold text-left cursor-pointer ${
+                            role === 'CLIENT'
+                              ? 'bg-[#093b61] border-[#23dcff] text-white'
+                              : 'bg-[#021526] border-cyan-500/30 text-cyan-200/70'
+                          }`}
+                        >
+                          <div className="text-[#23dcff] font-extrabold">CLIENT</div>
+                          <div className="text-[10px]">PTT-CLIENT-[NAMA]</div>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between gap-2 pt-1">
                     <button
                       type="button"
-                      onClick={() => setActiveBottomModal(null)}
-                      className="px-4 py-2 rounded-lg text-xs font-semibold text-cyan-200 hover:bg-cyan-500/10 cursor-pointer"
+                      onClick={() => {
+                        setActiveBottomModal(null);
+                        setIsSetupCompleted(false);
+                      }}
+                      className="px-3 py-2 rounded-lg text-[11px] font-semibold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/10 cursor-pointer"
                     >
-                      Batal
+                      Buka SetupScreen
                     </button>
-                    <button
-                      type="submit"
-                      className="px-4 py-2 rounded-lg text-xs font-bold cyan-btn-glow text-[#02182b] cursor-pointer"
-                    >
-                      Simpan Callsign
-                    </button>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setActiveBottomModal(null)}
+                        className="px-3.5 py-2 rounded-lg text-xs font-semibold text-cyan-200 hover:bg-cyan-500/10 cursor-pointer"
+                      >
+                        Batal
+                      </button>
+                      <button
+                        type="submit"
+                        className="px-4 py-2 rounded-lg text-xs font-bold cyan-btn-glow text-[#02182b] cursor-pointer"
+                      >
+                        Simpan Callsign
+                      </button>
+                    </div>
                   </div>
                 </form>
               )}
