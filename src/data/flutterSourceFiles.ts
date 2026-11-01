@@ -845,26 +845,43 @@ class UdpNetworkService extends ChangeNotifier {
     await _sendDiscoveryAnnouncement();
   }
 
+  int _subnetSweepCursor = 2;
+
   Future<void> _detectLocalHotspotIp() async {
+    String? detectedIp;
     try {
       final info = NetworkInfo();
-      String? wifiIp = await info.getWifiIP();
-      if (wifiIp == null || wifiIp.isEmpty || wifiIp == '0.0.0.0') {
-        final interfaces = await NetworkInterface.list(
-          type: InternetAddressType.IPv4,
-          includeLoopback: false,
-        );
-        for (final iface in interfaces) {
-          for (final addr in iface.addresses) {
-            if (addr.address.startsWith('192.168.')) {
-              wifiIp = addr.address;
-              break;
-            }
+      final wifiIp = await info.getWifiIP();
+      if (wifiIp != null && wifiIp.isNotEmpty && wifiIp != '0.0.0.0') {
+        detectedIp = wifiIp;
+      }
+
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+      );
+      for (final iface in interfaces) {
+        final name = iface.name.toLowerCase();
+        final isHotspotIface = name.contains('ap') ||
+            name.contains('wlan') ||
+            name.contains('swlan') ||
+            name.contains('rndis');
+        for (final addr in iface.addresses) {
+          final ip = addr.address;
+          if (ip == masterDefaultIp) {
+            detectedIp = masterDefaultIp;
+            break;
+          }
+          if (isHotspotIface && (ip.startsWith('192.168.') || ip.startsWith('172.'))) {
+            detectedIp = ip;
+          } else if ((detectedIp == null || detectedIp.isEmpty) && ip.startsWith('192.168.')) {
+            detectedIp = ip;
           }
         }
+        if (detectedIp == masterDefaultIp) break;
       }
-      _localIp = wifiIp ?? masterDefaultIp;
-      _isMaster = _localIp.endsWith('.1');
+      _localIp = detectedIp ?? masterDefaultIp;
+      _isMaster = _localIp == masterDefaultIp || _localIp.endsWith('.1');
       notifyListeners();
     } catch (_) {
       _localIp = masterDefaultIp;
@@ -886,14 +903,32 @@ class UdpNetworkService extends ChangeNotifier {
         final String type = data['type'] ?? '';
 
         if (type == 'ANNOUNCE') {
+          final String peerIp = (data['ip'] ?? senderIp).toString();
+          if (peerIp == _localIp) return;
+          data['ip'] = peerIp;
+          final bool isNew = !_peers.containsKey(peerIp);
           final incoming = PeerMember.fromJson(data);
-          final existing = _peers[senderIp];
+          final existing = _peers[peerIp];
           if (existing != null) {
             incoming.isTargeted = existing.isTargeted;
             incoming.lastPingMs = existing.lastPingMs;
           }
-          _peers[senderIp] = incoming;
+          _peers[peerIp] = incoming;
+          if (isNew) _sendDirectUnicastAnnounce(peerIp);
+          if (_isMaster) _broadcastPeerListSyncFromMaster();
           notifyListeners();
+        } else if (type == 'PEER_LIST_SYNC') {
+          final List<dynamic>? list = data['peers'] as List<dynamic>?;
+          if (list != null) {
+            for (final item in list) {
+              if (item is Map<String, dynamic>) {
+                final String pIp = (item['ip'] ?? '').toString();
+                if (pIp.isEmpty || pIp == _localIp) continue;
+                _peers[pIp] = PeerMember.fromJson(item);
+              }
+            }
+            notifyListeners();
+          }
         } else if (type == 'PING') {
           _sendPong(senderIp, data['ts'] as int);
         } else if (type == 'PONG') {
@@ -910,6 +945,51 @@ class UdpNetworkService extends ChangeNotifier {
     });
   }
 
+  Future<void> _sendDirectUnicastAnnounce(String targetIp) async {
+    if (_discoverySocket == null || targetIp == _localIp) return;
+    final bytes = utf8.encode(jsonEncode({
+      'type': 'ANNOUNCE',
+      'id': _deviceId,
+      'callsign': _myCallsign,
+      'ip': _localIp,
+      'ch': _currentChannel,
+      'ping': _lastPingMs,
+    }));
+    try {
+      await _discoverySocket!.send(
+        bytes,
+        Endpoint.unicast(InternetAddress(targetIp), port: const Port(discoveryPort)),
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _broadcastPeerListSyncFromMaster() async {
+    if (_discoverySocket == null || !_isMaster) return;
+    final allNodes = [
+      {
+        'id': _deviceId,
+        'callsign': _myCallsign,
+        'ip': _localIp,
+        'ch': _currentChannel,
+        'ping': _lastPingMs,
+      },
+      ..._peers.values.map((p) => p.toJson()),
+    ];
+    final bytes = utf8.encode(jsonEncode({
+      'type': 'PEER_LIST_SYNC',
+      'ch': _currentChannel,
+      'peers': allNodes,
+    }));
+    for (final peer in _peers.values) {
+      try {
+        await _discoverySocket!.send(
+          bytes,
+          Endpoint.unicast(InternetAddress(peer.ipAddress), port: const Port(discoveryPort)),
+        );
+      } catch (_) {}
+    }
+  }
+
   Future<void> _sendDiscoveryAnnouncement() async {
     if (_discoverySocket == null) return;
     final bytes = utf8.encode(jsonEncode({
@@ -922,20 +1002,47 @@ class UdpNetworkService extends ChangeNotifier {
     }));
 
     final parts = _localIp.split('.');
-    final subnetBroadcast = parts.length == 4
-        ? '\${parts[0]}.\${parts[1]}.\${parts[2]}.255'
-        : '192.168.43.255';
+    final subnetPrefix = parts.length == 4 ? '\${parts[0]}.\${parts[1]}.\${parts[2]}' : '192.168.43';
+    final subnetBroadcast = '\$subnetPrefix.255';
+    final subnetGateway = '\$subnetPrefix.1';
 
+    // 1. Subnet Broadcast (dipisah try/catch agar bebas ENETUNREACH saat Hotspot Tanpa Internet)
     try {
       await _discoverySocket!.send(
         bytes,
         Endpoint.unicast(InternetAddress(subnetBroadcast), port: const Port(discoveryPort)),
       );
-      await _discoverySocket!.send(
-        bytes,
-        Endpoint.broadcast(port: const Port(discoveryPort)),
-      );
     } catch (_) {}
+
+    // 2. Direct Unicast ke Gateway Master (.1) & Peer Aktif
+    final Set<String> directTargets = {
+      subnetGateway,
+      masterDefaultIp,
+      ..._peers.keys,
+    }..remove(_localIp);
+
+    for (final ip in directTargets) {
+      try {
+        await _discoverySocket!.send(
+          bytes,
+          Endpoint.unicast(InternetAddress(ip), port: const Port(discoveryPort)),
+        );
+      } catch (_) {}
+    }
+
+    // 3. Rotating Unicast Subnet Sweep (.2 .. .254) agar tembus AP Broadcast Isolation
+    for (int i = 0; i < 36; i++) {
+      final hostOctet = _subnetSweepCursor;
+      _subnetSweepCursor = _subnetSweepCursor >= 254 ? 2 : _subnetSweepCursor + 1;
+      final candidateIp = '\$subnetPrefix.\$hostOctet';
+      if (candidateIp == _localIp || directTargets.contains(candidateIp)) continue;
+      try {
+        _discoverySocket!.send(
+          bytes,
+          Endpoint.unicast(InternetAddress(candidateIp), port: const Port(discoveryPort)),
+        );
+      } catch (_) {}
+    }
   }
 
   Future<void> _bindAudioSocket() async {
@@ -949,6 +1056,22 @@ class UdpNetworkService extends ChangeNotifier {
 
       final bytes = datagram.data;
       if (bytes[0] != _currentChannel) return;
+
+      final flags = bytes[1];
+      final bool isRelayed = (flags & 4) != 0;
+      if (_isMaster && !isRelayed) {
+        final relayed = Uint8List.fromList(bytes);
+        relayed[1] = flags | 4;
+        for (final peer in activeChannelPeers) {
+          if (peer.ipAddress == senderIp || peer.ipAddress == _localIp) continue;
+          try {
+            _audioSocket!.send(
+              relayed,
+              Endpoint.unicast(InternetAddress(peer.ipAddress), port: const Port(audioPort)),
+            );
+          } catch (_) {}
+        }
+      }
 
       final pcmPayload = Uint8List.sublistView(bytes, 6);
       onAudioPacketReceived?.call(pcmPayload, senderIp);
@@ -969,11 +1092,18 @@ class UdpNetworkService extends ChangeNotifier {
     packet.setRange(0, 6, header.buffer.asUint8List());
     packet.setRange(6, packet.length, pcmChunk);
 
-    for (final peer in targetedPeers) {
+    final parts = _localIp.split('.');
+    final subnetGateway = parts.length == 4 ? '\${parts[0]}.\${parts[1]}.\${parts[2]}.1' : masterDefaultIp;
+    final Set<String> targetIps = {
+      ...targetedPeers.map((p) => p.ipAddress),
+      if (!_isMaster) subnetGateway,
+    }..remove(_localIp);
+
+    for (final ip in targetIps) {
       try {
         await _audioSocket!.send(
           packet,
-          Endpoint.unicast(InternetAddress(peer.ipAddress), port: const Port(audioPort)),
+          Endpoint.unicast(InternetAddress(ip), port: const Port(audioPort)),
         );
       } catch (_) {}
     }

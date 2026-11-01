@@ -30,6 +30,14 @@ import {
 } from 'lucide-react';
 import { FLUTTER_SOURCE_FILES } from './data/flutterSourceFiles';
 import { usePWAInstall } from './usePWAInstall';
+import {
+  CompactOfflineSignal,
+  decodeOfflineSignalFromInput,
+  detectLocalHotspotIpWebRTC,
+  encodeOfflineSignalToToken,
+  minifyDataChannelSdp,
+  waitForLocalIceGathering,
+} from './utils/offlineHotspotWebRTC';
 
 interface TacticalMember {
   id: string;
@@ -86,18 +94,14 @@ const WSS_CLOUD_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
 ];
+// IP-literal STUN servers first so WebRTC never hangs on DNS lookup when Hotspot has NO internet
 const WEBRTC_ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:74.125.250.129:19302' },
+  { urls: 'stun:142.250.82.127:19302' },
   { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun.cloudflare.com:3478' },
   {
     urls: 'turn:openrelay.metered.ca:80',
-    username: 'openrelayproject',
-    credential: 'openrelayproject',
-  },
-  {
-    urls: 'turn:openrelay.metered.ca:443',
     username: 'openrelayproject',
     credential: 'openrelayproject',
   },
@@ -118,11 +122,13 @@ function extractInviteParamsFromUrl() {
   const isInvite =
     params.get('invite') === '1' ||
     params.get('role') === 'CLIENT' ||
-    Boolean(params.get('hostPeer'));
+    Boolean(params.get('hostPeer')) ||
+    Boolean(params.get('lanSignal'));
   const ch = Number(params.get('ch'));
   const hostPeer = params.get('hostPeer') || '';
   const hostCallsign = (params.get('hostCallsign') || params.get('host') || 'MASTER').toUpperCase();
   const masterIp = params.get('master') || params.get('ip') || '192.168.43.1';
+  const lanSignal = params.get('lanSignal') || '';
 
   return {
     isInvite,
@@ -131,6 +137,7 @@ function extractInviteParamsFromUrl() {
     hostCallsign,
     masterIp,
     role: params.get('role'),
+    lanSignal,
   };
 }
 
@@ -256,7 +263,7 @@ export default function App() {
   const [selectedFileIndex, setSelectedFileIndex] = useState<number>(0);
   const [copiedText, setCopiedText] = useState<string | null>(null);
 
-  // Audio, WebRTC & WSS Cloud Mesh refs
+  // Audio, WebRTC, Offline Hotspot LAN & WSS Cloud Mesh refs
   const audioCtxRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -268,6 +275,13 @@ export default function App() {
   const peerConnectionsRef = useRef<Map<string, DataConnection>>(new Map());
   const pendingConnectTimestampRef = useRef<Map<string, number>>(new Map());
   const mqttClientsRef = useRef<MqttClient[]>([]);
+  const offlineRtcChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
+  const offlineMasterPcSlotsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const localHotspotWsRef = useRef<WebSocket | null>(null);
+  const [offlineOfferToken, setOfflineOfferToken] = useState<string>('');
+  const [offlineAnswerToken, setOfflineAnswerToken] = useState<string>('');
+  const [offlineAnswerQrUrl, setOfflineAnswerQrUrl] = useState<string>('');
+  const [isHotspotLanHubConnected, setIsHotspotLanHubConnected] = useState<boolean>(false);
   const seenPacketIdsRef = useRef<Set<string>>(new Set());
   const lastAnnounceReplyRef = useRef<Map<string, number>>(new Map());
   const membersRef = useRef<TacticalMember[]>([]);
@@ -408,7 +422,7 @@ export default function App() {
     [soundEnabled, playTacticalTone]
   );
 
-  // Send packet to all connected WebRTC peers + WSS Cloud Mesh Brokers + local BroadcastChannel
+  // Send packet to all connected WebRTC peers + Offline Hotspot LAN DataChannels + Local Hotspot WS Hub + WSS Cloud Mesh + BroadcastChannel
   const broadcastMeshPacket = useCallback(
     (partial: Omit<MeshPacket, 'senderId' | 'callsign' | 'ip' | 'role' | 'channel' | 'timestamp'>) => {
       if (!myCallsign) return;
@@ -434,6 +448,8 @@ export default function App() {
         peerNodeId: myPeerNodeId,
       };
 
+      const serialized = JSON.stringify(fullPacket);
+
       // 1. Local BroadcastChannel (instant same-device multi-tab sync)
       try {
         broadcastChannelRef.current?.postMessage(fullPacket);
@@ -452,8 +468,30 @@ export default function App() {
         }
       });
 
-      // 3. WSS Cloud Mesh Brokers (guarantees 100% cross-HP delivery on Vercel even behind symmetric CGNAT)
-      const serialized = JSON.stringify(fullPacket);
+      // 3. Offline Hotspot Serverless WebRTC RTCDataChannels (0% internet required)
+      offlineRtcChannelsRef.current.forEach((dc) => {
+        if (dc && dc.readyState === 'open') {
+          try {
+            dc.send(serialized);
+          } catch {
+            // Ignore closed offline DataChannel
+          }
+        }
+      });
+
+      // 4. Local Hotspot WebSocket Hub (ws://192.168.43.1:50002 / ws://[subnet].1:50002 — 0% internet required)
+      if (
+        localHotspotWsRef.current &&
+        localHotspotWsRef.current.readyState === WebSocket.OPEN
+      ) {
+        try {
+          localHotspotWsRef.current.send(serialized);
+        } catch {
+          // Ignore local WS send error
+        }
+      }
+
+      // 5. WSS Cloud Mesh Brokers (when internet is available)
       mqttClientsRef.current.forEach((client) => {
         if (client && client.connected) {
           try {
@@ -512,7 +550,9 @@ export default function App() {
       conn.on('open', () => {
         pendingConnectTimestampRef.current.delete(conn.peer);
         peerConnectionsRef.current.set(conn.peer, conn);
-        setConnectedPeersCount(peerConnectionsRef.current.size);
+        setConnectedPeersCount(
+          peerConnectionsRef.current.size + offlineRtcChannelsRef.current.size
+        );
 
         const pkt = announcePacketBuilderRef.current();
         if (pkt) {
@@ -532,16 +572,26 @@ export default function App() {
         }
         packetHandlerRef.current(incoming);
 
-        // If this device is Master, relay voice/control packets to other connected WebRTC clients
+        // If this device is Master, relay voice/control packets to other connected WebRTC & Offline LAN clients
         if (
           incoming.type !== 'ANNOUNCE' &&
           incoming.type !== 'PEER_LIST_SYNC' &&
           (localIp === '192.168.43.1' || role === 'MASTER')
         ) {
+          const serialized = JSON.stringify(incoming);
           peerConnectionsRef.current.forEach((otherConn, peerKey) => {
             if (peerKey !== conn.peer && otherConn.open) {
               try {
                 otherConn.send(incoming);
+              } catch {
+                // Ignore relay error
+              }
+            }
+          });
+          offlineRtcChannelsRef.current.forEach((dc) => {
+            if (dc.readyState === 'open') {
+              try {
+                dc.send(serialized);
               } catch {
                 // Ignore relay error
               }
@@ -553,7 +603,9 @@ export default function App() {
       const handleDisconnect = () => {
         pendingConnectTimestampRef.current.delete(conn.peer);
         peerConnectionsRef.current.delete(conn.peer);
-        setConnectedPeersCount(peerConnectionsRef.current.size);
+        setConnectedPeersCount(
+          peerConnectionsRef.current.size + offlineRtcChannelsRef.current.size
+        );
       };
 
       conn.on('close', handleDisconnect);
@@ -561,6 +613,104 @@ export default function App() {
     },
     [localIp, role]
   );
+
+  // Prepare a fresh Offline Hotspot WebRTC Offer on HP MASTER (0% internet required, iceServers: [])
+  const prepareNextOfflineMasterOffer = useCallback(async () => {
+    if (!myCallsign) return;
+    try {
+      const slotId = `SLOT-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      const dc = pc.createDataChannel('tactical_ptt_lan', { ordered: true });
+
+      const cleanupChannel = () => {
+        offlineRtcChannelsRef.current.delete(slotId);
+        setConnectedPeersCount(
+          peerConnectionsRef.current.size + offlineRtcChannelsRef.current.size
+        );
+      };
+
+      dc.onopen = () => {
+        offlineRtcChannelsRef.current.set(slotId, dc);
+        setConnectedPeersCount(
+          peerConnectionsRef.current.size + offlineRtcChannelsRef.current.size
+        );
+        const pkt = announcePacketBuilderRef.current();
+        if (pkt) {
+          try {
+            dc.send(JSON.stringify(pkt));
+          } catch {
+            // Ignore
+          }
+        }
+        window.setTimeout(() => {
+          broadcastPeerListSync();
+          // Immediately prepare a new Offer slot so the next HP Client on the Hotspot can also join!
+          prepareNextOfflineMasterOffer();
+        }, 120);
+      };
+
+      dc.onmessage = (ev) => {
+        try {
+          const incoming = JSON.parse(String(ev.data)) as MeshPacket;
+          if (!incoming) return;
+          packetHandlerRef.current(incoming);
+
+          // Master Star-Mesh Relay: forward voice & floor control to all other Offline Hotspot & WebRTC clients
+          if (
+            incoming.type !== 'ANNOUNCE' &&
+            incoming.type !== 'PEER_LIST_SYNC' &&
+            (localIp === '192.168.43.1' || role === 'MASTER')
+          ) {
+            const raw = JSON.stringify(incoming);
+            offlineRtcChannelsRef.current.forEach((otherDc, otherKey) => {
+              if (otherKey !== slotId && otherDc.readyState === 'open') {
+                try {
+                  otherDc.send(raw);
+                } catch {
+                  // Ignore relay error
+                }
+              }
+            });
+            peerConnectionsRef.current.forEach((otherConn) => {
+              if (otherConn.open) {
+                try {
+                  otherConn.send(incoming);
+                } catch {
+                  // Ignore relay error
+                }
+              }
+            });
+          }
+        } catch {
+          // Ignore malformed packet
+        }
+      };
+
+      dc.onclose = cleanupChannel;
+      dc.onerror = cleanupChannel;
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForLocalIceGathering(pc, 600);
+
+      const localSdp = pc.localDescription?.sdp || '';
+      if (localSdp) {
+        offlineMasterPcSlotsRef.current.set(slotId, pc);
+        const compactSig: CompactOfflineSignal = {
+          t: 'O',
+          c: myCallsign,
+          id: myDeviceId,
+          ip: localIp,
+          ch: channel,
+          sid: slotId,
+          sdp: minifyDataChannelSdp(localSdp),
+        };
+        setOfflineOfferToken(encodeOfflineSignalToToken(compactSig));
+      }
+    } catch {
+      // Ignore WebRTC offer error
+    }
+  }, [myCallsign, myDeviceId, localIp, channel, role, broadcastPeerListSync]);
 
   // Helper to initiate a non-duplicate WebRTC connection to a remote peerId
   const connectToPeerNodeIfNeeded = useCallback(
@@ -805,14 +955,95 @@ export default function App() {
     };
   }, [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]);
 
-  // Cloud Handshake Signaling (PeerJS Public Cloud + Dual WSS Cloud Mesh) + Auto-Reconnect Watchdog (2.5s):
-  // - Master attempts static ID 'PTT-MASTER-01'; if already occupied on 0.peerjs.com, seamlessly falls back to unique ID & connects to 'PTT-MASTER-01'
-  // - Client registers unique ID 'PTT-CLIENT-[CALLSIGN]-[ID]' and connects to 'PTT-MASTER-01'
-  // - Dual WSS Cloud Mesh (EMQX + HiveMQ over port 8084/8884) runs in parallel so HP devices on Vercel always discover and communicate across any mobile network
+  // Hybrid Cloud + Offline Hotspot LAN Signaling Engine + Auto-Reconnect Watchdog (2.5s):
+  // 1. Offline Hotspot Direct WebRTC Offer/Answer (iceServers: [] — 0% internet required)
+  // 2. Auto-Probe Local Hotspot WebSocket Hub (ws://192.168.43.1:50002 & ws://[subnet].1:50002 — 0% internet required)
+  // 3. PeerJS WebRTC P2P (`PTT-MASTER-01` & `PTT-CLIENT-[CALLSIGN]-[ID]`) + Dual WSS Cloud Mesh
   useEffect(() => {
     if (!isSetupCompleted || !myCallsign) return;
 
     let isCancelled = false;
+
+    // Pre-generate Offline Hotspot WebRTC Offer so QR Barcode works 100% offline without internet
+    prepareNextOfflineMasterOffer();
+
+    // Auto-detect real Hotspot IP via local WebRTC host ICE candidate & probe Local Hotspot WS Hub
+    let detectedSubnetGateway = '192.168.43.1';
+    detectLocalHotspotIpWebRTC().then((detectedIp) => {
+      if (isCancelled || !detectedIp) return;
+      const parts = detectedIp.split('.');
+      if (parts.length === 4) {
+        detectedSubnetGateway = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
+      }
+    });
+
+    const tryConnectLocalHotspotWsHub = () => {
+      if (isCancelled) return;
+      if (
+        localHotspotWsRef.current &&
+        (localHotspotWsRef.current.readyState === WebSocket.OPEN ||
+          localHotspotWsRef.current.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      // Only probe ws:// on HTTP or local WebView/APK contexts where mixed-content isn't blocked
+      if (window.location.protocol === 'https:' && !window.location.hostname.startsWith('192.168.')) {
+        return;
+      }
+
+      const candidateGateways = Array.from(
+        new Set([detectedSubnetGateway, '192.168.43.1', '192.168.137.1'])
+      );
+
+      for (const gw of candidateGateways) {
+        try {
+          const ws = new WebSocket(`ws://${gw}:50002`);
+          ws.onopen = () => {
+            if (isCancelled) {
+              ws.close();
+              return;
+            }
+            localHotspotWsRef.current = ws;
+            setIsHotspotLanHubConnected(true);
+            const pkt = announcePacketBuilderRef.current();
+            if (pkt) {
+              try {
+                ws.send(JSON.stringify(pkt));
+              } catch {
+                // Ignore
+              }
+            }
+          };
+          ws.onmessage = (ev) => {
+            if (isCancelled) return;
+            try {
+              const parsed = JSON.parse(String(ev.data)) as MeshPacket;
+              packetHandlerRef.current(parsed);
+            } catch {
+              // Ignore malformed JSON
+            }
+          };
+          ws.onclose = () => {
+            if (localHotspotWsRef.current === ws) {
+              localHotspotWsRef.current = null;
+              setIsHotspotLanHubConnected(false);
+            }
+          };
+          ws.onerror = () => {
+            try {
+              ws.close();
+            } catch {
+              // Ignore
+            }
+          };
+        } catch {
+          // Ignore security error if browser blocks ws://
+        }
+      }
+    };
+
+    tryConnectLocalHotspotWsHub();
 
     // 1. Local BroadcastChannel for same-browser multi-tab sync
     if ('BroadcastChannel' in window) {
@@ -968,6 +1199,7 @@ export default function App() {
     // 4. 2.5-second Watchdog Interval + Stale Peer Pruner
     const watchdogTimer = window.setInterval(() => {
       if (isCancelled) return;
+      tryConnectLocalHotspotWsHub();
       if (currentPeer && currentPeer.disconnected && !currentPeer.destroyed) {
         try {
           currentPeer.reconnect();
@@ -982,13 +1214,17 @@ export default function App() {
         broadcastPeerListSync();
       }
 
-      // Prune peers that have neither an open WebRTC DataChannel nor a recent ANNOUNCE (> 12s)
+      // Prune peers that have neither an open WebRTC/Offline LAN DataChannel nor a recent ANNOUNCE (> 12s)
       const now = Date.now();
+      const anyOfflineDcOpen = Array.from(offlineRtcChannelsRef.current.values()).some(
+        (dc) => dc.readyState === 'open'
+      );
       setMembers((prev) => {
         const filtered = prev.filter((m) => {
           const hasOpenRtc =
             (m.peerId && peerConnectionsRef.current.get(m.peerId)?.open) ||
-            peerConnectionsRef.current.get(m.id)?.open;
+            peerConnectionsRef.current.get(m.id)?.open ||
+            anyOfflineDcOpen;
           const recentlySeen = now - (m.lastSeen || now) < 12000;
           return Boolean(hasOpenRtc || recentlySeen);
         });
@@ -1011,7 +1247,9 @@ export default function App() {
       broadcastChannelRef.current?.close();
       peerConnectionsRef.current.clear();
       pendingConnectTimestampRef.current.clear();
-      setConnectedPeersCount(0);
+      localHotspotWsRef.current?.close();
+      localHotspotWsRef.current = null;
+      setConnectedPeersCount(offlineRtcChannelsRef.current.size);
       currentPeer?.destroy();
       activeMqttClients.forEach((c) => {
         try {
@@ -1034,6 +1272,7 @@ export default function App() {
     connectToPeerNodeIfNeeded,
     broadcastPeerListSync,
     broadcastMeshPacket,
+    prepareNextOfflineMasterOffer,
   ]);
 
   // Permanent role lock based on IP '192.168.43.1'
@@ -1335,37 +1574,46 @@ export default function App() {
     };
   }, [localIp]);
 
-  // Use exact active URL with #hash fragment so no web server or WebView ever returns "404 Page not found"
+  // Use exact active URL with #hash fragment + embedded Offline Hotspot SDP Offer (`lanSignal`)
   const cleanCurrentBaseUrl = `${window.location.origin}${window.location.pathname}`.replace(
     /\/+$/,
     ''
   );
   const sharePairUrl = `${cleanCurrentBaseUrl}/#invite=1&ch=${channel}&role=CLIENT&master=192.168.43.1&hostPeer=${encodeURIComponent(
     myPeerNodeId
-  )}&hostCallsign=${encodeURIComponent(myCallsign || 'MASTER')}`;
+  )}&hostCallsign=${encodeURIComponent(myCallsign || 'MASTER')}${
+    offlineOfferToken ? `&lanSignal=${encodeURIComponent(offlineOfferToken)}` : ''
+  }`;
 
-  // Generate real scannable QR Code image whenever sharePairUrl changes
+  // Generate real scannable QR Code image whenever sharePairUrl or offlineAnswerToken changes
   useEffect(() => {
     let active = true;
-    QRCode.toDataURL(sharePairUrl, {
+    const payloadToEncode = offlineAnswerToken || sharePairUrl;
+    QRCode.toDataURL(payloadToEncode, {
       width: 260,
       margin: 1,
-      errorCorrectionLevel: 'M',
+      errorCorrectionLevel: 'L',
       color: {
         dark: '#03192e',
         light: '#ffffff',
       },
     })
       .then((dataUrl) => {
-        if (active) setQrCodeDataUrl(dataUrl);
+        if (!active) return;
+        if (offlineAnswerToken) {
+          setOfflineAnswerQrUrl(dataUrl);
+        } else {
+          setQrCodeDataUrl(dataUrl);
+        }
       })
       .catch(() => {});
     return () => {
       active = false;
     };
-  }, [sharePairUrl]);
+  }, [sharePairUrl, offlineAnswerToken]);
 
   const handleShareInviteLink = async () => {
+    const targetPayload = offlineAnswerToken || sharePairUrl;
     const shareTitle = `DISKOMLEKAU TACTICAL PTT - CH ${String(channel).padStart(2, '0')}`;
     const shareText = `Gabung ke Jaringan Walkie-Talkie DISKOMLEKAU TACTICAL PTT (${
       myCallsign || 'MASTER'
@@ -1375,27 +1623,207 @@ export default function App() {
         await navigator.share({
           title: shareTitle,
           text: shareText,
-          url: sharePairUrl,
+          url: targetPayload,
         });
         return;
       } catch {
         // Fallback to copy
       }
     }
-    handleCopyText('pairUrl', sharePairUrl);
+    handleCopyText('pairUrl', targetPayload);
   };
 
-  // Universal processor for any scanned QR code string, pasted URL, or Master Node ID
+  // Universal processor for any scanned QR code string, Offline Hotspot SDP Offer/Answer, or Master Node ID
   const applyScannedOrPastedInvite = useCallback(
     (rawString: string): boolean => {
       const raw = rawString.trim();
       if (!raw) return false;
 
       try {
-        let parsedCh = channel;
+        // 1. Check if the scanned QR / pasted code contains an Offline Hotspot WebRTC SDP Offer or Answer
+        const offlineSig = decodeOfflineSignalFromInput(raw);
+
+        if (offlineSig && offlineSig.t === 'A') {
+          // HP MASTER scanned HP CLIENT's Offline Hotspot Answer Barcode!
+          const targetPc =
+            offlineMasterPcSlotsRef.current.get(offlineSig.sid) ||
+            Array.from(offlineMasterPcSlotsRef.current.values()).pop();
+
+          if (targetPc && targetPc.signalingState === 'have-local-offer') {
+            targetPc
+              .setRemoteDescription({ type: 'answer', sdp: offlineSig.sdp })
+              .catch(() => {});
+          }
+
+          const now = Date.now();
+          setMembers((prev) => {
+            const exists = prev.some((m) => m.id === offlineSig.id);
+            const next = exists
+              ? prev.map((m) =>
+                  m.id === offlineSig.id
+                    ? {
+                        ...m,
+                        callsign: offlineSig.c,
+                        ip: offlineSig.ip,
+                        role: 'CLIENT' as const,
+                        channel: offlineSig.ch,
+                        lastSeen: now,
+                      }
+                    : m
+                )
+              : [
+                  ...prev,
+                  {
+                    id: offlineSig.id,
+                    callsign: offlineSig.c,
+                    ip: offlineSig.ip,
+                    role: 'CLIENT' as const,
+                    statusText: 'HOTSPOT P2P AKTIF',
+                    isTargeted: true,
+                    isTalking: false,
+                    pingMs: 12,
+                    channel: offlineSig.ch,
+                    lastSeen: now,
+                  },
+                ];
+            window.setTimeout(() => broadcastPeerListSync(next), 150);
+            return next;
+          });
+
+          playTacticalTone('rx');
+          setInviteJoinStatus(
+            `TERHUBUNG OFFLINE HOTSPOT DENGAN ${offlineSig.c} (${offlineSig.ip})!`
+          );
+          return true;
+        }
+
+        if (offlineSig && offlineSig.t === 'O') {
+          // HP CLIENT scanned HP MASTER's Barcode (contains Offline Hotspot Offer)!
+          const effectiveCallsign =
+            myCallsign ||
+            setupCallsignInput.trim().toUpperCase() ||
+            `UNIT-${myDeviceId.slice(0, 3)}`;
+          const clientIp =
+            localIp !== '192.168.43.1'
+              ? localIp
+              : `192.168.43.${Math.floor(102 + Math.random() * 90)}`;
+
+          if (!myCallsign) {
+            setMyCallsign(effectiveCallsign);
+          }
+          if (!isSetupCompleted) {
+            setIsSetupCompleted(true);
+          }
+          setSetupIpMode('CLIENT');
+          setLocalIp(clientIp);
+          setRole('CLIENT');
+          setChannel(offlineSig.ch);
+
+          // Immediately register HP MASTER in Client's member grid
+          const now = Date.now();
+          setMembers((prev) => {
+            const exists = prev.some((m) => m.id === offlineSig.id);
+            return exists
+              ? prev.map((m) =>
+                  m.id === offlineSig.id
+                    ? {
+                        ...m,
+                        callsign: offlineSig.c,
+                        ip: offlineSig.ip,
+                        role: 'MASTER' as const,
+                        channel: offlineSig.ch,
+                        lastSeen: now,
+                      }
+                    : m
+                )
+              : [
+                  ...prev,
+                  {
+                    id: offlineSig.id,
+                    callsign: offlineSig.c,
+                    ip: offlineSig.ip,
+                    role: 'MASTER' as const,
+                    statusText: 'MASTER HOTSPOT',
+                    isTargeted: true,
+                    isTalking: false,
+                    pingMs: 12,
+                    channel: offlineSig.ch,
+                    lastSeen: now,
+                  },
+                ];
+          });
+
+          // Create Offline LAN RTCPeerConnection Answer (0% internet required, iceServers: [])
+          (async () => {
+            try {
+              const pc = new RTCPeerConnection({ iceServers: [] });
+              pc.ondatachannel = (ev) => {
+                const dc = ev.channel;
+                const slotKey = offlineSig.sid;
+                dc.onopen = () => {
+                  offlineRtcChannelsRef.current.set(slotKey, dc);
+                  setConnectedPeersCount(
+                    peerConnectionsRef.current.size + offlineRtcChannelsRef.current.size
+                  );
+                  setOfflineAnswerToken('');
+                  const pkt = announcePacketBuilderRef.current();
+                  if (pkt) {
+                    try {
+                      dc.send(JSON.stringify(pkt));
+                    } catch {
+                      // Ignore
+                    }
+                  }
+                };
+                dc.onmessage = (msgEv) => {
+                  try {
+                    const incoming = JSON.parse(String(msgEv.data)) as MeshPacket;
+                    if (incoming) packetHandlerRef.current(incoming);
+                  } catch {
+                    // Ignore
+                  }
+                };
+                const onClose = () => {
+                  offlineRtcChannelsRef.current.delete(slotKey);
+                  setConnectedPeersCount(
+                    peerConnectionsRef.current.size + offlineRtcChannelsRef.current.size
+                  );
+                };
+                dc.onclose = onClose;
+                dc.onerror = onClose;
+              };
+
+              await pc.setRemoteDescription({ type: 'offer', sdp: offlineSig.sdp });
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+              await waitForLocalIceGathering(pc, 600);
+
+              const answerSdp = pc.localDescription?.sdp || '';
+              if (answerSdp) {
+                const answerSig: CompactOfflineSignal = {
+                  t: 'A',
+                  c: effectiveCallsign,
+                  id: myDeviceId,
+                  ip: clientIp,
+                  ch: offlineSig.ch,
+                  sid: offlineSig.sid,
+                  sdp: minifyDataChannelSdp(answerSdp),
+                };
+                const encodedAnswer = encodeOfflineSignalToToken(answerSig);
+                setOfflineAnswerToken(encodedAnswer);
+                setBarcodeTab('show');
+                setActiveBottomModal('barcode');
+              }
+            } catch {
+              // Ignore offline answer error
+            }
+          })();
+        }
+
+        let parsedCh = offlineSig ? offlineSig.ch : channel;
         let parsedHostPeer = '';
-        let parsedHostCallsign = 'MASTER';
-        let parsedMasterIp = '192.168.43.1';
+        let parsedHostCallsign = offlineSig ? offlineSig.c : 'MASTER';
+        let parsedMasterIp = offlineSig ? offlineSig.ip : '192.168.43.1';
 
         if (
           raw.includes('invite=') ||
@@ -1404,7 +1832,6 @@ export default function App() {
           raw.includes('?') ||
           raw.includes('#')
         ) {
-          // Extract query/hash part after # or ?
           let queryPart = raw;
           if (raw.includes('#')) {
             queryPart = raw.split('#')[1].replace(/^\/?\??/, '');
@@ -1418,10 +1845,10 @@ export default function App() {
           parsedHostCallsign = (
             params.get('hostCallsign') ||
             params.get('host') ||
-            'MASTER'
+            parsedHostCallsign
           ).toUpperCase();
-          parsedMasterIp = params.get('master') || params.get('ip') || '192.168.43.1';
-        } else {
+          parsedMasterIp = params.get('master') || params.get('ip') || parsedMasterIp;
+        } else if (!offlineSig) {
           parsedHostPeer = raw.toUpperCase().startsWith('PTT-')
             ? raw.toUpperCase()
             : MASTER_PEER_ID;
@@ -1446,9 +1873,10 @@ export default function App() {
           hostCallsign: parsedHostCallsign,
           masterIp: parsedMasterIp,
           role: 'CLIENT',
+          lanSignal: '',
         });
 
-        // Immediately initiate real WebRTC DataChannel handshake to targetHostPeer / PTT-MASTER-01
+        // Also initiate PeerJS DataChannel if online
         const activePeer = directNodePeerRef.current || peerRef.current;
         if (activePeer && !activePeer.disconnected && !activePeer.destroyed) {
           try {
@@ -1461,9 +1889,11 @@ export default function App() {
 
         playTacticalTone('rx');
         setInviteJoinStatus(
-          `MENGHUBUNGKAN WEBRTC DATACHANNEL KE ${targetHostPeer} (CH ${String(
-            parsedCh
-          ).padStart(2, '0')})...`
+          offlineSig?.t === 'O'
+            ? `BARCODE MASTER DITERIMA! UNTUK HOTSPOT TANPA INTERNET: SCAN BARCODE BALASAN DI ATAS DARI HP MASTER.`
+            : `MENGHUBUNGKAN WEBRTC DATACHANNEL KE ${targetHostPeer} (CH ${String(
+                parsedCh
+              ).padStart(2, '0')})...`
         );
         return true;
       } catch {
@@ -1471,7 +1901,17 @@ export default function App() {
         return false;
       }
     },
-    [channel, localIp, playTacticalTone, registerPeerConnection]
+    [
+      channel,
+      localIp,
+      myCallsign,
+      setupCallsignInput,
+      myDeviceId,
+      isSetupCompleted,
+      playTacticalTone,
+      registerPeerConnection,
+      broadcastPeerListSync,
+    ]
   );
 
   // Stop in-app camera QR scanner stream
@@ -1521,13 +1961,20 @@ export default function App() {
             });
             if (code && code.data) {
               stopCameraScanner();
+              const sig = decodeOfflineSignalFromInput(code.data);
               const ok = applyScannedOrPastedInvite(code.data);
               if (ok) {
                 setIsSetupScannerOpen(false);
-                window.setTimeout(() => {
-                  setInviteJoinStatus(null);
-                  setActiveBottomModal(null);
-                }, 1100);
+                if (sig?.t === 'O') {
+                  // Keep Barcode modal open on 'show' tab so Master can scan Client's Offline Answer QR!
+                  setBarcodeTab('show');
+                  setActiveBottomModal('barcode');
+                } else {
+                  window.setTimeout(() => {
+                    setInviteJoinStatus(null);
+                    setActiveBottomModal(null);
+                  }, 1100);
+                }
               }
               return;
             }
@@ -1565,13 +2012,19 @@ export default function App() {
         const code = jsQR(imageData.data, imageData.width, imageData.height);
         if (code && code.data) {
           stopCameraScanner();
+          const sig = decodeOfflineSignalFromInput(code.data);
           const ok = applyScannedOrPastedInvite(code.data);
           if (ok) {
             setIsSetupScannerOpen(false);
-            window.setTimeout(() => {
-              setInviteJoinStatus(null);
-              setActiveBottomModal(null);
-            }, 1100);
+            if (sig?.t === 'O') {
+              setBarcodeTab('show');
+              setActiveBottomModal('barcode');
+            } else {
+              window.setTimeout(() => {
+                setInviteJoinStatus(null);
+                setActiveBottomModal(null);
+              }, 1100);
+            }
           }
         } else {
           setScannerError('Barcode tidak terdeteksi pada gambar. Pastikan QR Code terlihat jelas.');
@@ -1600,13 +2053,18 @@ export default function App() {
   // Join Master via pasted Invite Link or Master Peer Code inside the Barcode modal
   const handleManualInviteJoin = (e: React.FormEvent) => {
     e.preventDefault();
+    const sig = decodeOfflineSignalFromInput(manualInviteInput);
     const ok = applyScannedOrPastedInvite(manualInviteInput);
     if (ok) {
       setManualInviteInput('');
-      window.setTimeout(() => {
-        setInviteJoinStatus(null);
-        setActiveBottomModal(null);
-      }, 1100);
+      if (sig?.t === 'O') {
+        setBarcodeTab('show');
+      } else {
+        window.setTimeout(() => {
+          setInviteJoinStatus(null);
+          setActiveBottomModal(null);
+        }, 1100);
+      }
     }
   };
 
@@ -1967,7 +2425,7 @@ export default function App() {
 
             {/* Baris Bawah: Hanya menampilkan Real Peers yang terhubung via WebRTC DataChannel */}
             {activeChannelPeers.length === 0 ? (
-              <div className="tactical-panel rounded-2xl py-5 px-4 text-center space-y-1.5">
+              <div className="tactical-panel rounded-2xl py-3.5 px-4 text-center space-y-2">
                 <div className="flex items-center justify-center gap-2 text-[#23dcff]">
                   <RefreshCw className="w-4 h-4 animate-spin" />
                   <span className="font-tactical text-[16px] font-extrabold tracking-wider text-white">
@@ -1976,10 +2434,42 @@ export default function App() {
                 </div>
                 <p className="font-telemetry text-[10.5px] text-cyan-200/80">
                   Node: <strong className="text-white">{myPeerNodeId}</strong> •{' '}
-                  {isMasterDevice
-                    ? 'Menunggu Handshake Client ke PTT-MASTER-01'
-                    : 'Auto-Handshake & Watchdog 2.5s ke PTT-MASTER-01'}
+                  {isHotspotLanHubConnected
+                    ? 'Hotspot LAN Hub (Port 50002) Terhubung'
+                    : isMasterDevice
+                    ? 'Menunggu Client (Cloud / Hotspot P2P)'
+                    : 'Auto-Discovery Cloud & Hotspot LAN Aktif'}
                 </p>
+                <div className="flex items-center justify-center gap-2 pt-0.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBarcodeTab('show');
+                      setActiveBottomModal('barcode');
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-[#052542] hover:bg-[#093862] border border-[#23dcff]/70 font-telemetry text-[10.5px] font-bold text-white flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <QrCode className="w-3.5 h-3.5 text-[#23dcff]" />
+                    <span>
+                      {offlineAnswerToken
+                        ? 'Tampilkan Barcode Balasan'
+                        : 'Barcode Hotspot Offline'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBarcodeTab('scan');
+                      setActiveBottomModal('barcode');
+                    }}
+                    className="px-3 py-1.5 rounded-lg cyan-btn-glow text-[#02182b] font-telemetry text-[10.5px] font-extrabold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Camera className="w-3.5 h-3.5" />
+                    <span>
+                      {isMasterDevice ? 'Scan Balasan Client' : 'Scan Barcode Master'}
+                    </span>
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="grid grid-cols-3 gap-2">
@@ -2416,8 +2906,20 @@ export default function App() {
 
                   {barcodeTab === 'show' ? (
                     <>
-                      <div className="w-48 h-48 mx-auto bg-white p-2.5 rounded-2xl flex flex-col items-center justify-center shadow-[0_0_25px_rgba(35,220,255,0.35)] border-2 border-[#23dcff]">
-                        {qrCodeDataUrl ? (
+                      {offlineAnswerToken && (
+                        <div className="px-3 py-2 rounded-xl bg-amber-500/20 border border-amber-400 text-amber-200 font-telemetry text-[11px] font-bold">
+                          LANGKAH 2 HOTSPOT TANPA INTERNET: SCAN BARCODE BALASAN DI BAWAH INI DARI HP MASTER!
+                        </div>
+                      )}
+
+                      <div className="w-52 h-52 mx-auto bg-white p-2.5 rounded-2xl flex flex-col items-center justify-center shadow-[0_0_25px_rgba(35,220,255,0.35)] border-2 border-[#23dcff]">
+                        {offlineAnswerToken && offlineAnswerQrUrl ? (
+                          <img
+                            src={offlineAnswerQrUrl}
+                            alt="QR Code Offline Answer"
+                            className="w-full h-full object-contain rounded-lg select-all"
+                          />
+                        ) : qrCodeDataUrl ? (
                           <img
                             src={qrCodeDataUrl}
                             alt="QR Code Invite Link"
@@ -2428,24 +2930,39 @@ export default function App() {
                         )}
                       </div>
 
-                      <div className="space-y-0.5">
+                      <div className="space-y-1">
                         <div className="font-telemetry text-xs text-white font-extrabold">
-                          BARCODE HOST: {myCallsign} ({localIp}) • CH{' '}
-                          {String(channel).padStart(2, '0')}
+                          {offlineAnswerToken
+                            ? `BARCODE BALASAN OFFLINE: ${myCallsign} (${localIp})`
+                            : `BARCODE HOST: ${myCallsign} (${localIp}) • CH ${String(
+                                channel
+                              ).padStart(2, '0')}`}
                         </div>
                         <div className="font-telemetry text-[10.5px] text-cyan-200/85">
-                          Buka menu <strong className="text-white">[Barcode] &rarr; SCAN BARCODE</strong> di HP lain untuk langsung terhubung tanpa browser!
+                          {offlineAnswerToken ? (
+                            <>
+                              Di HP Master, tekan tab{' '}
+                              <strong className="text-white">SCAN BARCODE</strong> lalu arahkan ke layar ini untuk membuka jalur suara Hotspot Tanpa Internet!
+                            </>
+                          ) : (
+                            <>
+                              1) Scan Barcode ini dari HP Client. 2) Jika Hotspot{' '}
+                              <strong className="text-white">Tanpa Internet</strong>, HP Client akan memunculkan Barcode Balasan untuk di-scan balik oleh HP Master.
+                            </>
+                          )}
                         </div>
                       </div>
 
                       <div className="space-y-1.5 text-left">
                         <label className="block font-telemetry text-[10.5px] text-cyan-200 font-bold">
-                          LINK INVITE &amp; KODE NODE MASTER:
+                          {offlineAnswerToken
+                            ? 'KODE BALASAN OFFLINE HOTSPOT (ATAU SALIN KE HP MASTER):'
+                            : 'LINK INVITE & KODE OFFLINE HOTSPOT MASTER:'}
                         </label>
                         <input
                           type="text"
                           readOnly
-                          value={sharePairUrl}
+                          value={offlineAnswerToken || sharePairUrl}
                           onFocus={(e) => e.currentTarget.select()}
                           className="w-full font-telemetry text-[11px] text-cyan-100 bg-[#021526] px-3 py-2 rounded-lg border border-cyan-500/40 focus:outline-none select-all"
                         />
@@ -2454,31 +2971,47 @@ export default function App() {
                       <div className="grid grid-cols-2 gap-2">
                         <button
                           type="button"
-                          onClick={() => handleCopyText('pairUrl', sharePairUrl)}
+                          onClick={() =>
+                            handleCopyText('pairUrl', offlineAnswerToken || sharePairUrl)
+                          }
                           className="py-2.5 px-3 rounded-xl cyan-btn-glow text-[#02182b] font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
                         >
                           {copiedText === 'pairUrl' ? (
                             <>
                               <Check className="w-4 h-4" />
-                              <span>Link Tersalin!</span>
+                              <span>Kode Tersalin!</span>
                             </>
                           ) : (
                             <>
                               <Copy className="w-4 h-4" />
-                              <span>Salin Link Invite</span>
+                              <span>
+                                {offlineAnswerToken ? 'Salin Kode Balasan' : 'Salin Link / Kode'}
+                              </span>
                             </>
                           )}
                         </button>
 
                         <button
                           type="button"
-                          onClick={handleShareInviteLink}
+                          onClick={() => setBarcodeTab('scan')}
                           className="py-2.5 px-3 rounded-xl bg-[#063256] hover:bg-[#0a4678] border border-[#23dcff] text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer"
                         >
-                          <Share2 className="w-4 h-4 text-[#23dcff]" />
-                          <span>Bagikan Link</span>
+                          <Camera className="w-4 h-4 text-[#23dcff]" />
+                          <span>
+                            {isMasterDevice ? 'Scan Balasan Client' : 'Buka Kamera Scan'}
+                          </span>
                         </button>
                       </div>
+
+                      {offlineAnswerToken && (
+                        <button
+                          type="button"
+                          onClick={() => setOfflineAnswerToken('')}
+                          className="w-full py-1.5 rounded-lg bg-[#03192e] border border-cyan-500/35 text-cyan-200 font-telemetry text-[10.5px] font-semibold cursor-pointer"
+                        >
+                          Kembali ke Barcode Utama Saya
+                        </button>
+                      )}
                     </>
                   ) : (
                     <div className="space-y-3">

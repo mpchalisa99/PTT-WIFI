@@ -135,6 +135,7 @@ class UdpNetworkService extends ChangeNotifier {
   int _lastPingMs = 18;
   int _pingDeltaMs = 2;
   int _txSequence = 0;
+  int _subnetSweepCursor = 2;
 
   /// State Floor Control (Hak Bicara / Anti-Crowded)
   String? _activeSpeakerIp;
@@ -170,7 +171,7 @@ class UdpNetworkService extends ChangeNotifier {
   /// ATURAN FLOOR CONTROL & MASTER OVERRIDE:
   /// - Jika ada user lain yang sedang bicara (`isReceiving == true`):
   ///   * Klien biasa (`!_isMaster`) DIKUNCI tombol PTT-nya (`isPttLocked == true`).
-  ///   * HP MASTER (`_isMaster == true`, IP 192.168.43.1) TIDAK DIKUNCI (`isPttLocked == false`)
+  ///   * HP MASTER (`_isMaster == true`) TIDAK DIKUNCI (`isPttLocked == false`)
   ///     karena memiliki hak MASTER OVERRIDE untuk mengambil alih jalur bicara kapan saja.
   bool get isPttLocked => isReceiving && !_isMaster;
 
@@ -202,14 +203,17 @@ class UdpNetworkService extends ChangeNotifier {
       await _bindAudioSocket();
     }
 
-    // Kirim UDP Broadcast (ANNOUNCE) secara konstan setiap 1 detik
+    // Kirim UDP Discovery (4-Vector: Subnet Broadcast + Gateway Unicast + ARP + Sweep) setiap 1 detik
     _heartbeatTimer?.cancel();
     _heartbeatTimer = Timer.periodic(
       const Duration(seconds: 1),
-      (_) => _sendDiscoveryAnnouncement(),
+      (_) async {
+        await _detectLocalHotspotIp();
+        await _sendDiscoveryAnnouncement();
+      },
     );
 
-    // Bersihkan peer yang putus WiFi (> 5 detik) & reset Floor Control jika paket TX_STOP hilang
+    // Bersihkan peer yang putus WiFi (> 6 detik) & reset Floor Control jika paket TX_STOP hilang
     _pruneTimer?.cancel();
     _pruneTimer = Timer.periodic(
       const Duration(seconds: 1),
@@ -224,28 +228,40 @@ class UdpNetworkService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Deteksi IP lokal perangkat & kunci permanen status HP MASTER vs CLIENT:
-  /// Jika IP == '192.168.43.1' -> HP MASTER, selain itu -> CLIENT.
+  /// Deteksi IP lokal perangkat pada interface Hotspot/WiFi (`ap0`, `wlan0`, `swlan0`, `softap0`, `rndis0`)
+  /// termasuk saat Mobile Data MATI (Hotspot Tanpa Internet di Android 10–15).
   Future<void> _detectLocalHotspotIp() async {
     String? detectedIp;
     try {
       final info = NetworkInfo();
-      detectedIp = await info.getWifiIP();
+      final wifiIp = await info.getWifiIP();
+      if (wifiIp != null && wifiIp.isNotEmpty && wifiIp != '0.0.0.0') {
+        detectedIp = wifiIp;
+      }
 
       final interfaces = await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLoopback: false,
       );
 
+      // Prioritaskan interface Hotspot/Tethering/WiFi (`ap`, `swlan`, `wlan`, `softap`, `rndis`)
       for (final iface in interfaces) {
+        final name = iface.name.toLowerCase();
+        final isHotspotIface = name.contains('ap') ||
+            name.contains('wlan') ||
+            name.contains('swlan') ||
+            name.contains('rndis') ||
+            name.contains('eth');
         for (final addr in iface.addresses) {
-          if (addr.address == masterHotspotIp) {
+          final ip = addr.address;
+          if (ip == masterHotspotIp) {
             detectedIp = masterHotspotIp;
             break;
           }
-          if ((detectedIp == null || detectedIp.isEmpty || detectedIp == '0.0.0.0') &&
-              addr.address.startsWith('192.168.')) {
-            detectedIp = addr.address;
+          if (isHotspotIface && (ip.startsWith('192.168.') || ip.startsWith('172.'))) {
+            detectedIp = ip;
+          } else if ((detectedIp == null || detectedIp.isEmpty) && ip.startsWith('192.168.')) {
+            detectedIp = ip;
           }
         }
         if (detectedIp == masterHotspotIp) break;
@@ -258,11 +274,34 @@ class UdpNetworkService extends ChangeNotifier {
         ? detectedIp
         : masterHotspotIp;
 
-    // Kunci permanen peran berdasarkan IP '192.168.43.1'
-    _isMaster = (_localIp == masterHotspotIp);
+    // Kunci peran Master jika IP adalah '192.168.43.1' atau gateway Hotspot '.1'
+    _isMaster = (_localIp == masterHotspotIp || _localIp.endsWith('.1'));
   }
 
-  /// Buka socket UDP Port 50000 sekali saja & tangani ANNOUNCE, TX_START, TX_STOP, PING, PONG
+  /// Membaca tabel ARP kernel Android (`/proc/net/arp`) untuk menemukan IP klien/master
+  /// yang terhubung di Hotspot meskipun UDP Broadcast diblokir oleh firmware HP.
+  Future<List<String>> _readConnectedHotspotArpIps() async {
+    final List<String> arpIps = [];
+    try {
+      final arpFile = File('/proc/net/arp');
+      if (await arpFile.exists()) {
+        final lines = await arpFile.readAsLines();
+        for (int i = 1; i < lines.length; i++) {
+          final cols = lines[i].trim().split(RegExp(r'\s+'));
+          if (cols.isNotEmpty) {
+            final ip = cols[0];
+            if (ip != _localIp &&
+                (ip.startsWith('192.168.') || ip.startsWith('172.'))) {
+              arpIps.add(ip);
+            }
+          }
+        }
+      }
+    } catch (_) {}
+    return arpIps;
+  }
+
+  /// Buka socket UDP Port 50000 sekali saja & tangani ANNOUNCE, PEER_LIST_SYNC, TX_START, TX_STOP, PING, PONG
   Future<void> _bindDiscoverySocket() async {
     try {
       _discoverySocket = await UDP.bind(Endpoint.any(port: const Port(discoveryPort)));
@@ -280,51 +319,101 @@ class UdpNetworkService extends ChangeNotifier {
           final int packetCh = (data['ch'] as num?)?.toInt() ?? _currentChannel;
 
           if (type == 'ANNOUNCE') {
-            data['ip'] = senderIp;
+            final String announcedIp = (data['ip'] ?? senderIp).toString();
+            final String peerKey = (announcedIp.isNotEmpty && announcedIp != '0.0.0.0')
+                ? announcedIp
+                : senderIp;
+            if (peerKey == _localIp) return;
+
+            data['ip'] = peerKey;
+            final bool isNewPeer = !_peers.containsKey(peerKey);
             final incoming = PeerMember.fromJson(data);
-            final existing = _peers[senderIp];
+            final existing = _peers[peerKey];
             if (existing != null) {
               incoming.isTargeted = existing.isTargeted;
               incoming.lastPingMs = existing.lastPingMs;
             }
-            _peers[senderIp] = incoming;
+            _peers[peerKey] = incoming;
+
+            // Jika peer baru terdeteksi, langsung balas Unicast ANNOUNCE ke pengirim agar instan (< 100ms)
+            if (isNewPeer) {
+              _sendDirectUnicastAnnounce(peerKey);
+            }
+
+            // Jika perangkat ini adalah HP MASTER, sebarkan PEER_LIST_SYNC ke seluruh klien Hotspot
+            // agar semua klien saling menemukan meskipun Hotspot memblokir Broadcast antar-klien (AP Isolation)
+            if (_isMaster) {
+              _broadcastPeerListSyncFromMaster();
+            }
 
             // Sinkronisasi Floor Control jika pengirim sedang transmit di channel yang sama
             if (packetCh == _currentChannel && incoming.isTransmitting) {
               _handleIncomingTxStart(
-                senderIp: senderIp,
+                senderIp: peerKey,
                 senderCallsign: incoming.callsign,
-                senderIsMaster: senderIp == masterHotspotIp || (data['isMaster'] == true),
+                senderIsMaster: peerKey == masterHotspotIp ||
+                    peerKey.endsWith('.1') ||
+                    (data['isMaster'] == true),
               );
             }
             notifyListeners();
+          } else if (type == 'PEER_LIST_SYNC') {
+            final List<dynamic>? list = data['peers'] as List<dynamic>?;
+            if (list != null) {
+              bool changed = false;
+              for (final item in list) {
+                if (item is Map<String, dynamic>) {
+                  final String pIp = (item['ip'] ?? '').toString();
+                  if (pIp.isEmpty || pIp == _localIp) continue;
+                  final incoming = PeerMember.fromJson(item);
+                  final existing = _peers[pIp];
+                  if (existing != null) {
+                    incoming.isTargeted = existing.isTargeted;
+                    incoming.lastPingMs = existing.lastPingMs;
+                  }
+                  _peers[pIp] = incoming;
+                  changed = true;
+                }
+              }
+              if (changed) notifyListeners();
+            }
           } else if (type == 'TX_START') {
-            // Abaikan jika paket TX_START berasal dari channel berbeda
             if (packetCh != _currentChannel) return;
 
+            final String originIp = (data['ip'] ?? senderIp).toString();
             final String speakerCallsign =
-                (data['callsign'] ?? _peers[senderIp]?.callsign ?? senderIp)
+                (data['callsign'] ?? _peers[originIp]?.callsign ?? originIp)
                     .toString()
                     .toUpperCase();
-            final bool senderIsMaster =
-                senderIp == masterHotspotIp || (data['isMaster'] == true);
+            final bool senderIsMaster = originIp == masterHotspotIp ||
+                originIp.endsWith('.1') ||
+                (data['isMaster'] == true);
 
             _handleIncomingTxStart(
-              senderIp: senderIp,
+              senderIp: originIp,
               senderCallsign: speakerCallsign,
               senderIsMaster: senderIsMaster,
             );
+
+            // Jika HP MASTER menerima TX_START dari salah satu Client, teruskan (Relay Unicast) ke Client lain
+            if (_isMaster && senderIp != _localIp) {
+              _relayControlPacketToOtherClients(datagram.data, excludeIp: senderIp);
+            }
           } else if (type == 'TX_STOP') {
             if (packetCh != _currentChannel) return;
 
-            if (_peers.containsKey(senderIp)) {
-              _peers[senderIp]!.isTransmitting = false;
+            final String originIp = (data['ip'] ?? senderIp).toString();
+            if (_peers.containsKey(originIp)) {
+              _peers[originIp]!.isTransmitting = false;
             }
-            if (_activeSpeakerIp == senderIp) {
+            if (_activeSpeakerIp == originIp) {
               _activeSpeakerIp = null;
               _activeSpeakerCallsign = null;
               _activeSpeakerIsMaster = false;
               _lastTxPacketTime = null;
+            }
+            if (_isMaster && senderIp != _localIp) {
+              _relayControlPacketToOtherClients(datagram.data, excludeIp: senderIp);
             }
             notifyListeners();
           } else if (type == 'PING') {
@@ -345,6 +434,89 @@ class UdpNetworkService extends ChangeNotifier {
       });
     } catch (e) {
       debugPrint('Gagal bind discovery socket port $discoveryPort: $e');
+    }
+  }
+
+  /// Mengirim daftar lengkap anggota aktif (`PEER_LIST_SYNC`) dari HP MASTER ke seluruh Client via Unicast
+  Future<void> _broadcastPeerListSyncFromMaster() async {
+    if (_discoverySocket == null || !_isMaster || _myCallsign.isEmpty) return;
+
+    final List<Map<String, dynamic>> allNodes = [
+      {
+        'id': _deviceId,
+        'callsign': _myCallsign,
+        'ip': _localIp,
+        'ch': _currentChannel,
+        'tx': _isTransmitting,
+        'ping': _lastPingMs,
+      },
+      ..._peers.values.map((p) => p.toJson()),
+    ];
+
+    final bytes = utf8.encode(
+      jsonEncode({
+        'type': 'PEER_LIST_SYNC',
+        'ch': _currentChannel,
+        'peers': allNodes,
+      }),
+    );
+
+    for (final peer in _peers.values) {
+      try {
+        await _discoverySocket!.send(
+          bytes,
+          Endpoint.unicast(
+            InternetAddress(peer.ipAddress),
+            port: const Port(discoveryPort),
+          ),
+        );
+      } catch (_) {}
+    }
+  }
+
+  /// Balas langsung ANNOUNCE via Unicast ke IP tertentu
+  Future<void> _sendDirectUnicastAnnounce(String targetIp) async {
+    if (_discoverySocket == null || _myCallsign.isEmpty || targetIp == _localIp) return;
+    final bytes = utf8.encode(
+      jsonEncode({
+        'type': 'ANNOUNCE',
+        'id': _deviceId,
+        'callsign': _myCallsign,
+        'ip': _localIp,
+        'ch': _currentChannel,
+        'tx': _isTransmitting,
+        'isMaster': _isMaster,
+        'ping': _lastPingMs,
+      }),
+    );
+    try {
+      await _discoverySocket!.send(
+        bytes,
+        Endpoint.unicast(
+          InternetAddress(targetIp),
+          port: const Port(discoveryPort),
+        ),
+      );
+    } catch (_) {}
+  }
+
+  /// Relay paket kontrol (`TX_START` / `TX_STOP`) oleh HP MASTER ke klien lain (mengatasi AP Isolation)
+  Future<void> _relayControlPacketToOtherClients(
+    Uint8List rawBytes, {
+    required String excludeIp,
+  }) async {
+    if (_discoverySocket == null) return;
+    for (final peer in activeChannelPeers) {
+      if (peer.ipAddress == excludeIp || peer.ipAddress == _localIp) continue;
+      try {
+        await _discoverySocket!.send(
+          rawBytes,
+          Endpoint.unicast(
+            InternetAddress(peer.ipAddress),
+            port: const Port(discoveryPort),
+          ),
+        );
+      } catch (_) {}
     }
   }
 
@@ -398,12 +570,12 @@ class UdpNetworkService extends ChangeNotifier {
     );
 
     final parts = _localIp.split('.');
-    final subnetBroadcast = parts.length == 4
-        ? '${parts[0]}.${parts[1]}.${parts[2]}.255'
-        : '192.168.43.255';
+    final subnetPrefix = parts.length == 4 ? '${parts[0]}.${parts[1]}.${parts[2]}' : '192.168.43';
+    final subnetBroadcast = '$subnetPrefix.255';
+    final subnetGateway = '$subnetPrefix.1';
 
+    // 1. Kirim ke Subnet Broadcast (dipisah try-catch agar tidak gagal jika tidak ada internet)
     try {
-      // Kirim ke Subnet Broadcast & Global Broadcast
       await _discoverySocket!.send(
         payload,
         Endpoint.unicast(
@@ -411,25 +583,33 @@ class UdpNetworkService extends ChangeNotifier {
           port: const Port(discoveryPort),
         ),
       );
-      await _discoverySocket!.send(
-        payload,
-        Endpoint.broadcast(port: const Port(discoveryPort)),
-      );
+    } catch (_) {}
 
-      // Kirim Unicast langsung ke setiap peer aktif di channel ini agar bebas packet loss
-      for (final peer in activeChannelPeers) {
+    // 2. Kirim Unicast langsung ke Gateway Master (.1) & seluruh peer aktif
+    final Set<String> unicastTargets = {
+      subnetGateway,
+      masterHotspotIp,
+      ...activeChannelPeers.map((p) => p.ipAddress),
+    }..remove(_localIp);
+
+    for (final targetIp in unicastTargets) {
+      try {
         await _discoverySocket!.send(
           payload,
           Endpoint.unicast(
-            InternetAddress(peer.ipAddress),
+            InternetAddress(targetIp),
             port: const Port(discoveryPort),
           ),
         );
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
   }
 
-  /// Kirim paket ANNOUNCE setiap 1 detik ke Broadcast Subnet & Global Broadcast
+  /// 4-VECTOR OFFLINE HOTSPOT AUTO-DISCOVERY (Berjalan mulus 100% TANPA INTERNET):
+  /// 1. Subnet Broadcast (`x.x.x.255` & `192.168.43.255`)
+  /// 2. Direct Gateway Unicast (`x.x.x.1` & `192.168.43.1`) + Known Peers Unicast
+  /// 3. Pembacaan Tabel ARP Kernel (`/proc/net/arp`)
+  /// 4. Rotating Unicast Subnet Sweep (`x.x.x.2` .. `x.x.x.254`) untuk menembus pemblokiran Broadcast
   Future<void> _sendDiscoveryAnnouncement() async {
     if (_discoverySocket == null || _myCallsign.isEmpty) return;
 
@@ -447,10 +627,11 @@ class UdpNetworkService extends ChangeNotifier {
     );
 
     final parts = _localIp.split('.');
-    final subnetBroadcast = parts.length == 4
-        ? '${parts[0]}.${parts[1]}.${parts[2]}.255'
-        : '192.168.43.255';
+    final subnetPrefix = parts.length == 4 ? '${parts[0]}.${parts[1]}.${parts[2]}' : '192.168.43';
+    final subnetBroadcast = '$subnetPrefix.255';
+    final subnetGateway = '$subnetPrefix.1';
 
+    // Vector 1: Subnet Broadcast (dipisah try/catch dari Endpoint.broadcast agar bebas ENETUNREACH saat tanpa internet)
     try {
       await _discoverySocket!.send(
         bytes,
@@ -459,11 +640,69 @@ class UdpNetworkService extends ChangeNotifier {
           port: const Port(discoveryPort),
         ),
       );
+    } catch (_) {}
+
+    if (subnetBroadcast != '192.168.43.255') {
+      try {
+        await _discoverySocket!.send(
+          bytes,
+          Endpoint.unicast(
+            InternetAddress('192.168.43.255'),
+            port: const Port(discoveryPort),
+          ),
+        );
+      } catch (_) {}
+    }
+
+    try {
       await _discoverySocket!.send(
         bytes,
         Endpoint.broadcast(port: const Port(discoveryPort)),
       );
     } catch (_) {}
+
+    // Vector 2 & 3: Direct Unicast ke Gateway Master (.1), Peer yang sudah dikenal, dan Tabel ARP Kernel
+    final arpIps = await _readConnectedHotspotArpIps();
+    final Set<String> directTargets = {
+      subnetGateway,
+      masterHotspotIp,
+      ..._peers.keys,
+      ...arpIps,
+    }..remove(_localIp);
+
+    for (final ip in directTargets) {
+      try {
+        await _discoverySocket!.send(
+          bytes,
+          Endpoint.unicast(
+            InternetAddress(ip),
+            port: const Port(discoveryPort),
+          ),
+        );
+      } catch (_) {}
+    }
+
+    // Vector 4: Rotating Unicast Subnet Sweep (36 IP per detik) agar otomatis saling menemukan
+    // meskipun Hotspot HP memblokir paket Broadcast dan membatasi akses /proc/net/arp (Android 10+)
+    for (int i = 0; i < 36; i++) {
+      final hostOctet = _subnetSweepCursor;
+      _subnetSweepCursor = _subnetSweepCursor >= 254 ? 2 : _subnetSweepCursor + 1;
+      final candidateIp = '$subnetPrefix.$hostOctet';
+      if (candidateIp == _localIp || directTargets.contains(candidateIp)) continue;
+      try {
+        _discoverySocket!.send(
+          bytes,
+          Endpoint.unicast(
+            InternetAddress(candidateIp),
+            port: const Port(discoveryPort),
+          ),
+        );
+      } catch (_) {}
+    }
+
+    if (_isMaster && _peers.isNotEmpty) {
+      await _broadcastPeerListSyncFromMaster();
+    }
   }
 
   /// Buka socket UDP Port 50001 sekali saja & filter paket suara via byte header channel
@@ -480,9 +719,29 @@ class UdpNetworkService extends ChangeNotifier {
         final int packetChannel = bytes[0];
         final int flags = bytes[1];
         final bool packetFromMaster = (flags & 1) != 0;
+        final bool isRelayedByMaster = (flags & 4) != 0;
 
         // Filter channel di level aplikasi tanpa menutup/re-bind socket UDP
         if (packetChannel != _currentChannel) return;
+
+        // Jika perangkat ini adalah HP MASTER dan menerima paket suara dari Client,
+        // teruskan (Unicast Audio Relay) ke seluruh Client lain di channel yang sama (mengatasi AP Isolation)
+        if (_isMaster && !isRelayedByMaster) {
+          final relayedPacket = Uint8List.fromList(bytes);
+          relayedPacket[1] = flags | 4; // Tandai sudah di-relay agar tidak memantul kembali
+          for (final peer in activeChannelPeers) {
+            if (peer.ipAddress == senderIp || peer.ipAddress == _localIp) continue;
+            try {
+              _audioSocket!.send(
+                relayedPacket,
+                Endpoint.unicast(
+                  InternetAddress(peer.ipAddress),
+                  port: const Port(audioPort),
+                ),
+              );
+            } catch (_) {}
+          }
+        }
 
         // Jika pengirim adalah HP MASTER (Override) saat klien ini sedang Tx, hentikan Tx klien!
         if (_isTransmitting && packetFromMaster && !_isMaster) {
@@ -567,13 +826,22 @@ class UdpNetworkService extends ChangeNotifier {
     packet.setRange(0, 6, header.buffer.asUint8List());
     packet.setRange(6, packet.length, pcmChunk);
 
-    final targets = targetedPeers;
-    for (final peer in targets) {
+    final parts = _localIp.split('.');
+    final subnetGateway = parts.length == 4
+        ? '${parts[0]}.${parts[1]}.${parts[2]}.1'
+        : masterHotspotIp;
+
+    final Set<String> targetIps = {
+      ...targetedPeers.map((p) => p.ipAddress),
+      if (!_isMaster) subnetGateway,
+    }..remove(_localIp);
+
+    for (final ip in targetIps) {
       try {
         await _audioSocket!.send(
           packet,
           Endpoint.unicast(
-            InternetAddress(peer.ipAddress),
+            InternetAddress(ip),
             port: const Port(audioPort),
           ),
         );
