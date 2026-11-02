@@ -260,7 +260,7 @@ export default function App() {
   const [isFullScreen, setIsFullScreen] = useState<boolean>(false);
   const [fullScreenStretch, setFullScreenStretch] = useState<boolean>(true);
 
-  // Real Microphone & PTT Audio states
+  // Real Microphone, PTT & VOX (Voice Activity Detection) states
   const [isTransmitting, setIsTransmitting] = useState<boolean>(false);
   const [incomingSpeaker, setIncomingSpeaker] = useState<string | null>(null);
   const [micLevel, setMicLevel] = useState<number>(0);
@@ -269,6 +269,27 @@ export default function App() {
   // Default Echo Test to false so real Walkie-Talkie operation never echoes local speech
   const [echoTestMode, setEchoTestMode] = useState<boolean>(false);
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
+
+  // VOX (Voice Activity Detection) Hands-Free Web Audio API states (Active by default)
+  const [voxEnabled, setVoxEnabled] = useState<boolean>(() => {
+    const saved = localStorage.getItem('diskomlekau_vox_enabled');
+    return saved !== null ? saved === 'true' : true;
+  });
+  const [voxThreshold, setVoxThreshold] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('diskomlekau_vox_threshold'));
+    return saved >= 5 && saved <= 85 ? saved : 25;
+  });
+  const [voxHoldMs, setVoxHoldMs] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('diskomlekau_vox_hold_ms'));
+    return saved >= 500 && saved <= 3000 ? saved : 1100;
+  });
+  const [voxInputLevel, setVoxInputLevel] = useState<number>(0);
+
+  const getVoxNoiseGateLabel = (thr: number) => {
+    if (thr <= 24) return 'TENANG';
+    if (thr <= 46) return 'KERAMAIAN';
+    return 'ANGIN/MOTOR';
+  };
 
   // Bottom Navigation Modal States & On-Screen Tactical Chat States
   const [activeBottomModal, setActiveBottomModal] = useState<
@@ -302,11 +323,20 @@ export default function App() {
   // Audio, WebRTC, Offline Hotspot LAN & WSS Cloud Mesh refs
   const audioCtxRef = useRef<AudioContext | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micFilterRef = useRef<BiquadFilterNode | null>(null);
   const micAnalyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const animFrameRef = useRef<number | null>(null);
+  // VOX (Voice Activity Detection) refs
+  const voxEnabledRef = useRef<boolean>(voxEnabled);
+  const voxThresholdRef = useRef<number>(voxThreshold);
+  const voxHoldMsRef = useRef<number>(voxHoldMs);
+  const lastVoiceActiveTimeRef = useRef<number>(0);
+  const voxVoiceFramesRef = useRef<number>(0);
+  const isVoxTriggeredTxRef = useRef<boolean>(false);
+  const rxCooldownUntilRef = useRef<number>(0);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const directNodePeerRef = useRef<Peer | null>(null);
@@ -338,6 +368,20 @@ export default function App() {
     localStorage.setItem('diskomlekau_role', role);
     localStorage.setItem('diskomlekau_ip', localIp);
   }, [myCallsign, channel, role, localIp]);
+
+  // Persist VOX settings & sync refs
+  useEffect(() => {
+    voxEnabledRef.current = voxEnabled;
+    voxThresholdRef.current = voxThreshold;
+    voxHoldMsRef.current = voxHoldMs;
+    try {
+      localStorage.setItem('diskomlekau_vox_enabled', String(voxEnabled));
+      localStorage.setItem('diskomlekau_vox_threshold', String(voxThreshold));
+      localStorage.setItem('diskomlekau_vox_hold_ms', String(voxHoldMs));
+    } catch {
+      // Ignore storage error
+    }
+  }, [voxEnabled, voxThreshold, voxHoldMs]);
 
   // Persist tactical chat messages & auto-scroll to latest message
   useEffect(() => {
@@ -469,20 +513,29 @@ export default function App() {
         // Ignore stop error
       }
     }
-    // Physically mute hardware mic track while in RX mode
+    // Physically mute hardware mic track while in RX mode, then restore VOX standby after cooldown
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getAudioTracks().forEach((track) => {
         track.enabled = false;
       });
     }
+    rxCooldownUntilRef.current = Date.now() + 550;
   }, []);
 
   // Play incoming Base64 voice clip received from another device or loopback test (Strict Half-Duplex Rx)
   const playIncomingAudioBase64 = useCallback(
     (base64Data: string, senderCallsign: string) => {
       if (!soundEnabled) return;
-      // STRICT ANTI-ECHO: While 1st-click PTT is open (TX active / Receiver OFF), NEVER play any speaker audio!
+      // STRICT ANTI-ECHO: While PTT/VOX is open (TX active / Receiver OFF), NEVER play any speaker audio!
       if (isTransmittingRef.current || isReceiverOffRef.current) return;
+
+      // Temporarily gate VOX while speaker is playing incoming audio so RX speaker never triggers VOX
+      rxCooldownUntilRef.current = Date.now() + 2500;
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getAudioTracks().forEach((track) => {
+          track.enabled = false;
+        });
+      }
 
       playTacticalTone('rx');
       setIncomingSpeaker(senderCallsign);
@@ -497,11 +550,28 @@ export default function App() {
         activeAudioElementRef.current = null;
       }
 
+      const restoreVoxMicAfterRx = () => {
+        rxCooldownUntilRef.current = Date.now() + 450;
+        window.setTimeout(() => {
+          if (
+            voxEnabledRef.current &&
+            !isTransmittingRef.current &&
+            !remoteActiveTxRef.current &&
+            mediaStreamRef.current
+          ) {
+            mediaStreamRef.current.getAudioTracks().forEach((track) => {
+              track.enabled = true;
+            });
+          }
+        }, 420);
+      };
+
       const audio = new Audio(base64Data);
       audio.muted = false;
       audio.volume = 1.0; // Strict Half-Duplex: Max volume only when Receiver is ON
       activeAudioElementRef.current = audio;
       audio.onended = () => {
+        restoreVoxMicAfterRx();
         if (remoteActiveTxRef.current !== senderCallsign) {
           setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
           if (!isTransmittingRef.current && !isReceiverOffRef.current) {
@@ -510,11 +580,13 @@ export default function App() {
         }
       };
       audio.onerror = () => {
+        restoreVoxMicAfterRx();
         if (remoteActiveTxRef.current !== senderCallsign) {
           setIncomingSpeaker(null);
         }
       };
       audio.play().catch(() => {
+        restoreVoxMicAfterRx();
         if (remoteActiveTxRef.current !== senderCallsign) {
           setIncomingSpeaker(null);
         }
@@ -1431,20 +1503,9 @@ export default function App() {
   // HP MASTER (192.168.43.1) is never locked and can override at any time.
   const isPttLocked = !isMasterDevice && Boolean(incomingSpeaker);
 
-  // Klik Pertama: Buka PTT & Mulai Bicara -> Receiver (RX) WAJIB OFF (Muted 0%) & Mic (TX) ON
-  const handlePttStart = async () => {
-    if (isTransmittingRef.current) return;
-    if (isPttLocked) return;
-
-    // 1. STRICT HALF-DUPLEX (ANTI-ECHO): Matikan Receiver (Speaker RX OFF, Volume 0) SEBELUM membuka Mic!
-    muteAndDisableReceiver();
-
-    remoteActiveTxRef.current = null;
-    setIncomingSpeaker(null);
-    setIsTransmitting(true);
-    isTransmittingRef.current = true;
-    broadcastMeshPacket({ type: 'TX_START' });
-
+  // Initialize Web Audio API Graph (AudioContext -> MediaStreamSource -> Vocal Bandpass Filter -> AnalyserNode)
+  // Never connected to ctx.destination so microphone never leaks to local speaker!
+  const ensureWebAudioVoxGraph = useCallback(async (): Promise<AnalyserNode | null> => {
     try {
       if (!mediaStreamRef.current) {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -1459,115 +1520,174 @@ export default function App() {
       }
 
       const stream = mediaStreamRef.current;
-      if (stream) {
-        // Enable hardware microphone tracks ONLY while PTT is open
-        stream.getAudioTracks().forEach((track) => {
-          track.enabled = true;
-        });
+      if (!stream) return null;
 
-        // Real-time audio level meter (connected ONLY to AnalyserNode, NEVER to speaker destination!)
-        if (!audioCtxRef.current) {
-          audioCtxRef.current = new (window.AudioContext ||
-            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-        }
-        const ctx = audioCtxRef.current;
-        if (!micSourceRef.current || !micAnalyserRef.current) {
-          const source = ctx.createMediaStreamSource(stream);
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 64;
-          source.connect(analyser);
-          micSourceRef.current = source;
-          micAnalyserRef.current = analyser;
-        }
-        const analyser = micAnalyserRef.current;
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-        const updateMeter = () => {
-          if (!isTransmittingRef.current) return;
-          analyser.getByteFrequencyData(dataArray);
-          const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-          setMicLevel(Math.min(100, Math.max(25, avg * 1.4)));
-          animFrameRef.current = requestAnimationFrame(updateMeter);
-        };
-        updateMeter();
-
-        // Record voice while PTT is open, and ONLY transmit/play after 2nd click closes PTT
-        // so that neither local nor nearby receiver speakers ever play audio while the mic is open!
-        const segmentChunks: Blob[] = [];
-        recordedChunksRef.current = segmentChunks;
-
-        let recorder: MediaRecorder;
-        try {
-          recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
-        } catch {
-          recorder = new MediaRecorder(stream);
-        }
-
-        recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) {
-            segmentChunks.push(e.data);
-          }
-        };
-
-        recorder.onstop = () => {
-          // Ensure mic hardware tracks are OFF before sending or playing anything
-          if (mediaStreamRef.current) {
-            mediaStreamRef.current.getAudioTracks().forEach((track) => {
-              track.enabled = false;
-            });
-          }
-
-          const blob = new Blob(segmentChunks, {
-            type: recorder.mimeType || 'audio/webm',
-          });
-          if (blob.size > 200) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-              const base64Audio = reader.result as string;
-              if (base64Audio) {
-                broadcastMeshPacket({
-                  type: 'VOICE_CLIP',
-                  audioBase64: base64Audio,
-                  mimeType: blob.type,
-                });
-
-                // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
-                if (
-                  !isTransmittingRef.current &&
-                  !isReceiverOffRef.current &&
-                  echoTestMode &&
-                  membersRef.current.length === 0
-                ) {
-                  window.setTimeout(() => {
-                    playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
-                  }, 350);
-                }
-              }
-            };
-            reader.readAsDataURL(blob);
-          }
-        };
-
-        mediaRecorderRef.current = recorder;
-        recorder.start();
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new (window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
       }
-    } catch {
-      // Fallback animated waveform if mic permission isn't granted yet
-      setMicPermissionState('denied');
-      const fallbackTick = () => {
-        if (!isTransmittingRef.current) return;
-        setMicLevel(Math.floor(40 + Math.random() * 55));
-        animFrameRef.current = requestAnimationFrame(fallbackTick);
-      };
-      fallbackTick();
-    }
-  };
+      const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
 
-  // Klik Kedua: Tutup PTT -> Matikan Mic (TX OFF), Kirim Suara & TX_STOP, lalu Nyalakan Kembali Receiver (RX ON)
-  const handlePttEnd = () => {
+      if (!micSourceRef.current || !micAnalyserRef.current) {
+        const source = ctx.createMediaStreamSource(stream);
+        // Stage 1: High-pass filter (320Hz) to cut wind buffeting, breath pops, and motorcycle/vehicle engine rumble
+        const windCutHighpass = ctx.createBiquadFilter();
+        windCutHighpass.type = 'highpass';
+        windCutHighpass.frequency.value = 320;
+        windCutHighpass.Q.value = 0.7;
+
+        // Stage 2: Bandpass filter (320Hz - 3400Hz human speech presence band) to isolate human voice from background noise
+        const bandpass = ctx.createBiquadFilter();
+        bandpass.type = 'bandpass';
+        bandpass.frequency.value = 1150;
+        bandpass.Q.value = 0.85;
+
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.35;
+
+        source.connect(windCutHighpass);
+        windCutHighpass.connect(bandpass);
+        bandpass.connect(analyser);
+
+        micSourceRef.current = source;
+        micFilterRef.current = bandpass;
+        micAnalyserRef.current = analyser;
+      }
+
+      return micAnalyserRef.current;
+    } catch {
+      setMicPermissionState('denied');
+      return null;
+    }
+  }, []);
+
+  // onStartTransmit (Dipanggil otomatis oleh VOX saat suara melewati threshold, atau saat Klik Pertama tombol PTT)
+  const onStartTransmit = useCallback(
+    async (triggerSource: 'VOX' | 'MANUAL' = 'MANUAL') => {
+      if (isTransmittingRef.current) return;
+      if (isPttLocked) return;
+
+      // 1. STRICT HALF-DUPLEX (ANTI-ECHO): Matikan Receiver (Speaker RX OFF, Volume 0) SEBELUM membuka transmisi!
+      muteAndDisableReceiver();
+
+      remoteActiveTxRef.current = null;
+      setIncomingSpeaker(null);
+      setIsTransmitting(true);
+      isTransmittingRef.current = true;
+      isVoxTriggeredTxRef.current = triggerSource === 'VOX';
+      lastVoiceActiveTimeRef.current = Date.now();
+      broadcastMeshPacket({ type: 'TX_START' });
+
+      try {
+        const analyser = await ensureWebAudioVoxGraph();
+        const stream = mediaStreamRef.current;
+        if (stream && analyser) {
+          stream.getAudioTracks().forEach((track) => {
+            track.enabled = true;
+          });
+
+          const dataArray = new Uint8Array(analyser.frequencyBinCount);
+          const updateMeter = () => {
+            if (!isTransmittingRef.current) return;
+            analyser.getByteFrequencyData(dataArray);
+            const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+            setMicLevel(Math.min(100, Math.max(25, avg * 1.45)));
+            animFrameRef.current = requestAnimationFrame(updateMeter);
+          };
+          updateMeter();
+
+          const segmentChunks: Blob[] = [];
+          recordedChunksRef.current = segmentChunks;
+
+          let recorder: MediaRecorder;
+          try {
+            recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
+          } catch {
+            recorder = new MediaRecorder(stream);
+          }
+
+          recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              segmentChunks.push(e.data);
+            }
+          };
+
+          recorder.onstop = () => {
+            // Keep mic enabled ONLY if VOX is active and no incoming speaker is playing; otherwise disable track
+            if (mediaStreamRef.current) {
+              const keepOpenForVox =
+                voxEnabledRef.current && !remoteActiveTxRef.current;
+              mediaStreamRef.current.getAudioTracks().forEach((track) => {
+                track.enabled = keepOpenForVox;
+              });
+            }
+
+            const blob = new Blob(segmentChunks, {
+              type: recorder.mimeType || 'audio/webm',
+            });
+            if (blob.size > 200) {
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                const base64Audio = reader.result as string;
+                if (base64Audio) {
+                  broadcastMeshPacket({
+                    type: 'VOICE_CLIP',
+                    audioBase64: base64Audio,
+                    mimeType: blob.type,
+                  });
+
+                  // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
+                  if (
+                    !isTransmittingRef.current &&
+                    !isReceiverOffRef.current &&
+                    echoTestMode &&
+                    membersRef.current.length === 0
+                  ) {
+                    window.setTimeout(() => {
+                      playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
+                    }, 350);
+                  }
+                }
+              };
+              reader.readAsDataURL(blob);
+            }
+          };
+
+          mediaRecorderRef.current = recorder;
+          recorder.start();
+        }
+      } catch {
+        setMicPermissionState('denied');
+        const fallbackTick = () => {
+          if (!isTransmittingRef.current) return;
+          setMicLevel(Math.floor(40 + Math.random() * 55));
+          animFrameRef.current = requestAnimationFrame(fallbackTick);
+        };
+        fallbackTick();
+      }
+    },
+    [
+      isPttLocked,
+      muteAndDisableReceiver,
+      broadcastMeshPacket,
+      ensureWebAudioVoxGraph,
+      echoTestMode,
+      myCallsign,
+      playIncomingAudioBase64,
+    ]
+  );
+
+  // onStopTransmit (Dipanggil otomatis oleh VOX saat hening / berhenti bicara, atau saat Klik Kedua tombol PTT)
+  const onStopTransmit = useCallback(() => {
     if (!isTransmittingRef.current) return;
     setIsTransmitting(false);
     isTransmittingRef.current = false;
+    isVoxTriggeredTxRef.current = false;
+    voxVoiceFramesRef.current = 0;
     setMicLevel(0);
 
     if (pttSegmentIntervalRef.current) {
@@ -1580,14 +1700,14 @@ export default function App() {
       animFrameRef.current = null;
     }
 
-    // 1. Matikan track mikrofon hardware terlebih dahulu agar tidak menangkap suara speaker
-    if (mediaStreamRef.current) {
+    // Jika VOX dimatikan, matikan track mikrofon hardware; jika VOX aktif, biarkan siap mendengarkan kalimat berikutnya
+    if (mediaStreamRef.current && !voxEnabledRef.current) {
       mediaStreamRef.current.getAudioTracks().forEach((track) => {
         track.enabled = false;
       });
     }
 
-    // 2. Hentikan perekam & kirim paket VOICE_CLIP
+    // Hentikan perekam & kirim paket VOICE_CLIP
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop();
@@ -1596,21 +1716,188 @@ export default function App() {
       }
     }
 
-    // 3. Aktifkan kembali Receiver (RX ON) setelah mikrofon benar-benar mati
+    // Aktifkan kembali Receiver (RX ON) + beri cooldown singkat agar Roger Beep tidak memicu ulang VOX
+    rxCooldownUntilRef.current = Date.now() + 380;
     isReceiverOffRef.current = false;
     playTacticalTone('end');
     broadcastMeshPacket({ type: 'TX_STOP' });
-  };
+  }, [playTacticalTone, broadcastMeshPacket]);
 
-  // Toggle PTT (Klik Pertama = Buka PTT & Receiver OFF, Klik Kedua = Tutup PTT & Receiver ON)
+  const handlePttStart = () => onStartTransmit('MANUAL');
+  const handlePttEnd = () => onStopTransmit();
+
+  // Sakelar VOX On/Off (Toggle Switch Handler)
+  const handleToggleVoxSwitch = useCallback(() => {
+    setVoxEnabled((prev) => {
+      const next = !prev;
+      voxEnabledRef.current = next;
+      if (!next) {
+        voxVoiceFramesRef.current = 0;
+        setVoxInputLevel(0);
+        if (isTransmittingRef.current && isVoxTriggeredTxRef.current) {
+          onStopTransmit();
+        } else if (mediaStreamRef.current && !isTransmittingRef.current) {
+          mediaStreamRef.current.getAudioTracks().forEach((t) => {
+            t.enabled = false;
+          });
+        }
+      }
+      return next;
+    });
+  }, [onStopTransmit]);
+
+  // Toggle PTT Manual (Klik Pertama = Buka PTT & Receiver OFF, Klik Kedua = Tutup PTT & Receiver ON)
   const handlePttToggle = () => {
     if (isPttLocked) return;
     if (isTransmittingRef.current || isTransmitting) {
-      handlePttEnd();
+      onStopTransmit();
     } else {
-      handlePttStart();
+      onStartTransmit('MANUAL');
     }
   };
+
+  // MESIN UTAMA VOX (VOICE ACTIVITY DETECTION) BERBASIS WEB AUDIO API (OTOMATIS TANPA TOMBOL / TWS)
+  useEffect(() => {
+    if (!isSetupCompleted || !myCallsign) return;
+
+    let isCancelled = false;
+    let voxTimer: number | null = null;
+
+    const startContinuousVoxMonitor = async () => {
+      if (!voxEnabled && !isTransmittingRef.current) {
+        setVoxInputLevel(0);
+        if (mediaStreamRef.current && !isTransmittingRef.current) {
+          mediaStreamRef.current.getAudioTracks().forEach((t) => {
+            t.enabled = false;
+          });
+        }
+        return;
+      }
+
+      const analyser = await ensureWebAudioVoxGraph();
+      if (isCancelled || !analyser) return;
+
+      if (mediaStreamRef.current && !remoteActiveTxRef.current) {
+        mediaStreamRef.current.getAudioTracks().forEach((t) => {
+          t.enabled = true;
+        });
+      }
+
+      const timeDomainBuf = new Uint8Array(analyser.fftSize);
+      const freqDomainBuf = new Uint8Array(analyser.frequencyBinCount);
+
+      voxTimer = window.setInterval(() => {
+        if (isCancelled) return;
+
+        // Auto-resume AudioContext if mobile browser suspended it
+        if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+          audioCtxRef.current.resume().catch(() => {});
+        }
+
+        // Strict Half-Duplex Gate: Do not trigger VOX while receiving incoming audio from another peer or in cooldown
+        const isReceivingNow =
+          Boolean(remoteActiveTxRef.current) ||
+          Boolean(
+            activeAudioElementRef.current &&
+              !activeAudioElementRef.current.paused &&
+              !activeAudioElementRef.current.ended
+          ) ||
+          Date.now() < rxCooldownUntilRef.current;
+
+        if (isReceivingNow && !isTransmittingRef.current) {
+          voxVoiceFramesRef.current = 0;
+          setVoxInputLevel(0);
+          return;
+        }
+
+        analyser.getByteTimeDomainData(timeDomainBuf);
+        analyser.getByteFrequencyData(freqDomainBuf);
+
+        // Compute RMS amplitude from Web Audio time-domain waveform (post anti-wind & vocal bandpass filter)
+        let sumSquares = 0;
+        for (let i = 0; i < timeDomainBuf.length; i++) {
+          const normalized = (timeDomainBuf[i] - 128) / 128;
+          sumSquares += normalized * normalized;
+        }
+        const rms = Math.sqrt(sumSquares / timeDomainBuf.length);
+
+        // Compute average speech-band frequency energy
+        let freqSum = 0;
+        for (let i = 0; i < freqDomainBuf.length; i++) {
+          freqSum += freqDomainBuf[i];
+        }
+        const freqAvg = freqSum / freqDomainBuf.length;
+
+        // Combined human voice energy score (0 - 100)
+        const voiceEnergy = Math.min(
+          100,
+          Math.round(Math.max(rms * 255, freqAvg * 0.85))
+        );
+        setVoxInputLevel(voiceEnergy);
+
+        const now = Date.now();
+        const threshold = voxThresholdRef.current;
+        // In noisy/windy environments (threshold >= 38%), require 3 consecutive vocal frames (~165ms) to reject gusts/impulses
+        const requiredFrames = threshold >= 38 ? 3 : 2;
+
+        if (!isTransmittingRef.current) {
+          // Standby Listening -> Check if voice exceeds VOX threshold
+          if (voxEnabledRef.current && !isPttLocked && voiceEnergy >= threshold) {
+            voxVoiceFramesRef.current += 1;
+            if (voxVoiceFramesRef.current >= requiredFrames) {
+              voxVoiceFramesRef.current = 0;
+              lastVoiceActiveTimeRef.current = now;
+              onStartTransmit('VOX');
+            }
+          } else {
+            voxVoiceFramesRef.current = Math.max(0, voxVoiceFramesRef.current - 1);
+          }
+        } else {
+          // Currently Transmitting -> Check if voice is still active or silent
+          const sustainThreshold = Math.max(6, Math.round(threshold * 0.78));
+          if (voiceEnergy >= sustainThreshold) {
+            lastVoiceActiveTimeRef.current = now;
+          } else if (voxEnabledRef.current) {
+            const silentMs = now - lastVoiceActiveTimeRef.current;
+            if (silentMs >= voxHoldMsRef.current) {
+              onStopTransmit();
+            }
+          }
+        }
+      }, 55);
+    };
+
+    startContinuousVoxMonitor();
+
+    // Ensure AudioContext unlocks on any touch/click if browser initially suspended it on reload
+    const unlockAudioOnInteraction = () => {
+      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+      if (voxEnabledRef.current && !mediaStreamRef.current) {
+        ensureWebAudioVoxGraph();
+      }
+    };
+    window.addEventListener('pointerdown', unlockAudioOnInteraction, { passive: true });
+    window.addEventListener('touchstart', unlockAudioOnInteraction, { passive: true });
+    window.addEventListener('keydown', unlockAudioOnInteraction, { passive: true });
+
+    return () => {
+      isCancelled = true;
+      if (voxTimer) window.clearInterval(voxTimer);
+      window.removeEventListener('pointerdown', unlockAudioOnInteraction);
+      window.removeEventListener('touchstart', unlockAudioOnInteraction);
+      window.removeEventListener('keydown', unlockAudioOnInteraction);
+    };
+  }, [
+    isSetupCompleted,
+    myCallsign,
+    voxEnabled,
+    isPttLocked,
+    ensureWebAudioVoxGraph,
+    onStartTransmit,
+    onStopTransmit,
+  ]);
 
   // Toggle Native Browser/WebView FullScreen when clicking [FULL]
   const handleToggleFullScreen = async () => {
@@ -1655,32 +1942,18 @@ export default function App() {
     const cleaned = setupCallsignInput.trim().toUpperCase();
     if (!cleaned) return;
 
-    // Pre-warm microphone permission on user gesture so Android Chrome unlocks un-obfuscated LAN IPv4 host candidates (instead of .local mDNS)
-    try {
-      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-        mediaStreamRef.current = stream;
-        setMicPermissionState('granted');
-      }
-    } catch {
-      // Continue even if user postpones mic permission
-    }
+    // Pre-warm microphone permission & Web Audio API VOX graph on user gesture
+    await ensureWebAudioVoxGraph();
 
     const realLanIp = await detectLocalHotspotIpWebRTC(550);
     if (realLanIp) {
       detectedLanIpRef.current = realLanIp;
     }
 
-    // Keep microphone hardware tracks disabled (OFF) while in Standby / RX mode until 1st-click PTT Open
+    // Keep microphone hardware tracks enabled if VOX is ON, or disabled if VOX is OFF
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getAudioTracks().forEach((track) => {
-        track.enabled = false;
+        track.enabled = voxEnabledRef.current;
       });
     }
 
@@ -2386,7 +2659,11 @@ export default function App() {
   const currentFile = FLUTTER_SOURCE_FILES[selectedFileIndex];
 
   const curvedTitle = isTransmitting
-    ? 'KLIK KEDUA • TUTUP PTT'
+    ? voxEnabled
+      ? 'VOX AKTIF • HENING UTK TUTUP'
+      : 'KLIK KEDUA • TUTUP PTT'
+    : voxEnabled
+    ? 'VOX AUTO ON • BICARA LANGSUNG'
     : 'KLIK PERTAMA • BUKA PTT';
   const curvedChars = curvedTitle.split('');
 
@@ -2714,16 +2991,136 @@ export default function App() {
               </div>
             </div>
 
+            {/* Baris Tengah: Panel Sakelar VOX (VOX On/Off Switch) & Pengatur Sensitivitas (Threshold Slider Anti-Bising/Angin) */}
+            <div className="tactical-panel rounded-xl px-2.5 py-1.5 flex flex-col gap-1 border border-[#23dcff]/60">
+              {/* Baris 1: Tombol Sakelar VOX (On/Off Switch) + Mode Preset Anti-Bising/Angin + Hold Time */}
+              <div className="flex items-center justify-between gap-1.5">
+                {/* Tombol Sakelar VOX (VOX On/Off Switch) */}
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={voxEnabled}
+                  onClick={handleToggleVoxSwitch}
+                  className={`px-2 py-0.5 rounded-lg border flex items-center gap-1.5 transition-all shrink-0 cursor-pointer ${
+                    voxEnabled
+                      ? 'bg-[#073b61] border-[#23dcff] text-white shadow-[0_0_10px_rgba(35,220,255,0.3)]'
+                      : 'bg-[#031829] border-cyan-500/35 text-cyan-200/75'
+                  }`}
+                >
+                  {/* Visual Sliding Switch Track & Knob */}
+                  <div
+                    className={`w-7 h-4 rounded-full p-0.5 flex items-center transition-colors ${
+                      voxEnabled ? 'bg-[#23dcff] justify-end' : 'bg-[#02101c] border border-cyan-500/40 justify-start'
+                    }`}
+                  >
+                    <span
+                      className={`w-3 h-3 rounded-full transition-transform ${
+                        voxEnabled ? 'bg-[#02182b] shadow-xs' : 'bg-cyan-300/70'
+                      }`}
+                    />
+                  </div>
+                  <span className="font-tactical text-[11.5px] font-extrabold tracking-wider">
+                    {voxEnabled ? 'VOX: ON' : 'VOX: OFF'}
+                  </span>
+                </button>
+
+                {/* Tombol Preset Cepat Anti-Bising / Keramaian / Berkendara Angin */}
+                <div className="flex items-center gap-1 min-w-0">
+                  {[
+                    { label: 'TENANG', val: 18 },
+                    { label: 'RAMAI', val: 42 },
+                    { label: 'ANGIN', val: 65 },
+                  ].map((preset) => {
+                    const isActivePreset = Math.abs(voxThreshold - preset.val) <= 6;
+                    return (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => setVoxThreshold(preset.val)}
+                        title={`Set Sensitivitas VOX ke Mode ${preset.label} (${preset.val}%)`}
+                        className={`px-1.5 py-0.5 rounded font-telemetry text-[8.5px] font-bold transition-colors cursor-pointer ${
+                          isActivePreset
+                            ? 'bg-[#23dcff] text-[#02182b] font-extrabold'
+                            : 'bg-[#042138] hover:bg-[#083456] text-cyan-100 border border-cyan-400/35'
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Tombol Jeda Hening (Hold Time) */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setVoxHoldMs((prev) => (prev === 1100 ? 1600 : prev === 1600 ? 750 : 1100))
+                  }
+                  title="Jeda Hening Penutup Otomatis (Hold Time)"
+                  className="px-1.5 py-0.5 rounded bg-[#052542] hover:bg-[#093862] border border-cyan-400/45 font-telemetry text-[8.5px] font-bold text-cyan-100 shrink-0 cursor-pointer"
+                >
+                  {(voxHoldMs / 1000).toFixed(1)}s
+                </button>
+              </div>
+
+              {/* Baris 2: Pengatur Sensitivitas VOX (Threshold Slider) + Indikator Level Suara vs Ambang Bising */}
+              <div className="flex items-center gap-2">
+                <span className="font-telemetry text-[9px] font-bold text-cyan-100 shrink-0">
+                  THR <strong className="text-[#23dcff]">{voxThreshold}%</strong>
+                </span>
+
+                <div className="relative flex-1 h-4 flex items-center">
+                  {/* Track Background + Live Voice Level Bar */}
+                  <div className="w-full h-2 rounded-full bg-[#021220] border border-cyan-400/40 overflow-hidden relative">
+                    <div
+                      style={{ width: `${Math.min(100, voxInputLevel)}%` }}
+                      className={`h-full transition-all duration-75 ${
+                        voxInputLevel >= voxThreshold
+                          ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
+                          : 'bg-cyan-500/55'
+                      }`}
+                    />
+                  </div>
+
+                  {/* Garis Batas Ambang (Threshold Gate Marker) */}
+                  <div
+                    style={{
+                      left: `${((voxThreshold - 5) / (85 - 5)) * 100}%`,
+                    }}
+                    className="absolute top-0 bottom-0 w-1 -ml-0.5 rounded-full bg-white shadow-[0_0_6px_#23dcff] pointer-events-none"
+                  />
+
+                  {/* Input Range Slider Interaktif (Pengatur Sensitivitas VOX) */}
+                  <input
+                    type="range"
+                    min={5}
+                    max={85}
+                    step={1}
+                    value={voxThreshold}
+                    onChange={(e) => setVoxThreshold(Number(e.target.value))}
+                    aria-label="Pengatur Sensitivitas VOX Threshold Slider"
+                    className="absolute inset-0 w-full h-full accent-[#23dcff] opacity-90 cursor-pointer"
+                  />
+                </div>
+
+                <span className="font-telemetry text-[9px] text-cyan-100/95 shrink-0 min-w-[82px] text-right">
+                  {voxEnabled
+                    ? `MIC:${voxInputLevel}% (${getVoxNoiseGateLabel(voxThreshold)})`
+                    : 'MANUAL PTT'}
+                </span>
+              </div>
+            </div>
+
             {/* Baris Bawah: Real Peers atau Status Pencarian */}
             {activeChannelPeers.length === 0 ? (
-              <div className="tactical-panel rounded-xl py-2 px-3 flex items-center justify-between gap-2">
+              <div className="tactical-panel rounded-xl py-1.5 px-3 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2 min-w-0">
-                  <RefreshCw className="w-4 h-4 text-[#23dcff] animate-spin shrink-0" />
+                  <RefreshCw className="w-3.5 h-3.5 text-[#23dcff] animate-spin shrink-0" />
                   <div className="truncate">
-                    <span className="font-tactical text-[14px] font-extrabold tracking-wider text-white mr-1.5">
+                    <span className="font-tactical text-[13.5px] font-extrabold tracking-wider text-white mr-1.5">
                       Mencari Anggota...
                     </span>
-                    <span className="font-telemetry text-[10px] text-cyan-200/80">
+                    <span className="font-telemetry text-[9.5px] text-cyan-200/80">
                       ({myPeerNodeId})
                     </span>
                   </div>
@@ -2754,7 +3151,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="grid grid-cols-3 gap-1.5 max-h-18 overflow-y-auto">
+              <div className="grid grid-cols-3 gap-1.5 max-h-16 overflow-y-auto">
                 {activeChannelPeers.map((member) => {
                   const isHighlighted =
                     selectedMemberId === member.id ||
@@ -2780,20 +3177,20 @@ export default function App() {
                           setSelectedMemberId(member.id);
                         }
                       }}
-                      className={`rounded-xl px-2.5 py-1.5 flex items-center justify-between gap-1.5 border transition-all cursor-pointer ${
+                      className={`rounded-xl px-2.5 py-1 flex items-center justify-between gap-1.5 border transition-all cursor-pointer ${
                         isHighlighted
                           ? 'bg-gradient-to-b from-[#17a9d9] to-[#0c6c99] border-[#66ecff]'
                           : 'bg-gradient-to-b from-[#062b4c] to-[#041d35] border-[#23dcff]/45'
                       }`}
                     >
-                      <div className="relative w-6 h-6 rounded-full bg-[#03192e] border border-cyan-400/55 flex items-center justify-center shrink-0">
-                        <Mic className="w-3.5 h-3.5 text-[#23dcff]" />
+                      <div className="relative w-5 h-5 rounded-full bg-[#03192e] border border-cyan-400/55 flex items-center justify-center shrink-0">
+                        <Mic className="w-3 h-3 text-[#23dcff]" />
                       </div>
                       <div className="min-w-0 flex-1 leading-tight">
-                        <div className="font-tactical text-[13px] font-bold text-white truncate">
+                        <div className="font-tactical text-[12.5px] font-bold text-white truncate">
                           {member.callsign}
                         </div>
-                        <div className="font-telemetry text-[9px] text-cyan-100/90 truncate">
+                        <div className="font-telemetry text-[8.5px] text-cyan-100/90 truncate">
                           {member.ip}
                         </div>
                       </div>
@@ -2805,7 +3202,7 @@ export default function App() {
           </section>
 
           {/* 5. AREA UTAMA PTT + GELOMBANG SUARA + BANNER STATUS (FLEX-1 MAXIMIZED) */}
-          <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-2 py-0.5">
+          <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-1.5 py-0.5">
             <section className="flex items-center justify-center gap-3.5">
               {/* Indikator Gelombang Suara Kiri */}
               <div className="flex items-center gap-1">
@@ -2814,7 +3211,9 @@ export default function App() {
                     key={`lw-${i}`}
                     style={{
                       height: isTransmitting
-                        ? `${Math.max(6, ((h * micLevel) / 55) % 34)}px`
+                        ? `${Math.max(6, ((h * Math.max(micLevel, voxInputLevel)) / 55) % 34)}px`
+                        : voxEnabled && voxInputLevel > 5
+                        ? `${Math.max(5, ((h * voxInputLevel) / 85) % 22)}px`
                         : `${h * 0.65}px`,
                     }}
                     className={`w-1.5 rounded-full transition-all duration-75 ${
@@ -2826,12 +3225,12 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Tombol Lingkaran PTT (Klik 1 = Buka PTT, Klik 2 = Tutup PTT) */}
+              {/* Tombol Lingkaran PTT (VOX Hands-Free Otomatis + Klik Manual) */}
               <button
                 type="button"
                 disabled={isPttLocked}
                 onClick={isPttLocked ? undefined : handlePttToggle}
-                className={`relative w-40 h-40 sm:w-44 sm:h-44 rounded-full border-[4px] flex items-center justify-center transition-transform duration-150 select-none ${
+                className={`relative w-36 h-36 sm:w-40 sm:h-40 rounded-full border-[4px] flex items-center justify-center transition-transform duration-150 select-none ${
                   isPttLocked
                     ? 'bg-[#1a1318] border-red-500/80 opacity-85 cursor-not-allowed'
                     : isTransmitting
@@ -2839,11 +3238,11 @@ export default function App() {
                     : 'ptt-ring-outer border-[#2fe0ff] active:scale-95 cursor-pointer'
                 }`}
               >
-                {/* Teks Melingkar "KLIK PERTAMA • BUKA PTT" / "KLIK KEDUA • TUTUP PTT" */}
+                {/* Teks Melingkar */}
                 <div className="absolute inset-0 pointer-events-none">
                   {curvedChars.map((char, index) => {
                     const total = curvedChars.length;
-                    const spreadDeg = 114;
+                    const spreadDeg = 118;
                     const startAngle = -spreadDeg / 2;
                     const angle = startAngle + (index / (total - 1)) * spreadDeg;
                     return (
@@ -2852,7 +3251,7 @@ export default function App() {
                         style={{
                           transform: `rotate(${angle}deg)`,
                         }}
-                        className="absolute left-1/2 top-1.5 -ml-[4px] h-[74px] sm:h-[82px] origin-bottom font-tactical text-[10px] font-extrabold text-[#02192d] tracking-wider"
+                        className="absolute left-1/2 top-1.5 -ml-[4px] h-[66px] sm:h-[74px] origin-bottom font-tactical text-[9px] font-extrabold text-[#02192d] tracking-wider"
                       >
                         {char}
                       </span>
@@ -2862,7 +3261,7 @@ export default function App() {
 
                 {/* Lingkaran Dalam Tombol PTT */}
                 <div
-                  className={`w-28 h-28 sm:w-31 sm:h-31 rounded-full border-2 flex flex-col items-center justify-center px-2 text-center transition-all ${
+                  className={`w-25 h-25 sm:w-28 sm:h-28 rounded-full border-2 flex flex-col items-center justify-center px-2 text-center transition-all ${
                     isPttLocked
                       ? 'bg-gradient-to-b from-[#3d121d] to-[#1c080d] border-red-400/80'
                       : isTransmitting
@@ -2871,7 +3270,7 @@ export default function App() {
                   }`}
                 >
                   <Radio
-                    className={`w-8 h-8 mb-0.5 ${
+                    className={`w-7 h-7 mb-0.5 ${
                       isPttLocked
                         ? 'text-red-300 animate-pulse'
                         : isTransmitting
@@ -2879,22 +3278,28 @@ export default function App() {
                         : 'text-[#03233b]'
                     }`}
                   />
-                  <span className="font-tactical text-[12.5px] font-extrabold tracking-wider text-white drop-shadow leading-tight">
+                  <span className="font-tactical text-[12px] font-extrabold tracking-wider text-white drop-shadow leading-tight">
                     {isTransmitting
-                      ? 'KLIK TUTUP PTT'
+                      ? voxEnabled
+                        ? 'VOX TRANSMIT'
+                        : 'KLIK TUTUP PTT'
                       : incomingSpeaker
                       ? isPttLocked
                         ? `RX ${incomingSpeaker}`
                         : `OVERRIDE`
+                      : voxEnabled
+                      ? 'VOX STANDBY'
                       : isMasterDevice
                       ? 'MASTER READY'
                       : 'CLIENT READY'}
                   </span>
-                  <span className="font-telemetry text-[8.5px] font-bold text-cyan-100/95 leading-none mt-0.5">
+                  <span className="font-telemetry text-[8px] font-bold text-cyan-100/95 leading-none mt-0.5">
                     {isTransmitting
                       ? 'RX OFF • ANTI-ECHO'
                       : isPttLocked
                       ? 'MIC OFF • RX ON'
+                      : voxEnabled
+                      ? 'BICARA OTOMATIS'
                       : 'KLIK BUKA PTT'}
                   </span>
                 </div>
@@ -2907,7 +3312,9 @@ export default function App() {
                     key={`rw-${i}`}
                     style={{
                       height: isTransmitting
-                        ? `${Math.max(6, ((h * micLevel) / 55) % 34)}px`
+                        ? `${Math.max(6, ((h * Math.max(micLevel, voxInputLevel)) / 55) % 34)}px`
+                        : voxEnabled && voxInputLevel > 5
+                        ? `${Math.max(5, ((h * voxInputLevel) / 85) % 22)}px`
                         : `${h * 0.65}px`,
                     }}
                     className={`w-1.5 rounded-full transition-all duration-75 ${
@@ -2920,23 +3327,27 @@ export default function App() {
               </div>
             </section>
 
-            {/* BANNER STATUS BAWAH (KLIK 1 = BUKA PTT [RX OFF], KLIK 2 = TUTUP PTT [RX ON]) */}
+            {/* BANNER STATUS BAWAH (VOX OTOMATIS & KLIK MANUAL) */}
             <button
               type="button"
               disabled={isPttLocked}
               onClick={isPttLocked ? undefined : handlePttToggle}
-              className={`w-full py-2 rounded-xl font-tactical text-[14.5px] sm:text-[16px] font-extrabold tracking-[0.06em] text-white text-center shrink-0 transition-all ${
+              className={`w-full py-1.5 rounded-xl font-tactical text-[14px] sm:text-[15.5px] font-extrabold tracking-[0.06em] text-white text-center shrink-0 transition-all ${
                 isPttLocked
                   ? 'bg-red-950/90 border border-red-400/80 text-red-100 cursor-not-allowed'
                   : 'cyan-btn-glow shadow-[0_0_15px_rgba(35,220,255,0.35)] cursor-pointer'
               }`}
             >
               {isTransmitting
-                ? 'TX AKTIF (RECEIVER OFF) • KLIK KEDUA TUTUP PTT'
+                ? voxEnabled
+                  ? 'VOX TX AKTIF (RX OFF) • HENING OTOMATIS TUTUP PTT'
+                  : 'TX AKTIF (RECEIVER OFF) • KLIK KEDUA TUTUP PTT'
                 : incomingSpeaker
                 ? isMasterDevice
                   ? `RECEIVING FROM ${incomingSpeaker} (KLIK UNTUK OVERRIDE)`
                   : `RECEIVING FROM ${incomingSpeaker} (PTT LOCKED)`
+                : voxEnabled
+                ? 'VOX AKTIF • LANGSUNG BICARA TANPA TEKAN TOMBOL'
                 : isMasterDevice
                 ? 'MASTER READY • KLIK UNTUK BUKA PTT'
                 : 'CLIENT READY • KLIK UNTUK BUKA PTT'}
@@ -3668,13 +4079,112 @@ export default function App() {
                         </button>
                       )}
 
+                      <div className="p-3 rounded-xl bg-[#021526] border border-[#23dcff]/45 space-y-2.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <div>
+                            <div className="text-white font-bold">
+                              Sakelar VOX (VOX On/Off Switch)
+                            </div>
+                            <div className="text-[10px] text-cyan-200/75">
+                              Otomatis kirim suara saat bicara &amp; tutup saat hening (Tanpa Tombol / TWS)
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={voxEnabled}
+                            onClick={handleToggleVoxSwitch}
+                            className={`px-3 py-1.5 rounded-xl font-bold flex items-center gap-2 border cursor-pointer ${
+                              voxEnabled
+                                ? 'bg-[#073b61] border-[#23dcff] text-white'
+                                : 'bg-cyan-950 border-cyan-500/30 text-cyan-300'
+                            }`}
+                          >
+                            <div
+                              className={`w-8 h-4 rounded-full p-0.5 flex items-center ${
+                                voxEnabled ? 'bg-[#23dcff] justify-end' : 'bg-[#02101c] justify-start'
+                              }`}
+                            >
+                              <span
+                                className={`w-3 h-3 rounded-full ${
+                                  voxEnabled ? 'bg-[#02182b]' : 'bg-cyan-400/70'
+                                }`}
+                              />
+                            </div>
+                            <span>{voxEnabled ? 'VOX ON' : 'VOX OFF'}</span>
+                          </button>
+                        </div>
+
+                        <div className="space-y-1.5 pt-2 border-t border-cyan-500/20">
+                          <div className="flex items-center justify-between text-[11px]">
+                            <span className="text-cyan-200">
+                              Sensitivitas VOX (Threshold Slider)
+                            </span>
+                            <span className="text-[#23dcff] font-bold">
+                              {voxThreshold}% ({getVoxNoiseGateLabel(voxThreshold)}) • Mic: {voxInputLevel}%
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={5}
+                            max={85}
+                            step={1}
+                            value={voxThreshold}
+                            onChange={(e) => setVoxThreshold(Number(e.target.value))}
+                            className="w-full accent-[#23dcff] cursor-pointer"
+                          />
+                          <div className="grid grid-cols-3 gap-1.5 pt-1">
+                            {[
+                              { label: 'Tenang (18%)', val: 18 },
+                              { label: 'Keramaian (42%)', val: 42 },
+                              { label: 'Angin/Motor (65%)', val: 65 },
+                            ].map((p) => (
+                              <button
+                                key={p.label}
+                                type="button"
+                                onClick={() => setVoxThreshold(p.val)}
+                                className={`py-1 px-2 rounded-lg text-[10px] font-bold border cursor-pointer ${
+                                  Math.abs(voxThreshold - p.val) <= 6
+                                    ? 'bg-[#23dcff] text-[#02182b] border-white'
+                                    : 'bg-[#042440] text-cyan-100 border-cyan-500/35'
+                                }`}
+                              >
+                                {p.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between pt-2 border-t border-cyan-500/20 text-[11px]">
+                          <span className="text-cyan-200">
+                            Jeda Hening Tutup Transmisi (Hold Time)
+                          </span>
+                          <div className="flex items-center gap-1">
+                            {[750, 1100, 1600].map((ms) => (
+                              <button
+                                key={ms}
+                                type="button"
+                                onClick={() => setVoxHoldMs(ms)}
+                                className={`px-2 py-1 rounded font-bold cursor-pointer ${
+                                  voxHoldMs === ms
+                                    ? 'bg-[#23dcff] text-[#02182b]'
+                                    : 'bg-[#042440] text-cyan-200'
+                                }`}
+                              >
+                                {(ms / 1000).toFixed(1)}s
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+
                       <div className="flex items-center justify-between py-2 border-b border-cyan-500/20">
                         <div>
                           <div className="text-white font-bold">
                             Mode Echo / Uji Suara Mic APK
                           </div>
                           <div className="text-[10px] text-cyan-200/75">
-                            Putar balik suara Anda setelah klik kedua (tutup PTT)
+                            Putar balik suara Anda setelah berhenti bicara / tutup PTT
                           </div>
                         </div>
                         <button
