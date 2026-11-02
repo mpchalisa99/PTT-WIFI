@@ -419,15 +419,67 @@ export function encodePcmChunksToWavBlob(
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
+// WeakMap to track HTMLAudioElements already routed into Web Audio API GainNode
+const htmlAudioGainMap = new WeakMap<
+  HTMLAudioElement,
+  { ctx: AudioContext; gainNode: GainNode }
+>();
+
 /**
- * Decodes Base64 Data URL and plays it directly through Web Audio API AudioBufferSourceNode.
- * Essential fallback for iOS Safari & backgrounded Android/HarmonyOS when HTMLAudioElement.play() is throttled.
+ * Routes an HTMLAudioElement through a Web Audio API GainNode (gain.value = 2.2 default)
+ * + Vocal Clarity Filter + Anti-Clipping Limiter so even HTML5 <audio> fallback plays loud & clear.
+ */
+export function ensureHtmlAudioElementGainBooster(
+  ctx: AudioContext,
+  audioEl: HTMLAudioElement,
+  rxGainValue = 2.2
+): void {
+  try {
+    const existing = htmlAudioGainMap.get(audioEl);
+    if (existing && existing.ctx === ctx) {
+      existing.gainNode.gain.value = Math.max(0.5, Math.min(4.0, rxGainValue));
+      return;
+    }
+
+    const mediaSource = ctx.createMediaElementSource(audioEl);
+    const vocalClarityFilter = ctx.createBiquadFilter();
+    vocalClarityFilter.type = 'peaking';
+    vocalClarityFilter.frequency.value = 2100;
+    vocalClarityFilter.Q.value = 1.0;
+    vocalClarityFilter.gain.value = 3.5;
+
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = Math.max(0.5, Math.min(4.0, rxGainValue));
+
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -2.0;
+    limiter.knee.value = 6.0;
+    limiter.ratio.value = 12.0;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.12;
+
+    mediaSource.connect(vocalClarityFilter);
+    vocalClarityFilter.connect(gainNode);
+    gainNode.connect(limiter);
+    limiter.connect(ctx.destination);
+
+    htmlAudioGainMap.set(audioEl, { ctx, gainNode });
+  } catch {
+    // Ignore if createMediaElementSource was already bound or unsupported
+  }
+}
+
+/**
+ * Decodes decrypted AES-GCM Base64 Data URL and plays it through Web Audio API AudioBufferSourceNode
+ * with a high-output GainNode (default gain.value = 2.2), automatic quiet-voice normalization,
+ * vocal clarity presence EQ, and anti-clipping DynamicsCompressor limiter.
  */
 export async function playBase64AudioViaWebAudioFallback(
   ctx: AudioContext,
   base64DataUrl: string,
-  onEnded: () => void
-): Promise<{ stop: () => void } | null> {
+  onEnded: () => void,
+  rxGainValue = 2.2
+): Promise<{ stop: () => void; setGain: (val: number) => void } | null> {
   try {
     const st = ctx.state as string;
     if (st === 'suspended' || st === 'interrupted') {
@@ -443,7 +495,7 @@ export async function playBase64AudioViaWebAudioFallback(
       bytes[i] = binaryString.charCodeAt(i);
     }
 
-    // Use callback-style decodeAudioData wrapper for older Safari iOS compatibility
+    // Use callback-style decodeAudioData wrapper for Safari iOS & Chrome Android/HarmonyOS compatibility
     const audioBuffer = await new Promise<AudioBuffer>((resolve, reject) => {
       try {
         const res = ctx.decodeAudioData(
@@ -459,18 +511,64 @@ export async function playBase64AudioViaWebAudioFallback(
       }
     });
 
-    const source = ctx.createBufferSource();
-    const gainNode = ctx.createGain();
-    gainNode.gain.value = 1.0;
+    // Auto-normalize quiet decoded audio buffers so soft microphone recordings are brought up to optimal level before GainNode
+    let autoMakeupGain = 1.0;
+    try {
+      let maxPeak = 0;
+      for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+        const channelData = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < channelData.length; i += 4) {
+          const abs = Math.abs(channelData[i]);
+          if (abs > maxPeak) maxPeak = abs;
+        }
+      }
+      if (maxPeak > 0.01 && maxPeak < 0.45) {
+        autoMakeupGain = Math.min(2.0, 0.65 / maxPeak);
+      }
+    } catch {
+      autoMakeupGain = 1.0;
+    }
 
+    const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(gainNode);
-    gainNode.connect(ctx.destination);
+
+    // Stage 1: Vocal Presence Clarity Filter (2.1 kHz +3.5 dB boost for crisp walkie-talkie speech)
+    const vocalClarityFilter = ctx.createBiquadFilter();
+    vocalClarityFilter.type = 'peaking';
+    vocalClarityFilter.frequency.value = 2100;
+    vocalClarityFilter.Q.value = 1.0;
+    vocalClarityFilter.gain.value = 3.5;
+
+    // Stage 2: Web Audio API GainNode (gain.value = 2.0+ amplified receiver boost)
+    const gainNode = ctx.createGain();
+    const effectiveGain = Math.max(0.5, Math.min(5.0, rxGainValue * autoMakeupGain));
+    gainNode.gain.value = effectiveGain;
+
+    // Stage 3: Anti-Clipping DynamicsCompressor Limiter (prevents harsh speaker distortion at high gain)
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -2.0;
+    limiter.knee.value = 6.0;
+    limiter.ratio.value = 12.0;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.12;
+
+    source.connect(vocalClarityFilter);
+    vocalClarityFilter.connect(gainNode);
+    gainNode.connect(limiter);
+    limiter.connect(ctx.destination);
 
     let stopped = false;
     source.onended = () => {
       if (!stopped) {
         stopped = true;
+        try {
+          source.disconnect();
+          vocalClarityFilter.disconnect();
+          gainNode.disconnect();
+          limiter.disconnect();
+        } catch {
+          // Ignore disconnect error
+        }
         onEnded();
       }
     };
@@ -485,9 +583,16 @@ export async function playBase64AudioViaWebAudioFallback(
           gainNode.gain.value = 0;
           source.stop(0);
           source.disconnect();
+          vocalClarityFilter.disconnect();
+          gainNode.disconnect();
+          limiter.disconnect();
         } catch {
           // Ignore stop error
         }
+      },
+      setGain: (val: number) => {
+        if (stopped) return;
+        gainNode.gain.value = Math.max(0.5, Math.min(5.0, val * autoMakeupGain));
       },
     };
   } catch {

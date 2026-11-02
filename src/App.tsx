@@ -32,6 +32,10 @@ import {
   Trash2,
   ChevronDown,
   ChevronUp,
+  Lock,
+  Shield,
+  ShieldAlert,
+  KeyRound,
 } from 'lucide-react';
 import { FLUTTER_SOURCE_FILES } from './data/flutterSourceFiles';
 import { usePWAInstall } from './usePWAInstall';
@@ -48,10 +52,21 @@ import {
   requestMicrophoneWithFallbacks,
   getSupportedAudioMimeType,
   encodePcmChunksToWavBlob,
+  ensureHtmlAudioElementGainBooster,
   playBase64AudioViaWebAudioFallback,
   createSilentKeepAliveController,
   SilentKeepAliveSession,
 } from './utils/mobileAudioEngine';
+import {
+  TACTICAL_AUTH_SESSION_KEY,
+  getOrDeriveTacticalAesKey,
+  purgeTacticalCryptoKeyCache,
+  encryptAudioPayloadAesGcm,
+  decryptAudioPayloadAesGcm,
+} from './utils/tacticalCrypto';
+
+// Spesifikasi Passcode Operasional Harian (Wajib sebelum akses PTT, Web Audio API & WebSocket)
+const PASSCODE_HARIAN = 'DISKOMLEKAU';
 
 interface TacticalMember {
   id: string;
@@ -119,6 +134,10 @@ interface MeshPacket {
   channel: number;
   timestamp: number;
   audioBase64?: string;
+  encryptedAudio?: boolean;
+  audioCiphertext?: string;
+  aesIv?: string;
+  cipherAlgo?: 'AES-256-GCM';
   mimeType?: string;
   chatText?: string;
   peerNodeId?: string;
@@ -219,15 +238,45 @@ export default function App() {
   });
 
   const [myCallsign, setMyCallsign] = useState<string>(() => {
-    return localStorage.getItem('diskomlekau_callsign') || '';
+    return localStorage.getItem('diskomlekau_callsign') || 'GARUDA-1';
   });
 
+  // Autentikasi Passcode Operasional Harian (Disimpan di sessionStorage agar otomatis terhapus saat browser ditutup)
+  const [isPasscodeAuthenticated, setIsPasscodeAuthenticated] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem(TACTICAL_AUTH_SESSION_KEY) === PASSCODE_HARIAN;
+    } catch {
+      return false;
+    }
+  });
+  const isPasscodeAuthenticatedRef = useRef<boolean>(isPasscodeAuthenticated);
+  useEffect(() => {
+    isPasscodeAuthenticatedRef.current = isPasscodeAuthenticated;
+    if (isPasscodeAuthenticated) {
+      // Pre-derive and cache AES-256-GCM CryptoKey in RAM for <1ms real-time voice encryption
+      getOrDeriveTacticalAesKey(PASSCODE_HARIAN);
+    }
+  }, [isPasscodeAuthenticated]);
+
+  const [passcodeInput, setPasscodeInput] = useState<string>('');
+  const [passcodeError, setPasscodeError] = useState<string | null>(null);
+  const [e2eEncryptedTxCount, setE2eEncryptedTxCount] = useState<number>(0);
+  const [e2eDecryptedRxCount, setE2eDecryptedRxCount] = useState<number>(0);
+  const [lastAesIvPreview, setLastAesIvPreview] = useState<string>('AES-256-GCM SIAP');
+
   const [isSetupCompleted, setIsSetupCompleted] = useState<boolean>(() => {
-    return Boolean(localStorage.getItem('diskomlekau_callsign'));
+    try {
+      return (
+        sessionStorage.getItem(TACTICAL_AUTH_SESSION_KEY) === PASSCODE_HARIAN &&
+        Boolean(localStorage.getItem('diskomlekau_callsign'))
+      );
+    } catch {
+      return false;
+    }
   });
 
   const [setupCallsignInput, setSetupCallsignInput] = useState<string>(() => {
-    return localStorage.getItem('diskomlekau_callsign') || '';
+    return localStorage.getItem('diskomlekau_callsign') || 'GARUDA-1';
   });
 
   const [setupIpMode, setSetupIpMode] = useState<'192.168.43.1' | 'CLIENT'>(() => {
@@ -320,6 +369,11 @@ export default function App() {
     const saved = Number(localStorage.getItem('diskomlekau_vox_hold_ms'));
     return saved >= 500 && saved <= 3000 ? saved : 1100;
   });
+  // Penguatan Volume Penerima Suara (Web Audio API GainNode: default gain.value = 2.2)
+  const [rxGainBoost, setRxGainBoost] = useState<number>(() => {
+    const saved = Number(localStorage.getItem('diskomlekau_rx_gain'));
+    return saved >= 1.0 && saved <= 4.0 ? saved : 2.2;
+  });
   const [voxInputLevel, setVoxInputLevel] = useState<number>(0);
 
   const getVoxNoiseGateLabel = (thr: number) => {
@@ -377,6 +431,7 @@ export default function App() {
   const voxEnabledRef = useRef<boolean>(voxEnabled);
   const voxThresholdRef = useRef<number>(voxThreshold);
   const voxHoldMsRef = useRef<number>(voxHoldMs);
+  const rxGainBoostRef = useRef<number>(rxGainBoost);
   const lastVoiceActiveTimeRef = useRef<number>(0);
   const voxVoiceFramesRef = useRef<number>(0);
   const isVoxTriggeredTxRef = useRef<boolean>(false);
@@ -419,21 +474,23 @@ export default function App() {
     localStorage.setItem('diskomlekau_ip', localIp);
   }, [myCallsign, channel, role, localIp]);
 
-  // Persist VOX & Keep-Alive settings & sync refs
+  // Persist VOX, Keep-Alive & Receiver GainNode Boost settings & sync refs
   useEffect(() => {
     voxEnabledRef.current = voxEnabled;
     voxThresholdRef.current = voxThreshold;
     voxHoldMsRef.current = voxHoldMs;
     keepAliveEnabledRef.current = keepAliveEnabled;
+    rxGainBoostRef.current = rxGainBoost;
     try {
       localStorage.setItem('diskomlekau_vox_enabled', String(voxEnabled));
       localStorage.setItem('diskomlekau_vox_threshold', String(voxThreshold));
       localStorage.setItem('diskomlekau_vox_hold_ms', String(voxHoldMs));
       localStorage.setItem('diskomlekau_keepalive_enabled', String(keepAliveEnabled));
+      localStorage.setItem('diskomlekau_rx_gain', String(rxGainBoost));
     } catch {
       // Ignore storage error
     }
-  }, [voxEnabled, voxThreshold, voxHoldMs, keepAliveEnabled]);
+  }, [voxEnabled, voxThreshold, voxHoldMs, keepAliveEnabled, rxGainBoost]);
 
   // Persist tactical chat messages & auto-scroll to latest message
   useEffect(() => {
@@ -692,61 +749,78 @@ export default function App() {
         }
       };
 
-      // Fallback helper using Web Audio API decodeAudioData (crucial when iOS Safari or background screen-off blocks HTMLAudioElement)
-      const tryWebAudioDecodeFallback = async () => {
+      // Fallback helper using HTMLAudioElement routed through Web Audio API GainNode (gain.value = 2.2+)
+      const playViaHtmlAudioWithGainFallback = () => {
+        if (isTransmittingRef.current || isReceiverOffRef.current) {
+          releaseChannelLockAndRestoreVox();
+          return;
+        }
+        try {
+          if (!reusableRxAudioRef.current) {
+            const el = new Audio();
+            el.setAttribute('playsinline', 'true');
+            el.setAttribute('webkit-playsinline', 'true');
+            reusableRxAudioRef.current = el;
+          }
+          const audio = reusableRxAudioRef.current;
+          audio.pause();
+          audio.src = base64Data;
+          audio.muted = false;
+          audio.volume = 1.0;
+
+          const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+          if (ctx) {
+            audioCtxRef.current = ctx;
+            ensureHtmlAudioElementGainBooster(
+              ctx,
+              audio,
+              rxGainBoostRef.current || 2.2
+            );
+          }
+
+          activeAudioElementRef.current = audio;
+          audio.onended = handlePlaybackFinished;
+          audio.onerror = () => {
+            releaseChannelLockAndRestoreVox();
+          };
+
+          const playPromise = audio.play();
+          if (playPromise !== undefined) {
+            playPromise.catch(() => {
+              releaseChannelLockAndRestoreVox();
+            });
+          }
+        } catch {
+          releaseChannelLockAndRestoreVox();
+        }
+      };
+
+      // Primary Receiver Decoder: Web Audio API decodeAudioData -> Vocal Clarity EQ -> GainNode (gain.value = 2.2+) -> Limiter -> Destination
+      // Memastikan suara setelah dekripsi AES-GCM terdengar nyaring, jernih, dan penuh di semua perangkat!
+      (async () => {
         if (isTransmittingRef.current || isReceiverOffRef.current) {
           releaseChannelLockAndRestoreVox();
           return;
         }
         const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
         if (!ctx) {
-          releaseChannelLockAndRestoreVox();
+          playViaHtmlAudioWithGainFallback();
           return;
         }
         audioCtxRef.current = ctx;
         const handle = await playBase64AudioViaWebAudioFallback(
           ctx,
           base64Data,
-          handlePlaybackFinished
+          handlePlaybackFinished,
+          rxGainBoostRef.current || 2.2
         );
         if (handle) {
           activeWebAudioRxStopRef.current = handle.stop;
         } else {
-          releaseChannelLockAndRestoreVox();
+          // Jika format kontainer membutuhkan dekoder HTMLAudioElement, putar via HTMLAudioElement + Web Audio GainNode
+          playViaHtmlAudioWithGainFallback();
         }
-      };
-
-      // Primary path: Use pre-unlocked reusable HTMLAudioElement with playsinline for mobile Safari/Chrome/HarmonyOS
-      try {
-        if (!reusableRxAudioRef.current) {
-          const el = new Audio();
-          el.setAttribute('playsinline', 'true');
-          el.setAttribute('webkit-playsinline', 'true');
-          reusableRxAudioRef.current = el;
-        }
-        const audio = reusableRxAudioRef.current;
-        audio.pause();
-        audio.src = base64Data;
-        audio.muted = false;
-        audio.volume = 1.0; // Strict Half-Duplex: Max volume only when Receiver is ON
-        activeAudioElementRef.current = audio;
-
-        audio.onended = handlePlaybackFinished;
-        audio.onerror = () => {
-          // If HTMLAudioElement cannot decode format (e.g. WebM on Safari or MP4 on custom WebView), try Web Audio decodeAudioData
-          tryWebAudioDecodeFallback();
-        };
-
-        const playPromise = audio.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(() => {
-            // If mobile autoplay policy or background lockscreen blocked HTML5 <audio>, play directly via Web Audio API!
-            tryWebAudioDecodeFallback();
-          });
-        }
-      } catch {
-        tryWebAudioDecodeFallback();
-      }
+      })();
     },
     [soundEnabled, playTacticalTone]
   );
@@ -1435,7 +1509,10 @@ export default function App() {
             }
           }, 620);
         }
-      } else if (pkt.type === 'VOICE_CLIP' && pkt.audioBase64) {
+      } else if (
+        pkt.type === 'VOICE_CLIP' &&
+        (pkt.encryptedAudio || pkt.audioBase64)
+      ) {
         // 1. STRICT ANTI-ECHO: While local PTT/VOX is open (Receiver OFF), drop incoming voice playback completely
         if (isTransmittingRef.current || isReceiverOffRef.current) {
           return;
@@ -1449,7 +1526,23 @@ export default function App() {
         ) {
           return;
         }
-        playIncomingAudioBase64(pkt.audioBase64, pkt.callsign, pkt.senderId);
+
+        // 3. REAL-TIME END-TO-END AES-256-GCM DECRYPTION (Web Crypto API crypto.subtle.decrypt)
+        if (pkt.encryptedAudio && pkt.audioCiphertext && pkt.aesIv) {
+          decryptAudioPayloadAesGcm(
+            pkt.audioCiphertext,
+            pkt.aesIv,
+            PASSCODE_HARIAN
+          ).then((decryptedBase64) => {
+            if (!decryptedBase64) return;
+            if (isTransmittingRef.current || isReceiverOffRef.current) return;
+            setE2eDecryptedRxCount((c) => c + 1);
+            setLastAesIvPreview(`RX-GCM IV:${pkt.aesIv?.slice(0, 8)}…`);
+            playIncomingAudioBase64(decryptedBase64, pkt.callsign, pkt.senderId);
+          });
+        } else if (pkt.audioBase64) {
+          playIncomingAudioBase64(pkt.audioBase64, pkt.callsign, pkt.senderId);
+        }
       } else if (pkt.type === 'CHAT_MSG' && pkt.chatText) {
         const newMsg: TacticalChatMessage = {
           id: pkt.packetId || `${pkt.senderId}-${pkt.timestamp}`,
@@ -1505,7 +1598,7 @@ export default function App() {
   const announcePacketBuilderRef = useRef<() => MeshPacket | null>(() => null);
   useEffect(() => {
     announcePacketBuilderRef.current = () => {
-      if (!myCallsign) return null;
+      if (!myCallsign || !isPasscodeAuthenticated) return null;
       return {
         packetId: `${myDeviceId}-${Date.now()}-ann`,
         type: 'ANNOUNCE',
@@ -1518,14 +1611,12 @@ export default function App() {
         peerNodeId: myPeerNodeId,
       };
     };
-  }, [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]);
+  }, [myDeviceId, myCallsign, isPasscodeAuthenticated, localIp, role, channel, myPeerNodeId]);
 
   // Hybrid Cloud + Offline Hotspot LAN Signaling Engine + Auto-Reconnect Watchdog (2.5s):
-  // 1. Offline Hotspot Direct WebRTC Offer/Answer (iceServers: [] — 0% internet required)
-  // 2. Auto-Probe Local Hotspot WebSocket Hub (ws://192.168.43.1:50002 & ws://[subnet].1:50002 — 0% internet required)
-  // 3. PeerJS WebRTC P2P (`PTT-MASTER-01` & `PTT-CLIENT-[CALLSIGN]-[ID]`) + Dual WSS Cloud Mesh
+  // Wajib terautentikasi Passcode Operasional ("DISKOMLEKAU") sebelum WebSocket/WebRTC diizinkan aktif!
   useEffect(() => {
-    if (!isSetupCompleted || !myCallsign) return;
+    if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
 
     let isCancelled = false;
 
@@ -1842,6 +1933,7 @@ export default function App() {
       mqttClientsRef.current = [];
     };
   }, [
+    isPasscodeAuthenticated,
     isSetupCompleted,
     myCallsign,
     myDeviceId,
@@ -1880,9 +1972,10 @@ export default function App() {
 
   // Initialize Web Audio API Graph (AudioContext -> MediaStreamSource -> Vocal Bandpass Filter -> AnalyserNode)
   // Compatible with Safari (iOS), Chrome (Android), and HarmonyOS, with multi-tier getUserMedia fallbacks
-  // Never connected to ctx.destination so microphone never leaks to local speaker!
+  // Blocked until Passcode Operasional Harian is authenticated!
   const ensureWebAudioVoxGraph = useCallback(
     async (forceRebuild = false): Promise<AnalyserNode | null> => {
+      if (!isPasscodeAuthenticatedRef.current) return null;
       try {
         // Check if existing MediaStream was ended by OS (e.g. iOS background interrupt or TWS headset switch)
         if (mediaStreamRef.current) {
@@ -2061,7 +2154,11 @@ export default function App() {
     const handleDeviceChange = () => {
       if (isUnmounted) return;
       // Rebuild microphone stream if user connects/disconnects TWS earbuds or wired headset
-      if (isSetupCompleted && (voxEnabledRef.current || isTransmittingRef.current)) {
+      if (
+        isPasscodeAuthenticatedRef.current &&
+        isSetupCompleted &&
+        (voxEnabledRef.current || isTransmittingRef.current)
+      ) {
         ensureWebAudioVoxGraph(true);
       }
     };
@@ -2087,13 +2184,13 @@ export default function App() {
         navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
       }
     };
-  }, [isSetupCompleted, ensureWebAudioVoxGraph]);
+  }, [isPasscodeAuthenticated, isSetupCompleted, ensureWebAudioVoxGraph]);
 
   // SISTEM KEEP-ALIVE LATAR BELAKANG (SILENT AUDIO STREAM VIA WEB AUDIO API PADA VISIBILITYCHANGE EVENT)
   // Mencegah browser Android (Chrome/HarmonyOS) & iOS (Safari) membekukan aliran WebSocket, VOX,
   // dan pemutaran suara masuk saat layar HP dimatikan atau dimasukkan ke dalam saku saat berkendara.
   useEffect(() => {
-    if (!isSetupCompleted || !myCallsign) return;
+    if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
 
     if (!keepAliveSessionRef.current) {
       keepAliveSessionRef.current = createSilentKeepAliveController();
@@ -2194,6 +2291,7 @@ export default function App() {
       window.removeEventListener('focus', handleVisibilityChange);
     };
   }, [
+    isPasscodeAuthenticated,
     isSetupCompleted,
     myCallsign,
     keepAliveEnabled,
@@ -2201,7 +2299,7 @@ export default function App() {
     ensureWebAudioVoxGraph,
   ]);
 
-  // Helper untuk mengirim Blob rekaman suara (baik dari MediaRecorder maupun fallback WAV) ke jaringan
+  // Helper untuk mengenkripsi (AES-256-GCM via Web Crypto API) & mengirim Blob rekaman suara ke jaringan
   const dispatchRecordedVoiceBlob = useCallback(
     (blob: Blob) => {
       // Keep mic enabled ONLY if VOX is active and no incoming speaker is playing; otherwise disable track
@@ -2223,17 +2321,40 @@ export default function App() {
 
       if (blob.size > 200) {
         const reader = new FileReader();
-        reader.onloadend = () => {
+        reader.onloadend = async () => {
           const base64Audio = reader.result as string;
           if (base64Audio) {
-            broadcastMeshPacket({
-              type: 'VOICE_CLIP',
-              audioBase64: base64Audio,
-              mimeType: blob.type || 'audio/wav',
-              lockOwnerId: myDeviceId,
-              lockOwnerCallsign: myCallsign,
-              lockStartedAt: localTxStartedAtRef.current,
-            });
+            // ENKRIPSI AUDIO END-TO-END (AES-256-GCM via window.crypto.subtle) SEBELUM DIKIRIM MELALUI WEBSOCKET/WEBRTC
+            const encrypted = await encryptAudioPayloadAesGcm(
+              base64Audio,
+              PASSCODE_HARIAN
+            );
+
+            if (encrypted) {
+              setE2eEncryptedTxCount((c) => c + 1);
+              setLastAesIvPreview(encrypted.ivBase64.slice(0, 8));
+              broadcastMeshPacket({
+                type: 'VOICE_CLIP',
+                encryptedAudio: true,
+                audioCiphertext: encrypted.ciphertextBase64,
+                aesIv: encrypted.ivBase64,
+                cipherAlgo: 'AES-256-GCM',
+                mimeType: blob.type || 'audio/wav',
+                lockOwnerId: myDeviceId,
+                lockOwnerCallsign: myCallsign,
+                lockStartedAt: localTxStartedAtRef.current,
+              });
+            } else {
+              // Fallback hanya jika environment tidak mendukung SubtleCrypto
+              broadcastMeshPacket({
+                type: 'VOICE_CLIP',
+                audioBase64: base64Audio,
+                mimeType: blob.type || 'audio/wav',
+                lockOwnerId: myDeviceId,
+                lockOwnerCallsign: myCallsign,
+                lockStartedAt: localTxStartedAtRef.current,
+              });
+            }
 
             // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
             if (
@@ -2566,7 +2687,7 @@ export default function App() {
 
   // MESIN UTAMA VOX (VOICE ACTIVITY DETECTION) BERBASIS WEB AUDIO API (OTOMATIS TANPA TOMBOL / TWS)
   useEffect(() => {
-    if (!isSetupCompleted || !myCallsign) return;
+    if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
 
     let isCancelled = false;
     let voxTimer: number | null = null;
@@ -2735,6 +2856,7 @@ export default function App() {
       window.removeEventListener('keydown', unlockAudioOnInteraction);
     };
   }, [
+    isPasscodeAuthenticated,
     isSetupCompleted,
     myCallsign,
     myDeviceId,
@@ -2774,19 +2896,230 @@ export default function App() {
 
   // Constant 1-second ANNOUNCE broadcast once connected (mirrors Flutter Timer.periodic 1s)
   useEffect(() => {
-    if (!isSetupCompleted || !myCallsign) return;
+    if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
     broadcastMeshPacket({ type: 'ANNOUNCE' });
     const interval = window.setInterval(() => {
       broadcastMeshPacket({ type: 'ANNOUNCE' });
     }, 1000);
     return () => window.clearInterval(interval);
-  }, [isSetupCompleted, myCallsign, broadcastMeshPacket]);
+  }, [isPasscodeAuthenticated, isSetupCompleted, myCallsign, broadcastMeshPacket]);
 
+  // TOMBOL EMERGENCY CLEAR (PEMBERSIHAN DARURAT MILITER)
+  // Memutuskan koneksi WebSocket/WebRTC/MQTT secara instan, menghentikan seluruh stream mikrofon (MediaStreamTrack.stop()),
+  // menghapus cache penyimpanan lokal (sessionStorage, localStorage, Cache API, CryptoKey RAM), dan me-reset ke halaman login awal.
+  const handleEmergencyClear = useCallback(async () => {
+    // 1. Hentikan transmisi aktif & bungkam receiver secara instan
+    forceStopLocalRecording(true);
+    muteAndDisableReceiver();
+    isTransmittingRef.current = false;
+    isVoxTriggeredTxRef.current = false;
+    setIsTransmitting(false);
+    setVoxInputLevel(0);
+
+    // 2. Hentikan seluruh MediaStreamTrack mikrofon (MediaStreamTrack.stop()) & kamera scanner
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.enabled = false;
+          track.stop();
+        } catch {
+          // Ignore
+        }
+      });
+      mediaStreamRef.current = null;
+    }
+    try {
+      micSourceRef.current?.disconnect();
+    } catch {
+      // Ignore
+    }
+    micSourceRef.current = null;
+    micFilterRef.current = null;
+    micAnalyserRef.current = null;
+
+    if (scannerStreamRef.current) {
+      scannerStreamRef.current.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // Ignore
+        }
+      });
+      scannerStreamRef.current = null;
+    }
+
+    // 3. Hentikan Keep-Alive Silent Audio Stream & tutup AudioContext
+    if (keepAliveSessionRef.current) {
+      keepAliveSessionRef.current.stop();
+      setIsSilentKeepAliveRunning(false);
+    }
+    if (audioCtxRef.current) {
+      try {
+        await audioCtxRef.current.close();
+      } catch {
+        // Ignore
+      }
+      audioCtxRef.current = null;
+    }
+
+    // 4. Putuskan koneksi WebSocket, MQTT, PeerJS, dan WebRTC DataChannel secara instan
+    try {
+      broadcastMeshPacket({ type: 'PEER_LEAVE' });
+    } catch {
+      // Ignore
+    }
+
+    if (localHotspotWsRef.current) {
+      try {
+        localHotspotWsRef.current.onclose = null;
+        localHotspotWsRef.current.close(1000, 'EMERGENCY_CLEAR');
+      } catch {
+        // Ignore
+      }
+      localHotspotWsRef.current = null;
+    }
+
+    mqttClientsRef.current.forEach((client) => {
+      try {
+        client.end(true);
+      } catch {
+        // Ignore
+      }
+    });
+    mqttClientsRef.current = [];
+
+    peerConnectionsRef.current.forEach((conn) => {
+      try {
+        conn.close();
+      } catch {
+        // Ignore
+      }
+    });
+    peerConnectionsRef.current.clear();
+
+    offlineRtcChannelsRef.current.forEach((dc) => {
+      try {
+        dc.close();
+      } catch {
+        // Ignore
+      }
+    });
+    offlineRtcChannelsRef.current.clear();
+
+    offlineMasterPcSlotsRef.current.forEach((pc) => {
+      try {
+        pc.close();
+      } catch {
+        // Ignore
+      }
+    });
+    offlineMasterPcSlotsRef.current.clear();
+
+    if (offlineClientPcRef.current) {
+      try {
+        offlineClientPcRef.current.close();
+      } catch {
+        // Ignore
+      }
+      offlineClientPcRef.current = null;
+    }
+
+    if (peerRef.current) {
+      try {
+        peerRef.current.destroy();
+      } catch {
+        // Ignore
+      }
+      peerRef.current = null;
+    }
+
+    if (directNodePeerRef.current) {
+      try {
+        directNodePeerRef.current.destroy();
+      } catch {
+        // Ignore
+      }
+      directNodePeerRef.current = null;
+    }
+
+    if (broadcastChannelRef.current) {
+      try {
+        broadcastChannelRef.current.close();
+      } catch {
+        // Ignore
+      }
+      broadcastChannelRef.current = null;
+    }
+
+    // 5. Hapus kunci AES-GCM di RAM serta bersihkan sessionStorage, localStorage, dan Cache Storage browser
+    purgeTacticalCryptoKeyCache();
+    try {
+      sessionStorage.clear();
+    } catch {
+      // Ignore
+    }
+    try {
+      localStorage.clear();
+    } catch {
+      // Ignore
+    }
+    try {
+      if (typeof window !== 'undefined' && 'caches' in window) {
+        const cacheKeys = await window.caches.keys();
+        await Promise.all(cacheKeys.map((k) => window.caches.delete(k)));
+      }
+    } catch {
+      // Ignore
+    }
+
+    // 6. Reset seluruh state aplikasi kembali ke halaman Login Passcode awal
+    isPasscodeAuthenticatedRef.current = false;
+    setIsPasscodeAuthenticated(false);
+    setIsSetupCompleted(false);
+    setPasscodeInput('');
+    setPasscodeError(null);
+    setMyCallsign('');
+    setSetupCallsignInput('');
+    setMembers([]);
+    membersRef.current = [];
+    setChatMessages([]);
+    seenPacketIdsRef.current.clear();
+    channelLockOwnerRef.current = null;
+    setChannelLockOwner(null);
+    remoteActiveTxRef.current = null;
+    setIncomingSpeaker(null);
+    setActiveBottomModal(null);
+    setIsSetupScannerOpen(false);
+    setE2eEncryptedTxCount(0);
+    setE2eDecryptedRxCount(0);
+    setLastAesIvPreview('');
+  }, [forceStopLocalRecording, muteAndDisableReceiver, broadcastMeshPacket]);
 
   const handleSetupConnect = async (e: React.FormEvent) => {
     e.preventDefault();
+    const enteredPasscode = passcodeInput.trim().toUpperCase();
+    if (!isPasscodeAuthenticated && enteredPasscode !== PASSCODE_HARIAN) {
+      setPasscodeError(
+        'PASSCODE OPERASIONAL DITOLAK! Masukkan Passcode Harian resmi untuk membuka akses PTT & Enkripsi.'
+      );
+      return;
+    }
+
     const cleaned = setupCallsignInput.trim().toUpperCase();
     if (!cleaned) return;
+
+    // Simpan status autentikasi di sessionStorage (otomatis terhapus saat browser ditutup)
+    try {
+      sessionStorage.setItem(TACTICAL_AUTH_SESSION_KEY, PASSCODE_HARIAN);
+    } catch {
+      // Ignore storage quota errors
+    }
+    setPasscodeError(null);
+    isPasscodeAuthenticatedRef.current = true;
+    setIsPasscodeAuthenticated(true);
+
+    // Pre-derive kunci kriptografi AES-256-GCM di Web Crypto API agar enkripsi/dekripsi real-time < 1ms
+    await getOrDeriveTacticalAesKey(PASSCODE_HARIAN);
 
     // Pre-warm microphone permission & Web Audio API VOX graph on user gesture
     await ensureWebAudioVoxGraph();
@@ -3513,77 +3846,71 @@ export default function App() {
     : 'KLIK PERTAMA • BUKA PTT';
   const curvedChars = curvedTitle.split('');
 
-  // 1. LAYAR SETUP AWAL (SetupScreen - KONEK NAMA + SCAN BARCODE LANGSUNG)
-  if (!isSetupCompleted) {
+  // 1. LAYAR LOGIN AUTENTIKASI PASSCODE OPERASIONAL & SETUP AWAL
+  if (!isPasscodeAuthenticated || !isSetupCompleted) {
     return (
-      <div className="min-h-[100dvh] w-full tactical-grid-bg text-[#e5faff] flex items-center justify-center p-5 select-none">
-        <div className="w-full max-w-[420px] tactical-panel rounded-3xl p-6 space-y-4 shadow-[0_0_50px_rgba(35,220,255,0.22)]">
-          <div className="flex flex-col items-center text-center space-y-2">
-            <div className="w-16 h-16 rounded-full bg-[#03192e] border-2 border-[#23dcff] shadow-[0_0_20px_rgba(35,220,255,0.35)] flex items-center justify-center">
-              <Radio className="w-8 h-8 text-[#23dcff]" />
+      <div className="min-h-[100dvh] w-full tactical-grid-bg text-[#e5faff] flex items-center justify-center p-4 select-none">
+        <div className="w-full max-w-[420px] tactical-panel rounded-3xl p-5 space-y-3.5 shadow-[0_0_50px_rgba(35,220,255,0.22)]">
+          <div className="flex flex-col items-center text-center space-y-1.5">
+            <div className="w-14 h-14 rounded-full bg-[#03192e] border-2 border-[#23dcff] shadow-[0_0_20px_rgba(35,220,255,0.35)] flex items-center justify-center relative">
+              <Radio className="w-7 h-7 text-[#23dcff]" />
+              <div className="absolute -bottom-1 -right-1 w-6 h-6 rounded-full bg-[#06385c] border border-[#23dcff] flex items-center justify-center">
+                <Lock className="w-3.5 h-3.5 text-[#23dcff]" />
+              </div>
             </div>
-            <h1 className="font-tactical text-[24px] font-extrabold tracking-wider text-white cyan-glow-text leading-tight">
+            <h1 className="font-tactical text-[22px] font-extrabold tracking-wider text-white cyan-glow-text leading-tight">
               TACTICAL NET-COMM SUBDISRUDAL
             </h1>
-            <p className="font-telemetry text-[11px] text-cyan-200/90 tracking-wide">
-              REGISTRASI IDENTITAS JARINGAN HOTSPOT LAN
-            </p>
+            <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#04233d] border border-[#23dcff]/60 font-telemetry text-[10px] text-[#23dcff] font-bold">
+              <Shield className="w-3 h-3" />
+              <span>MODUL KEAMANAN MILITER • AES-256-GCM E2EE</span>
+            </div>
             {urlInviteParams.isInvite && (
-              <div className="w-full mt-1 px-3 py-2 rounded-xl bg-[#07375c] border border-[#23dcff] text-xs font-telemetry text-white font-bold">
+              <div className="w-full mt-1 px-3 py-1.5 rounded-xl bg-[#07375c] border border-[#23dcff] text-xs font-telemetry text-white font-bold">
                 TERHUBUNG BARCODE MASTER: {invitedHostCallsign} • CHANNEL{' '}
                 {String(channel).padStart(2, '0')}
               </div>
             )}
           </div>
 
-          {/* Tombol Buka In-App Scanner di SetupScreen agar tidak pernah "Page Not Found" */}
-          <div>
-            <button
-              type="button"
-              onClick={() => setIsSetupScannerOpen((prev) => !prev)}
-              className="w-full py-2.5 px-3 rounded-xl bg-[#052946] hover:bg-[#093b63] border border-[#23dcff] text-white font-telemetry text-xs font-bold flex items-center justify-center gap-2 cursor-pointer"
-            >
-              <Camera className="w-4 h-4 text-[#23dcff]" />
-              <span>
-                {isSetupScannerOpen
-                  ? 'TUTUP KAMERA SCANNER BARCODE'
-                  : 'SCAN BARCODE DARI HP MASTER (TANPA BROWSER)'}
-              </span>
-            </button>
-
-            {isSetupScannerOpen && (
-              <div className="mt-2.5 p-3 rounded-2xl bg-[#021526] border border-[#23dcff] space-y-2.5 text-center">
-                <div className="relative w-full aspect-square max-w-[230px] mx-auto rounded-xl overflow-hidden bg-black border-2 border-[#23dcff]">
-                  <video
-                    ref={scannerVideoRef}
-                    className="w-full h-full object-cover"
-                    muted
-                    playsInline
-                  />
-                  <canvas ref={scannerCanvasRef} className="hidden" />
-                  <div className="absolute inset-5 border-2 border-dashed border-[#23dcff]/80 rounded-xl pointer-events-none" />
-                </div>
-                {scannerError && (
-                  <p className="font-telemetry text-[10.5px] text-amber-300">{scannerError}</p>
-                )}
-                <label className="w-full py-2 px-3 rounded-xl bg-[#07375c] hover:bg-[#0b4b7a] border border-cyan-400/60 text-white font-telemetry text-[11px] font-bold flex items-center justify-center gap-1.5 cursor-pointer">
-                  <Upload className="w-3.5 h-3.5 text-[#23dcff]" />
-                  <span>Ambil Foto / Pilih Gambar Barcode</span>
-                  <input
-                    type="file"
-                    accept="image/*"
-                    capture="environment"
-                    onChange={handleScanQrImageFile}
-                    className="hidden"
-                  />
+          <form onSubmit={handleSetupConnect} className="space-y-3">
+            {/* INPUT PASSCODE OPERASIONAL HARIAN (WAJIB SEBELUM AKSES PTT / WEB AUDIO / WEBSOCKET) */}
+            <div className="p-3 rounded-2xl bg-[#021526]/95 border-2 border-[#23dcff]/80 space-y-1.5 shadow-[inset_0_0_16px_rgba(35,220,255,0.12)]">
+              <div className="flex items-center justify-between">
+                <label className="font-telemetry text-[11px] font-extrabold text-[#23dcff] flex items-center gap-1.5">
+                  <KeyRound className="w-3.5 h-3.5" />
+                  <span>PASSCODE OPERASIONAL HARIAN:</span>
                 </label>
+                <span className="font-telemetry text-[9.5px] px-1.5 py-0.5 rounded bg-[#063354] text-cyan-200 border border-cyan-400/40">
+                  {isPasscodeAuthenticated ? 'TERVERIFIKASI' : 'WAJIB LOGIN'}
+                </span>
               </div>
-            )}
-          </div>
+              <input
+                type="password"
+                required={!isPasscodeAuthenticated}
+                value={isPasscodeAuthenticated ? PASSCODE_HARIAN : passcodeInput}
+                onChange={(e) => {
+                  setPasscodeInput(e.target.value);
+                  if (passcodeError) setPasscodeError(null);
+                }}
+                placeholder="MASUKKAN SANDI HARIAN..."
+                autoComplete="off"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-[#010d18] border border-[#23dcff] text-white font-telemetry text-sm font-extrabold uppercase tracking-[0.2em] focus:outline-none focus:ring-2 focus:ring-[#23dcff]"
+              />
+              {passcodeError ? (
+                <div className="px-2.5 py-1.5 rounded-lg bg-red-950/90 border border-red-400 text-red-200 font-telemetry text-[10.5px] font-bold flex items-center gap-1.5">
+                  <ShieldAlert className="w-4 h-4 text-red-400 shrink-0" />
+                  <span>{passcodeError}</span>
+                </div>
+              ) : (
+                <p className="font-telemetry text-[9.5px] text-cyan-200/80 leading-tight">
+                  Disimpan di <strong className="text-white">sessionStorage</strong> & digunakan menurunkan kunci enkripsi suara <strong className="text-[#23dcff]">AES-256-GCM</strong>.
+                </p>
+              )}
+            </div>
 
-          <form onSubmit={handleSetupConnect} className="space-y-4">
             <div>
-              <label className="block font-telemetry text-xs font-bold text-cyan-100 mb-1.5">
+              <label className="block font-telemetry text-xs font-bold text-cyan-100 mb-1">
                 MASUKKAN NAMA / CALLSIGN ANDA:
               </label>
               <input
@@ -3593,20 +3920,64 @@ export default function App() {
                 value={setupCallsignInput}
                 onChange={(e) => setSetupCallsignInput(e.target.value)}
                 placeholder="CONTOH: YUDHI / GARUDA-1"
-                autoFocus
-                className="w-full px-4 py-3 rounded-xl bg-[#021526] border-2 border-[#23dcff]/70 focus:border-[#23dcff] text-white font-telemetry text-base font-extrabold uppercase tracking-wider focus:outline-none"
+                className="w-full px-3.5 py-2.5 rounded-xl bg-[#021526] border-2 border-[#23dcff]/70 focus:border-[#23dcff] text-white font-telemetry text-sm font-extrabold uppercase tracking-wider focus:outline-none"
               />
             </div>
 
+            {/* Tombol Buka In-App Scanner di SetupScreen */}
             <div>
-              <label className="block font-telemetry text-[11px] font-bold text-cyan-200/90 mb-1.5">
+              <button
+                type="button"
+                onClick={() => setIsSetupScannerOpen((prev) => !prev)}
+                className="w-full py-2 px-3 rounded-xl bg-[#052946] hover:bg-[#093b63] border border-[#23dcff] text-white font-telemetry text-[11px] font-bold flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Camera className="w-4 h-4 text-[#23dcff]" />
+                <span>
+                  {isSetupScannerOpen
+                    ? 'TUTUP KAMERA SCANNER BARCODE'
+                    : 'SCAN BARCODE DARI HP MASTER (TANPA BROWSER)'}
+                </span>
+              </button>
+
+              {isSetupScannerOpen && (
+                <div className="mt-2 p-2.5 rounded-2xl bg-[#021526] border border-[#23dcff] space-y-2 text-center">
+                  <div className="relative w-full aspect-square max-w-[200px] mx-auto rounded-xl overflow-hidden bg-black border-2 border-[#23dcff]">
+                    <video
+                      ref={scannerVideoRef}
+                      className="w-full h-full object-cover"
+                      muted
+                      playsInline
+                    />
+                    <canvas ref={scannerCanvasRef} className="hidden" />
+                    <div className="absolute inset-5 border-2 border-dashed border-[#23dcff]/80 rounded-xl pointer-events-none" />
+                  </div>
+                  {scannerError && (
+                    <p className="font-telemetry text-[10px] text-amber-300">{scannerError}</p>
+                  )}
+                  <label className="w-full py-1.5 px-3 rounded-xl bg-[#07375c] hover:bg-[#0b4b7a] border border-cyan-400/60 text-white font-telemetry text-[10.5px] font-bold flex items-center justify-center gap-1.5 cursor-pointer">
+                    <Upload className="w-3.5 h-3.5 text-[#23dcff]" />
+                    <span>Ambil Foto / Pilih Gambar Barcode</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      onChange={handleScanQrImageFile}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <label className="block font-telemetry text-[10.5px] font-bold text-cyan-200/90 mb-1">
                 PILIH PERAN JARINGAN (CLOUD HANDSHAKE PEERJS):
               </label>
               <div className="grid grid-cols-2 gap-2 font-telemetry text-xs">
                 <button
                   type="button"
                   onClick={() => setSetupIpMode('192.168.43.1')}
-                  className={`py-2.5 px-3 rounded-xl border font-bold text-left transition-all cursor-pointer ${
+                  className={`py-2 px-3 rounded-xl border font-bold text-left transition-all cursor-pointer ${
                     setupIpMode === '192.168.43.1'
                       ? 'bg-[#093b61] border-[#23dcff] text-white shadow-[0_0_12px_rgba(35,220,255,0.3)]'
                       : 'bg-[#021526] border-cyan-500/30 text-cyan-200/70'
@@ -3618,7 +3989,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setSetupIpMode('CLIENT')}
-                  className={`py-2.5 px-3 rounded-xl border font-bold text-left transition-all cursor-pointer ${
+                  className={`py-2 px-3 rounded-xl border font-bold text-left transition-all cursor-pointer ${
                     setupIpMode === 'CLIENT'
                       ? 'bg-[#093b61] border-[#23dcff] text-white shadow-[0_0_12px_rgba(35,220,255,0.3)]'
                       : 'bg-[#021526] border-cyan-500/30 text-cyan-200/70'
@@ -3632,10 +4003,10 @@ export default function App() {
 
             <button
               type="submit"
-              className="w-full py-3.5 rounded-xl cyan-btn-glow text-[#02182b] font-tactical text-lg font-extrabold tracking-wider flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full py-3 rounded-xl cyan-btn-glow text-[#02182b] font-tactical text-base font-extrabold tracking-wider flex items-center justify-center gap-2 cursor-pointer"
             >
-              <Wifi className="w-5 h-5" />
-              <span>KONEK JARINGAN</span>
+              <Lock className="w-4 h-4" />
+              <span>OTORISASI & KONEK JARINGAN</span>
             </button>
           </form>
         </div>
@@ -3652,12 +4023,16 @@ export default function App() {
             : 'max-w-[460px] sm:border-x-2 sm:border-[#23dcff]/45 sm:shadow-[0_0_60px_rgba(0,195,255,0.25)]'
         }`}
       >
-        {/* TOP TELEMETRY STATUS STRIP */}
-        <header className="px-3 py-1 flex items-center justify-between text-[10px] font-telemetry text-cyan-100/95 border-b border-cyan-400/15 bg-[#03192e]/70 backdrop-blur-xs shrink-0">
+        {/* TOP TELEMETRY STATUS STRIP + AES-256-GCM E2EE BADGE */}
+        <header className="px-2.5 py-1 flex items-center justify-between text-[9.5px] font-telemetry text-cyan-100/95 border-b border-cyan-400/15 bg-[#03192e]/70 backdrop-blur-xs shrink-0">
           <div className="flex items-center gap-1.5 truncate">
-            <Wifi className="w-3 h-3 text-[#23dcff] shrink-0" />
-            <span className="tracking-tight truncate">
-              VERCEL CLOUD MESH • UDP LAN HOTSPOT
+            <Lock className="w-3 h-3 text-[#23dcff] shrink-0" />
+            <span className="tracking-tight font-bold text-[#23dcff] truncate">
+              AES-256-GCM E2EE
+            </span>
+            <span className="text-cyan-400/50">•</span>
+            <span className="text-cyan-100/90 truncate">
+              TX:{e2eEncryptedTxCount} RX:{e2eDecryptedRxCount}
             </span>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
@@ -3667,7 +4042,7 @@ export default function App() {
             <button
               onClick={handleToggleFullScreen}
               title="Layar Penuh HP (Fullscreen)"
-              className="px-1.5 py-0.5 rounded border border-cyan-400/60 text-[9.5px] font-bold text-cyan-100 bg-cyan-950/80 hover:bg-[#23dcff] hover:text-[#02182b] transition-colors flex items-center gap-1 cursor-pointer"
+              className="px-1.5 py-0.5 rounded border border-cyan-400/60 text-[9px] font-bold text-cyan-100 bg-cyan-950/80 hover:bg-[#23dcff] hover:text-[#02182b] transition-colors flex items-center gap-1 cursor-pointer"
             >
               {isFullScreen ? (
                 <Minimize2 className="w-2.5 h-2.5" />
@@ -3741,11 +4116,16 @@ export default function App() {
               </div>
             </div>
 
-            {/* Teks Informasi Peran Permanen & Peer Aktif */}
-            <div className="flex items-center justify-between font-telemetry text-[10.5px] text-white/95 border-t border-cyan-400/25 pt-1">
+            {/* Teks Informasi Peran Permanen, Status AES-GCM & Peer Aktif */}
+            <div className="flex items-center justify-between font-telemetry text-[10px] text-white/95 border-t border-cyan-400/25 pt-1">
               <div className="truncate">
                 <span className="font-semibold">PERAN: {permanentRoleLabel}</span>{' '}
                 <span className="text-cyan-200">({detectedLanIpRef.current || localIp})</span>
+                {lastAesIvPreview && (
+                  <span className="ml-1.5 text-[#23dcff] font-bold">
+                    • IV:{lastAesIvPreview}
+                  </span>
+                )}
               </div>
               <div className="shrink-0">
                 Peer: <strong className="text-white">{activeChannelPeers.length}</strong> • Target:{' '}
@@ -3802,8 +4182,8 @@ export default function App() {
 
           {/* 4. GRID USER / ANGGOTA (REAL PEERS ONLY - MAXIMIZED) */}
           <section className="space-y-1.5 shrink-0">
-            {/* Baris Atas: Tombol TALK ALL, ID SAYA: [CALLSIGN], dan Edit Nama */}
-            <div className="flex items-center gap-2">
+            {/* Baris Atas: Tombol TALK ALL, ID SAYA: [CALLSIGN], Edit Nama & TOMBOL EMERGENCY CLEAR */}
+            <div className="flex items-center gap-1.5">
               <button
                 onClick={() => {
                   const next = !talkAll;
@@ -3812,29 +4192,40 @@ export default function App() {
                     setMembers((prev) => prev.map((m) => ({ ...m, isTargeted: true })));
                   }
                 }}
-                className={`px-3.5 py-1.5 rounded-full font-tactical text-[14px] font-bold tracking-wider flex items-center gap-1.5 transition-all shrink-0 cursor-pointer ${
+                className={`px-3 py-1.5 rounded-full font-tactical text-[13px] font-bold tracking-wider flex items-center gap-1 transition-all shrink-0 cursor-pointer ${
                   talkAll
                     ? 'cyan-btn-glow text-white border border-white/50'
                     : 'bg-[#052542] text-cyan-200 border border-cyan-400/50'
                 }`}
               >
-                <Radio className="w-4 h-4" />
+                <Radio className="w-3.5 h-3.5" />
                 <span>TALK ALL</span>
               </button>
 
-              <div className="flex-1 tactical-panel rounded-full px-3.5 py-1.5 flex items-center justify-between gap-2">
-                <div className="font-telemetry text-[11px] truncate">
-                  <span className="text-cyan-200/90">ID SAYA: </span>
+              <div className="flex-1 min-w-0 tactical-panel rounded-full px-3 py-1.5 flex items-center justify-between gap-1.5">
+                <div className="font-telemetry text-[10.5px] truncate">
+                  <span className="text-cyan-200/90">ID: </span>
                   <strong className="text-white font-bold">{myCallsign}</strong>
                 </div>
                 <button
                   onClick={() => openEditNameModal()}
-                  className="px-2.5 py-0.5 rounded-full bg-[#041d34] hover:bg-[#083156] border border-cyan-400/50 flex items-center gap-1 text-[10.5px] font-medium text-cyan-100 shrink-0 cursor-pointer"
+                  className="px-2 py-0.5 rounded-full bg-[#041d34] hover:bg-[#083156] border border-cyan-400/50 flex items-center gap-1 text-[10px] font-medium text-cyan-100 shrink-0 cursor-pointer"
                 >
-                  <Pencil className="w-3 h-3 text-[#23dcff]" />
+                  <Pencil className="w-2.5 h-2.5 text-[#23dcff]" />
                   <span>Edit</span>
                 </button>
               </div>
+
+              {/* TOMBOL KHUSUS EMERGENCY CLEAR (PEMBERSIHAN DARURAT) */}
+              <button
+                type="button"
+                onClick={handleEmergencyClear}
+                title="EMERGENCY CLEAR: Putuskan WebSocket, Matikan Mikrofon, Hapus Cache & Reset ke Login"
+                className="px-2.5 py-1.5 rounded-full bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 border border-red-300/80 shadow-[0_0_14px_rgba(239,68,68,0.55)] text-white font-tactical text-[11px] font-extrabold tracking-wider flex items-center gap-1 shrink-0 active:scale-95 transition-all cursor-pointer"
+              >
+                <ShieldAlert className="w-3.5 h-3.5 text-white shrink-0" />
+                <span>EMERGENCY CLEAR</span>
+              </button>
             </div>
 
             {/* Baris Tengah: Panel Sakelar VOX (VOX On/Off Switch), Keep-Alive Saku/Layar Mati & Pengatur Sensitivitas (Threshold Slider Anti-Bising/Angin) */}
@@ -3912,6 +4303,20 @@ export default function App() {
                       ? 'SAKU:AKTIF'
                       : 'KEEP:ON'
                     : 'KEEP:OFF'}
+                </button>
+
+                {/* Tombol Penguat Volume Penerima (Web Audio API GainNode Boost: 2.0x / 2.2x / 3.0x) */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setRxGainBoost((prev) =>
+                      prev < 2.0 ? 2.0 : prev === 2.0 ? 2.2 : prev === 2.2 ? 3.0 : 1.5
+                    )
+                  }
+                  title="Penguat Volume Suara Masuk (Web Audio API GainNode Receiver Boost)"
+                  className="px-1.5 py-0.5 rounded bg-[#06385c] hover:bg-[#094b7a] border border-[#23dcff] font-telemetry text-[8px] font-extrabold text-[#23dcff] shrink-0 cursor-pointer"
+                >
+                  GAIN:{rxGainBoost.toFixed(1)}x
                 </button>
 
                 {/* Tombol Jeda Hening (Hold Time) atau Tombol Pulihkan Izin Mic jika Ditolak */}
@@ -5129,6 +5534,48 @@ export default function App() {
                               : 'Berikan Izin Mikrofon & Buka Kunci Audio (iOS/Android)'}
                           </span>
                         </button>
+                      </div>
+
+                      {/* Penguatan Volume Suara Masuk (Web Audio API GainNode pasca Dekripsi AES-GCM) */}
+                      <div className="p-3 rounded-xl bg-[#021526] border border-[#23dcff]/45 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <div className="text-white font-bold">
+                              Penguat Suara Penerima (Web Audio GainNode)
+                            </div>
+                            <div className="text-[10px] text-cyan-200/75">
+                              Menguatkan volume audio masuk setelah dekripsi AES-GCM agar nyaring &amp; jelas
+                            </div>
+                          </div>
+                          <span className="px-2 py-1 rounded-lg bg-[#06385c] border border-[#23dcff] text-[#23dcff] font-extrabold text-xs">
+                            {rxGainBoost.toFixed(1)}x
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min={1.0}
+                          max={3.5}
+                          step={0.1}
+                          value={rxGainBoost}
+                          onChange={(e) => setRxGainBoost(Number(e.target.value))}
+                          className="w-full accent-[#23dcff] cursor-pointer"
+                        />
+                        <div className="grid grid-cols-4 gap-1.5">
+                          {[1.5, 2.0, 2.2, 3.0].map((g) => (
+                            <button
+                              key={g}
+                              type="button"
+                              onClick={() => setRxGainBoost(g)}
+                              className={`py-1 px-2 rounded-lg text-[10px] font-bold border cursor-pointer ${
+                                Math.abs(rxGainBoost - g) < 0.05
+                                  ? 'bg-[#23dcff] text-[#02182b] border-white'
+                                  : 'bg-[#042440] text-cyan-100 border-cyan-500/35'
+                              }`}
+                            >
+                              Gain {g.toFixed(1)}x
+                            </button>
+                          ))}
+                        </div>
                       </div>
 
                       <div className="flex items-center justify-between py-2 border-b border-cyan-500/20">
