@@ -1455,10 +1455,126 @@ class TacticalPttHomePage extends StatefulWidget {
 
 class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
   int _selectedNavIndex = 0;
+  final FocusNode _twsMediaFocusNode = FocusNode();
+  DateTime? _lastTwsToggleTime;
+  bool _twsAutoDetected = false;
+  bool _twsHandsFreeEnabled = true;
+  String _lastTwsKeySignal = 'SENTUH 1x = BUKA MIC • 2x = PUTUS MIC';
 
   static const Color bgDarkNavy = Color(0xFF041D34);
   static const Color cyanBright = Color(0xFF23DCFF);
   static const Color cyanSoft = Color(0xFF7CE8FF);
+
+  static final Set<LogicalKeyboardKey> _twsLogicalKeys = <LogicalKeyboardKey>{
+    LogicalKeyboardKey.mediaPlayPause,
+    LogicalKeyboardKey.mediaPlay,
+    LogicalKeyboardKey.mediaPause,
+    LogicalKeyboardKey.mediaStop,
+    LogicalKeyboardKey.mediaTrackNext,
+    LogicalKeyboardKey.mediaTrackPrevious,
+    LogicalKeyboardKey.mediaFastForward,
+    LogicalKeyboardKey.mediaRewind,
+    LogicalKeyboardKey.headsetHook,
+    LogicalKeyboardKey.call,
+    LogicalKeyboardKey.endCall,
+  };
+
+  @override
+  void dispose() {
+    _twsMediaFocusNode.dispose();
+    super.dispose();
+  }
+
+  /// Fungsi utama memulai transmisi suara (dipanggil oleh Tombol PTT Utama & Sentuhan ke-1 TWS)
+  Future<void> onStartTransmit(
+    BuildContext context,
+    UdpNetworkService net,
+    AudioService audioService,
+  ) async {
+    if (net.isTransmitting) return;
+    final String speakerName = net.activeSpeakerCallsign ?? 'ANGGOTA';
+
+    if (net.isPttLocked) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: Colors.redAccent.shade700,
+          duration: const Duration(milliseconds: 1200),
+          content: Text(
+            'JALUR SIBUK: Sedang menerima suara dari $speakerName!',
+            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+          ),
+        ),
+      );
+      return;
+    }
+
+    final allowed = await net.startTransmitting();
+    if (!allowed) return;
+
+    await audioService.startRecording((Uint8List pcmChunk) {
+      net.sendRawAudioChunk(pcmChunk);
+    });
+  }
+
+  /// Fungsi utama menghentikan transmisi suara (dipanggil saat Lepas Tombol PTT & Sentuhan ke-2 TWS)
+  Future<void> onStopTransmit(
+    UdpNetworkService net,
+    AudioService audioService,
+  ) async {
+    if (!net.isTransmitting) return;
+    await audioService.stopRecording();
+    await net.stopTransmitting();
+  }
+
+  /// Deteksi Otomatis TWS & Mode Toggle:
+  /// - Sentuh 1x membuka Mic untuk bicara (`onStartTransmit`)
+  /// - Sentuh ke-2 memutus Mic (`onStopTransmit`)
+  KeyEventResult _handleTwsKeyEvent(
+    KeyEvent event,
+    BuildContext context,
+    UdpNetworkService net,
+    AudioService audioService,
+  ) {
+    if (!_twsHandsFreeEnabled) return KeyEventResult.ignored;
+
+    final bool isMediaKey = _twsLogicalKeys.contains(event.logicalKey) ||
+        const <int>{79, 85, 86, 87, 88, 89, 90, 126, 127}.contains(
+          event.logicalKey.keyId & 0xFF,
+        );
+    if (!isMediaKey) return KeyEventResult.ignored;
+
+    final String keyLabel = event.logicalKey.keyLabel.isNotEmpty
+        ? event.logicalKey.keyLabel
+        : 'TWS-KEY';
+
+    if (event is KeyDownEvent) {
+      final now = DateTime.now();
+      if (_lastTwsToggleTime != null &&
+          now.difference(_lastTwsToggleTime!).inMilliseconds < 360) {
+        return KeyEventResult.handled;
+      }
+      _lastTwsToggleTime = now;
+
+      if (!_twsAutoDetected) {
+        _twsAutoDetected = true;
+      }
+
+      if (!net.isTransmitting) {
+        setState(() => _lastTwsKeySignal = 'SENTUH 1x [$keyLabel] -> MIC TERBUKA');
+        onStartTransmit(context, net, audioService);
+      } else {
+        setState(() => _lastTwsKeySignal = 'SENTUH KE-2 [$keyLabel] -> MIC DIPUTUS');
+        onStopTransmit(net, audioService);
+      }
+      return KeyEventResult.handled;
+    }
+
+    if (event is KeyRepeatEvent || event is KeyUpEvent) {
+      return KeyEventResult.handled;
+    }
+
+    return KeyEventResult.ignored;
+  }
 
   void _showEditCallsignDialog(BuildContext context, UdpNetworkService net) {
     final controller = TextEditingController(text: net.myCallsign);
@@ -1674,62 +1790,68 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
         final List<PeerMember> realPeers = net.activeChannelPeers;
         final int activeCount = realPeers.length;
 
-        return Scaffold(
-          backgroundColor: bgDarkNavy,
-          body: CustomPaint(
-            painter: _TacticalGridPainter(),
-            child: SafeArea(
-              child: Column(
-                children: [
-                  Expanded(
-                    child: SingleChildScrollView(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                      child: Column(
-                        children: [
-                          // 1. TEKS JUDUL "TACTICAL NET-COMM SUBDISRUDAL"
-                          const Padding(
-                            padding: EdgeInsets.symmetric(vertical: 8),
-                            child: Text(
-                              'TACTICAL NET-COMM SUBDISRUDAL',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                color: Color(0xFFE5FAFF),
-                                fontSize: 24,
-                                fontWeight: FontWeight.w900,
-                                letterSpacing: 1.5,
-                                shadows: [
-                                  Shadow(color: cyanBright, blurRadius: 14),
-                                ],
+        return Focus(
+          focusNode: _twsMediaFocusNode,
+          autofocus: true,
+          onKeyEvent: (node, event) =>
+              _handleTwsKeyEvent(event, context, net, audioService),
+          child: Scaffold(
+            backgroundColor: bgDarkNavy,
+            body: CustomPaint(
+              painter: _TacticalGridPainter(),
+              child: SafeArea(
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                        child: Column(
+                          children: [
+                            // 1. TEKS JUDUL "TACTICAL NET-COMM SUBDISRUDAL"
+                            const Padding(
+                              padding: EdgeInsets.symmetric(vertical: 8),
+                              child: Text(
+                                'TACTICAL NET-COMM SUBDISRUDAL',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: Color(0xFFE5FAFF),
+                                  fontSize: 24,
+                                  fontWeight: FontWeight.w900,
+                                  letterSpacing: 1.5,
+                                  shadows: [
+                                    Shadow(color: cyanBright, blurRadius: 14),
+                                  ],
+                                ),
                               ),
                             ),
-                          ),
 
-                          // 2. CONTAINER CARD STATUS JARINGAN
-                          _buildNetworkStatusCard(net, activeCount),
-                          const SizedBox(height: 12),
+                            // 2. CONTAINER CARD STATUS JARINGAN
+                            _buildNetworkStatusCard(net, activeCount),
+                            const SizedBox(height: 12),
 
-                          // 3. CONTAINER CHANNEL SELECTOR
-                          _buildChannelCard(context, net, activeCount),
-                          const SizedBox(height: 14),
+                            // 3. CONTAINER CHANNEL SELECTOR
+                            _buildChannelCard(context, net, activeCount),
+                            const SizedBox(height: 14),
 
-                          // 4. GRIDVIEW ANGGOTA (REAL PEERS + INDIKATOR TX/RX)
-                          _buildMemberGridSection(context, net, realPeers),
-                          const SizedBox(height: 18),
+                            // 4. GRIDVIEW ANGGOTA (REAL PEERS + INDIKATOR TX/RX)
+                            _buildMemberGridSection(context, net, realPeers),
+                            const SizedBox(height: 18),
 
-                          // 5. TOMBOL PTT RAKSASA (FLOOR CONTROL + MASTER OVERRIDE + HALF-DUPLEX)
-                          _buildGiantPttButton(context, net, audioService),
-                          const SizedBox(height: 16),
+                            // 5. TOMBOL PTT RAKSASA (TERHUBUNG KE onStartTransmit / onStopTransmit & TWS)
+                            _buildGiantPttButton(context, net, audioService),
+                            const SizedBox(height: 16),
 
-                          // Banner Status Bawah (Menampilkan RECEIVING FROM [NAMA] / TRANSMITTING / READY)
-                          _buildBottomStatusBanner(net),
-                        ],
+                            // Banner Status Bawah (Menampilkan RECEIVING FROM [NAMA] / TRANSMITTING / READY)
+                            _buildBottomStatusBanner(net),
+                          ],
+                        ),
                       ),
                     ),
-                  ),
 
-                  // 6. BOTTOM NAVIGATION BAR (4 IKON)
-                  _buildBottomNavigationBar(context, net),
-                ],
+                    // 6. BOTTOM NAVIGATION BAR (4 IKON)
+                    _buildBottomNavigationBar(context, net),
+                  ],
+                ),
               ),
             ),
           ),
@@ -2257,35 +2379,8 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
     }
 
     return GestureDetector(
-      onLongPress: () async {
-        // Jika terkunci oleh Floor Control (dan bukan HP MASTER), tolak transmisi
-        if (net.isPttLocked) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              backgroundColor: Colors.redAccent.shade700,
-              duration: const Duration(milliseconds: 1200),
-              content: Text(
-                'JALUR SIBUK: Sedang menerima suara dari $speakerName!',
-                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-              ),
-            ),
-          );
-          return;
-        }
-
-        final allowed = await net.startTransmitting();
-        if (!allowed) return;
-
-        // Strict Half-Duplex: AudioPlayer di-mute (0.0) & mulai rekam microphone
-        await audioService.startRecording((Uint8List pcmChunk) {
-          net.sendRawAudioChunk(pcmChunk);
-        });
-      },
-      onLongPressEnd: (_) async {
-        // Strict Half-Duplex: Hentikan rekam microphone & kembalikan volume AudioPlayer ke 1.0
-        await audioService.stopRecording();
-        await net.stopTransmitting();
-      },
+      onLongPress: () => onStartTransmit(context, net, audioService),
+      onLongPressEnd: (_) => onStopTransmit(net, audioService),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
         width: 215,

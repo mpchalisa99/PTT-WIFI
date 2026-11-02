@@ -631,15 +631,16 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
   Widget _buildGiantPttButton(UdpNetworkService net, AudioService audioService) {
     final bool isTx = net.isTransmitting;
     return GestureDetector(
-      onLongPress: () async {
-        net.setTransmitting(true);
-        await audioService.startRecording((pcmChunk) {
-          net.sendRawAudioChunk(pcmChunk);
-        });
-      },
-      onLongPressEnd: (_) async {
-        await audioService.stopRecording();
-        net.setTransmitting(false);
+      onTap: () async {
+        if (!isTx) {
+          net.setTransmitting(true);
+          await audioService.startRecording((pcmChunk) {
+            net.sendRawAudioChunk(pcmChunk);
+          });
+        } else {
+          await audioService.stopRecording();
+          net.setTransmitting(false);
+        }
       },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
@@ -664,15 +665,15 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Text(
-              'PUSH TO TALK & HOLD',
-              style: TextStyle(color: Color(0xFF03233B), fontSize: 11, fontWeight: FontWeight.w900),
+            Text(
+              isTx ? 'KLIK KEDUA • TUTUP PTT' : 'KLIK PERTAMA • BUKA PTT',
+              style: const TextStyle(color: Color(0xFF03233B), fontSize: 11, fontWeight: FontWeight.w900),
             ),
             const SizedBox(height: 12),
             Icon(Icons.sensors, size: 44, color: isTx ? Colors.white : const Color(0xFF03233B)),
             const SizedBox(height: 6),
             Text(
-              isTx ? 'TRANSMITTING' : 'MASTER READY',
+              isTx ? 'KLIK TUTUP PTT' : 'MASTER READY',
               style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 14),
             ),
           ],
@@ -690,7 +691,7 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
         borderRadius: BorderRadius.circular(14),
       ),
       child: Text(
-        net.isTransmitting ? 'TRANSMITTING RAW PCM UDP...' : 'MASTER READY',
+        net.isTransmitting ? 'BICARA AKTIF • KLIK KEDUA UNTUK TUTUP PTT' : 'MASTER READY • KLIK UNTUK BUKA PTT',
         textAlign: TextAlign.center,
         style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w900),
       ),

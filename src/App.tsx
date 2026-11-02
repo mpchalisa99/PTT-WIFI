@@ -419,6 +419,8 @@ export default function App() {
   );
 
   const activeAudioElementRef = useRef<HTMLAudioElement | null>(null);
+  const remoteActiveTxRef = useRef<string | null>(null);
+  const pttSegmentIntervalRef = useRef<number | null>(null);
   const isTransmittingRef = useRef<boolean>(false);
   useEffect(() => {
     isTransmittingRef.current = isTransmitting;
@@ -429,6 +431,10 @@ export default function App() {
     setIsTransmitting(false);
     isTransmittingRef.current = false;
     setMicLevel(0);
+    if (pttSegmentIntervalRef.current) {
+      window.clearInterval(pttSegmentIntervalRef.current);
+      pttSegmentIntervalRef.current = null;
+    }
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
@@ -461,14 +467,21 @@ export default function App() {
       audio.volume = 1.0; // Strict Half-Duplex: Max volume on Rx
       activeAudioElementRef.current = audio;
       audio.onended = () => {
-        setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
-        playTacticalTone('end');
+        // Keep floor locked if remote sender still has Toggle PTT open (hasn't clicked 2nd time to close PTT yet)
+        if (remoteActiveTxRef.current !== senderCallsign) {
+          setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
+          playTacticalTone('end');
+        }
       };
       audio.onerror = () => {
-        setIncomingSpeaker(null);
+        if (remoteActiveTxRef.current !== senderCallsign) {
+          setIncomingSpeaker(null);
+        }
       };
       audio.play().catch(() => {
-        setIncomingSpeaker(null);
+        if (remoteActiveTxRef.current !== senderCallsign) {
+          setIncomingSpeaker(null);
+        }
       });
     },
     [soundEnabled, playTacticalTone]
@@ -958,10 +971,17 @@ export default function App() {
         if (isTransmittingRef.current && (!amIMaster || senderIsMaster)) {
           forceStopLocalRecording();
         }
+        remoteActiveTxRef.current = pkt.callsign;
         setIncomingSpeaker(pkt.callsign);
         playTacticalTone('rx');
       } else if (pkt.type === 'TX_STOP' || pkt.type === 'PTT_END') {
-        setIncomingSpeaker((curr) => (curr === pkt.callsign ? null : curr));
+        if (remoteActiveTxRef.current === pkt.callsign) {
+          remoteActiveTxRef.current = null;
+        }
+        const activeAudio = activeAudioElementRef.current;
+        if (!activeAudio || activeAudio.paused || activeAudio.ended) {
+          setIncomingSpeaker((curr) => (curr === pkt.callsign ? null : curr));
+        }
       } else if (pkt.type === 'VOICE_CLIP' && pkt.audioBase64) {
         if (amIMaster && isTransmittingRef.current && !senderIsMaster) {
           return;
@@ -1368,9 +1388,9 @@ export default function App() {
   // HP MASTER (192.168.43.1) is never locked and can override at any time.
   const isPttLocked = !isMasterDevice && Boolean(incomingSpeaker);
 
-  // Start Push-To-Talk (`onLongPress` / Hold) -> Captures real microphone audio
+  // Klik Pertama: Buka PTT & Mulai Bicara -> Mengirim TX_START & merekam suara mikrofon
   const handlePttStart = async () => {
-    if (isTransmitting) return;
+    if (isTransmittingRef.current) return;
     if (isPttLocked) return;
 
     // Strict Half-Duplex: Immediately mute (volume 0) and stop speaker playback before opening mic
@@ -1380,6 +1400,7 @@ export default function App() {
       activeAudioElementRef.current = null;
     }
 
+    remoteActiveTxRef.current = null;
     setIncomingSpeaker(null);
     setIsTransmitting(true);
     isTransmittingRef.current = true;
@@ -1421,47 +1442,76 @@ export default function App() {
         };
         updateMeter();
 
-        // Record voice packet for cross-device WebRTC / WSS Cloud Mesh / BroadcastChannel & APK Echo Test
-        recordedChunksRef.current = [];
-        let recorder: MediaRecorder;
-        try {
-          recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
-        } catch {
-          recorder = new MediaRecorder(stream);
-        }
-        recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) {
-            recordedChunksRef.current.push(e.data);
-          }
-        };
-        recorder.onstop = () => {
-          const blob = new Blob(recordedChunksRef.current, {
-            type: recorder.mimeType || 'audio/webm',
-          });
-          if (blob.size > 200) {
-            const reader = new FileReader();
-            reader.onloadend = () => {
-              const base64Audio = reader.result as string;
-              if (base64Audio) {
-                broadcastMeshPacket({
-                  type: 'VOICE_CLIP',
-                  audioBase64: base64Audio,
-                  mimeType: blob.type,
-                });
+        // Start a self-contained MediaRecorder segment so voice is streamed both during long Toggle PTT sessions and when closed on 2nd click
+        const startRecorderSegment = () => {
+          if (!isTransmittingRef.current || !stream.active) return;
+          const segmentChunks: Blob[] = [];
+          recordedChunksRef.current = segmentChunks;
 
-                // If Echo Test Mode is enabled (and no remote peer is active), play back captured voice
-                if (echoTestMode && membersRef.current.length === 0) {
-                  window.setTimeout(() => {
-                    playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
-                  }, 350);
-                }
-              }
-            };
-            reader.readAsDataURL(blob);
+          let recorder: MediaRecorder;
+          try {
+            recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
+          } catch {
+            recorder = new MediaRecorder(stream);
           }
+
+          recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              segmentChunks.push(e.data);
+            }
+          };
+
+          recorder.onstop = () => {
+            const blob = new Blob(segmentChunks, {
+              type: recorder.mimeType || 'audio/webm',
+            });
+            if (blob.size > 200) {
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                const base64Audio = reader.result as string;
+                if (base64Audio) {
+                  broadcastMeshPacket({
+                    type: 'VOICE_CLIP',
+                    audioBase64: base64Audio,
+                    mimeType: blob.type,
+                  });
+
+                  // If Echo Test Mode is enabled (and no remote peer is active), play back captured voice after PTT is closed
+                  if (
+                    !isTransmittingRef.current &&
+                    echoTestMode &&
+                    membersRef.current.length === 0
+                  ) {
+                    window.setTimeout(() => {
+                      playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
+                    }, 350);
+                  }
+                }
+              };
+              reader.readAsDataURL(blob);
+            }
+          };
+
+          mediaRecorderRef.current = recorder;
+          recorder.start();
         };
-        mediaRecorderRef.current = recorder;
-        recorder.start();
+
+        startRecorderSegment();
+
+        if (pttSegmentIntervalRef.current) {
+          window.clearInterval(pttSegmentIntervalRef.current);
+        }
+        pttSegmentIntervalRef.current = window.setInterval(() => {
+          if (!isTransmittingRef.current) return;
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+            try {
+              mediaRecorderRef.current.stop();
+            } catch {
+              // Ignore stop error
+            }
+            startRecorderSegment();
+          }
+        }, 3500);
       }
     } catch {
       // Fallback animated waveform if mic permission isn't granted yet
@@ -1474,12 +1524,17 @@ export default function App() {
     }
   };
 
-  // Stop Push-To-Talk (`onLongPressEnd` / Release)
+  // Klik Kedua: Tutup PTT -> Menghentikan mic, mengirim paket suara terakhir & TX_STOP
   const handlePttEnd = () => {
-    if (!isTransmitting) return;
+    if (!isTransmittingRef.current) return;
     setIsTransmitting(false);
     isTransmittingRef.current = false;
     setMicLevel(0);
+
+    if (pttSegmentIntervalRef.current) {
+      window.clearInterval(pttSegmentIntervalRef.current);
+      pttSegmentIntervalRef.current = null;
+    }
 
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
@@ -1496,6 +1551,16 @@ export default function App() {
 
     playTacticalTone('end');
     broadcastMeshPacket({ type: 'TX_STOP' });
+  };
+
+  // Toggle PTT (Klik Pertama = Buka PTT & Bicara, Klik Kedua = Tutup PTT)
+  const handlePttToggle = () => {
+    if (isPttLocked) return;
+    if (isTransmittingRef.current || isTransmitting) {
+      handlePttEnd();
+    } else {
+      handlePttStart();
+    }
   };
 
   // Toggle Native Browser/WebView FullScreen when clicking [FULL]
@@ -2264,7 +2329,9 @@ export default function App() {
 
   const currentFile = FLUTTER_SOURCE_FILES[selectedFileIndex];
 
-  const curvedTitle = 'PUSH TO TALK & HOLD';
+  const curvedTitle = isTransmitting
+    ? 'KLIK KEDUA • TUTUP PTT'
+    : 'KLIK PERTAMA • BUKA PTT';
   const curvedChars = curvedTitle.split('');
 
   // 1. LAYAR SETUP AWAL (SetupScreen - KONEK NAMA + SCAN BARCODE LANGSUNG)
@@ -2703,30 +2770,20 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Tombol Lingkaran PTT (Push-To-Talk & Hold) - Diperbesar & Maksimal */}
+              {/* Tombol Lingkaran PTT (Klik 1 = Buka PTT, Klik 2 = Tutup PTT) */}
               <button
                 type="button"
                 disabled={isPttLocked}
-                onMouseDown={isPttLocked ? undefined : handlePttStart}
-                onMouseUp={isPttLocked ? undefined : handlePttEnd}
-                onMouseLeave={isPttLocked ? undefined : handlePttEnd}
-                onTouchStart={(e) => {
-                  e.preventDefault();
-                  if (!isPttLocked) handlePttStart();
-                }}
-                onTouchEnd={(e) => {
-                  e.preventDefault();
-                  if (!isPttLocked) handlePttEnd();
-                }}
+                onClick={isPttLocked ? undefined : handlePttToggle}
                 className={`relative w-40 h-40 sm:w-44 sm:h-44 rounded-full border-[4px] flex items-center justify-center transition-transform duration-150 select-none ${
                   isPttLocked
                     ? 'bg-[#1a1318] border-red-500/80 opacity-85 cursor-not-allowed'
                     : isTransmitting
-                    ? 'ptt-ring-active border-white scale-[0.97] cursor-pointer'
+                    ? 'ptt-ring-active border-white scale-[0.98] cursor-pointer'
                     : 'ptt-ring-outer border-[#2fe0ff] active:scale-95 cursor-pointer'
                 }`}
               >
-                {/* Teks Melingkar "PUSH TO TALK & HOLD" */}
+                {/* Teks Melingkar "KLIK PERTAMA • BUKA PTT" / "KLIK KEDUA • TUTUP PTT" */}
                 <div className="absolute inset-0 pointer-events-none">
                   {curvedChars.map((char, index) => {
                     const total = curvedChars.length;
@@ -2739,7 +2796,7 @@ export default function App() {
                         style={{
                           transform: `rotate(${angle}deg)`,
                         }}
-                        className="absolute left-1/2 top-1.5 -ml-[4px] h-[74px] sm:h-[82px] origin-bottom font-tactical text-[10.5px] font-extrabold text-[#02192d] tracking-wider"
+                        className="absolute left-1/2 top-1.5 -ml-[4px] h-[74px] sm:h-[82px] origin-bottom font-tactical text-[10px] font-extrabold text-[#02192d] tracking-wider"
                       >
                         {char}
                       </span>
@@ -2758,7 +2815,7 @@ export default function App() {
                   }`}
                 >
                   <Radio
-                    className={`w-9 h-9 mb-1 ${
+                    className={`w-8 h-8 mb-0.5 ${
                       isPttLocked
                         ? 'text-red-300 animate-pulse'
                         : isTransmitting
@@ -2766,9 +2823,9 @@ export default function App() {
                         : 'text-[#03233b]'
                     }`}
                   />
-                  <span className="font-tactical text-[13px] font-extrabold tracking-wider text-white drop-shadow leading-none">
+                  <span className="font-tactical text-[12.5px] font-extrabold tracking-wider text-white drop-shadow leading-tight">
                     {isTransmitting
-                      ? 'TRANSMIT'
+                      ? 'KLIK TUTUP PTT'
                       : incomingSpeaker
                       ? isPttLocked
                         ? `RX ${incomingSpeaker}`
@@ -2776,6 +2833,13 @@ export default function App() {
                       : isMasterDevice
                       ? 'MASTER READY'
                       : 'CLIENT READY'}
+                  </span>
+                  <span className="font-telemetry text-[8.5px] font-bold text-cyan-100/95 leading-none mt-0.5">
+                    {isTransmitting
+                      ? 'SEDANG BICARA'
+                      : isPttLocked
+                      ? 'TERKUNCI'
+                      : 'KLIK BUKA PTT'}
                   </span>
                 </div>
               </button>
@@ -2800,36 +2864,26 @@ export default function App() {
               </div>
             </section>
 
-            {/* BANNER STATUS BAWAH ("MASTER READY" / "RECEIVING FROM [NAMA]") */}
+            {/* BANNER STATUS BAWAH (KLIK 1 = BUKA PTT, KLIK 2 = TUTUP PTT) */}
             <button
               type="button"
               disabled={isPttLocked}
-              onMouseDown={isPttLocked ? undefined : handlePttStart}
-              onMouseUp={isPttLocked ? undefined : handlePttEnd}
-              onMouseLeave={isPttLocked ? undefined : handlePttEnd}
-              onTouchStart={(e) => {
-                e.preventDefault();
-                if (!isPttLocked) handlePttStart();
-              }}
-              onTouchEnd={(e) => {
-                e.preventDefault();
-                if (!isPttLocked) handlePttEnd();
-              }}
-              className={`w-full py-2 rounded-xl font-tactical text-[16px] font-extrabold tracking-[0.08em] text-white text-center shrink-0 transition-all ${
+              onClick={isPttLocked ? undefined : handlePttToggle}
+              className={`w-full py-2 rounded-xl font-tactical text-[15px] sm:text-[16px] font-extrabold tracking-[0.07em] text-white text-center shrink-0 transition-all ${
                 isPttLocked
                   ? 'bg-red-950/90 border border-red-400/80 text-red-100 cursor-not-allowed'
                   : 'cyan-btn-glow shadow-[0_0_15px_rgba(35,220,255,0.35)] cursor-pointer'
               }`}
             >
               {isTransmitting
-                ? 'TRANSMITTING VOICE STREAM...'
+                ? 'BICARA AKTIF • KLIK KEDUA UNTUK TUTUP PTT'
                 : incomingSpeaker
                 ? isMasterDevice
-                  ? `RECEIVING FROM ${incomingSpeaker} (TEKAN UNTUK OVERRIDE)`
+                  ? `RECEIVING FROM ${incomingSpeaker} (KLIK UNTUK OVERRIDE)`
                   : `RECEIVING FROM ${incomingSpeaker} (PTT LOCKED)`
                 : isMasterDevice
-                ? 'MASTER READY'
-                : 'CLIENT READY'}
+                ? 'MASTER READY • KLIK UNTUK BUKA PTT'
+                : 'CLIENT READY • KLIK UNTUK BUKA PTT'}
             </button>
           </div>
 
@@ -3564,7 +3618,7 @@ export default function App() {
                             Mode Echo / Uji Suara Mic APK
                           </div>
                           <div className="text-[10px] text-cyan-200/75">
-                            Putar balik suara Anda setelah lepas tombol PTT
+                            Putar balik suara Anda setelah klik kedua (tutup PTT)
                           </div>
                         </div>
                         <button
