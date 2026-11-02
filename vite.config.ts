@@ -14,10 +14,10 @@ export default defineConfig(() => {
         includeAssets: ['icon.svg'],
         manifest: {
           id: '/',
-          name: 'DISKOMLEKAU TACTICAL PTT',
+          name: 'TACTICAL NET-COMM SUBDISRUDAL',
           short_name: 'TacticalPTT',
           description:
-            'Aplikasi Android Push-to-Talk (PTT) Walkie Talkie Taktikal DISKOMLEKAU via Cloud Mesh & WiFi Hotspot.',
+            'Aplikasi Android Push-to-Talk (PTT) Walkie Talkie Taktikal SUBDISRUDAL via Cloud Mesh & WiFi Hotspot.',
           theme_color: '#041d34',
           background_color: '#031525',
           display: 'fullscreen',
@@ -39,7 +39,7 @@ export default defineConfig(() => {
           globIgnores: ['**/assets/aistudio/**'],
         },
         devOptions: {
-          enabled: true,
+          enabled: process.env.DISABLE_HMR !== 'true',
           type: 'module',
         },
       }),

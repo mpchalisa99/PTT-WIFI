@@ -41,6 +41,17 @@ import {
   detectLocalHotspotIpWebRTC,
   gatherLocalIceCandidatesExplicit,
 } from './utils/offlineHotspotWebRTC';
+import {
+  detectMobileAudioPlatform,
+  getOrCreateCompatibleAudioContext,
+  unlockMobileAudioSession,
+  requestMicrophoneWithFallbacks,
+  getSupportedAudioMimeType,
+  encodePcmChunksToWavBlob,
+  playBase64AudioViaWebAudioFallback,
+  createSilentKeepAliveController,
+  SilentKeepAliveSession,
+} from './utils/mobileAudioEngine';
 
 interface TacticalMember {
   id: string;
@@ -76,6 +87,13 @@ interface TacticalChatMessage {
   timestamp: number;
 }
 
+interface ChannelLockInfo {
+  senderId: string;
+  callsign: string;
+  startedAt: number;
+  updatedAt: number;
+}
+
 interface MeshPacket {
   packetId?: string;
   type:
@@ -88,6 +106,9 @@ interface MeshPacket {
     | 'PTT_END'
     | 'TX_START'
     | 'TX_STOP'
+    | 'CHANNEL_LOCK'
+    | 'CHANNEL_UNLOCK'
+    | 'CHANNEL_BUSY'
     | 'PING'
     | 'PONG';
   senderId: string;
@@ -102,6 +123,9 @@ interface MeshPacket {
   chatText?: string;
   peerNodeId?: string;
   peerList?: PeerSyncEntry[];
+  lockOwnerId?: string;
+  lockOwnerCallsign?: string;
+  lockStartedAt?: number;
 }
 
 const MASTER_PEER_ID = 'PTT-MASTER-01';
@@ -260,15 +284,28 @@ export default function App() {
   const [isFullScreen, setIsFullScreen] = useState<boolean>(false);
   const [fullScreenStretch, setFullScreenStretch] = useState<boolean>(true);
 
-  // Real Microphone, PTT & VOX (Voice Activity Detection) states
+  // Real Microphone, PTT, VOX (Voice Activity Detection), Mobile Compatibility & Keep-Alive states
+  const [mobilePlatformInfo] = useState(() => detectMobileAudioPlatform());
   const [isTransmitting, setIsTransmitting] = useState<boolean>(false);
   const [incomingSpeaker, setIncomingSpeaker] = useState<string | null>(null);
   const [micLevel, setMicLevel] = useState<number>(0);
   const [micPermissionState, setMicPermissionState] = useState<'prompt' | 'granted' | 'denied'>('prompt');
+  const [micConstraintTier, setMicConstraintTier] = useState<string>('STANDBY');
+  const [micErrorNotice, setMicErrorNotice] = useState<string | null>(null);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   // Default Echo Test to false so real Walkie-Talkie operation never echoes local speech
   const [echoTestMode, setEchoTestMode] = useState<boolean>(false);
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
+
+  // Background Keep-Alive (Silent Audio Stream via Web Audio API on visibilitychange / Screen Off / Pocket Mode)
+  const [keepAliveEnabled, setKeepAliveEnabled] = useState<boolean>(() => {
+    const saved = localStorage.getItem('diskomlekau_keepalive_enabled');
+    return saved !== null ? saved === 'true' : true;
+  });
+  const [isSilentKeepAliveRunning, setIsSilentKeepAliveRunning] = useState<boolean>(false);
+  const [isBackgroundMode, setIsBackgroundMode] = useState<boolean>(false);
+  const keepAliveEnabledRef = useRef<boolean>(keepAliveEnabled);
+  const keepAliveSessionRef = useRef<SilentKeepAliveSession | null>(null);
 
   // VOX (Voice Activity Detection) Hands-Free Web Audio API states (Active by default)
   const [voxEnabled, setVoxEnabled] = useState<boolean>(() => {
@@ -328,8 +365,15 @@ export default function App() {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  // Web Audio API PCM-to-WAV Fallback Recorder refs (for Safari iOS / HarmonyOS WebViews without MediaRecorder)
+  const pcmProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const pcmZeroGainRef = useRef<GainNode | null>(null);
+  const pcmChunksRef = useRef<Float32Array[]>([]);
+  const isPcmRecordingRef = useRef<boolean>(false);
+  const reusableRxAudioRef = useRef<HTMLAudioElement | null>(null);
+  const activeWebAudioRxStopRef = useRef<(() => void) | null>(null);
   const animFrameRef = useRef<number | null>(null);
-  // VOX (Voice Activity Detection) refs
+  // VOX (Voice Activity Detection) & Channel Lockout / Anti-Collision refs
   const voxEnabledRef = useRef<boolean>(voxEnabled);
   const voxThresholdRef = useRef<number>(voxThreshold);
   const voxHoldMsRef = useRef<number>(voxHoldMs);
@@ -337,6 +381,12 @@ export default function App() {
   const voxVoiceFramesRef = useRef<number>(0);
   const isVoxTriggeredTxRef = useRef<boolean>(false);
   const rxCooldownUntilRef = useRef<number>(0);
+  const [channelLockOwner, setChannelLockOwner] = useState<ChannelLockInfo | null>(null);
+  const channelLockOwnerRef = useRef<ChannelLockInfo | null>(null);
+  const localTxStartedAtRef = useRef<number>(0);
+  const abortDiscardRecordingRef = useRef<boolean>(false);
+  const txLockHeartbeatRef = useRef<number | null>(null);
+  const [collisionBlockedNotice, setCollisionBlockedNotice] = useState<string | null>(null);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const directNodePeerRef = useRef<Peer | null>(null);
@@ -369,19 +419,21 @@ export default function App() {
     localStorage.setItem('diskomlekau_ip', localIp);
   }, [myCallsign, channel, role, localIp]);
 
-  // Persist VOX settings & sync refs
+  // Persist VOX & Keep-Alive settings & sync refs
   useEffect(() => {
     voxEnabledRef.current = voxEnabled;
     voxThresholdRef.current = voxThreshold;
     voxHoldMsRef.current = voxHoldMs;
+    keepAliveEnabledRef.current = keepAliveEnabled;
     try {
       localStorage.setItem('diskomlekau_vox_enabled', String(voxEnabled));
       localStorage.setItem('diskomlekau_vox_threshold', String(voxThreshold));
       localStorage.setItem('diskomlekau_vox_hold_ms', String(voxHoldMs));
+      localStorage.setItem('diskomlekau_keepalive_enabled', String(keepAliveEnabled));
     } catch {
       // Ignore storage error
     }
-  }, [voxEnabled, voxThreshold, voxHoldMs]);
+  }, [voxEnabled, voxThreshold, voxHoldMs, keepAliveEnabled]);
 
   // Persist tactical chat messages & auto-scroll to latest message
   useEffect(() => {
@@ -397,12 +449,12 @@ export default function App() {
     modalChatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  // Request Screen Wake Lock so HP screen stays on in APK/fullscreen mode
+  // Request Screen Wake Lock so HP screen stays on in APK/fullscreen mode & re-acquire on visibilitychange
   useEffect(() => {
     let wakeLock: WakeLockSentinel | null = null;
     const requestWakeLock = async () => {
       try {
-        if ('wakeLock' in navigator) {
+        if ('wakeLock' in navigator && document.visibilityState === 'visible') {
           wakeLock = await navigator.wakeLock.request('screen');
         }
       } catch {
@@ -410,24 +462,27 @@ export default function App() {
       }
     };
     requestWakeLock();
+    const handleVisibilityWakeLock = () => {
+      if (document.visibilityState === 'visible') {
+        requestWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityWakeLock);
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityWakeLock);
       wakeLock?.release().catch(() => {});
     };
   }, []);
 
-  // Tactical Walkie-Talkie Roger Beep & Squelch Synthesizer
+  // Tactical Walkie-Talkie Roger Beep & Squelch Synthesizer (Safari iOS & Chrome Android/HarmonyOS compatible)
   const playTacticalTone = useCallback(
     (type: 'start' | 'end' | 'rx') => {
       if (!soundEnabled) return;
       try {
-        if (!audioCtxRef.current) {
-          audioCtxRef.current = new (window.AudioContext ||
-            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-        }
-        const ctx = audioCtxRef.current;
-        if (ctx.state === 'suspended') {
-          ctx.resume();
-        }
+        const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+        if (!ctx) return;
+        audioCtxRef.current = ctx;
+
         const now = ctx.currentTime;
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
@@ -476,15 +531,22 @@ export default function App() {
     isReceiverOffRef.current = isTransmitting;
   }, [isTransmitting]);
 
-  // Helper to immediately mute & shut off Receiver (Speaker) during 1st-click PTT Open
+  // Helper to immediately mute & shut off Receiver (both HTMLAudioElement & Web Audio BufferSource) during PTT/VOX Open
   const muteAndDisableReceiver = useCallback(() => {
     isReceiverOffRef.current = true;
+    if (activeWebAudioRxStopRef.current) {
+      try {
+        activeWebAudioRxStopRef.current();
+      } catch {
+        // Ignore Web Audio RX stop error
+      }
+      activeWebAudioRxStopRef.current = null;
+    }
     if (activeAudioElementRef.current) {
       try {
         activeAudioElementRef.current.muted = true;
         activeAudioElementRef.current.volume = 0.0;
         activeAudioElementRef.current.pause();
-        activeAudioElementRef.current.src = '';
       } catch {
         // Ignore audio element cleanup error
       }
@@ -492,15 +554,24 @@ export default function App() {
     }
   }, []);
 
-  // Helper to force-stop microphone recording & re-enable Receiver (Strict Half-Duplex when switching to Rx)
-  const forceStopLocalRecording = useCallback(() => {
+  // Helper to force-stop microphone recording (both MediaRecorder & PCM fallback) & re-enable Receiver
+  const forceStopLocalRecording = useCallback((discardClip = false) => {
+    if (discardClip) {
+      abortDiscardRecordingRef.current = true;
+    }
     setIsTransmitting(false);
     isTransmittingRef.current = false;
     isReceiverOffRef.current = false;
+    isVoxTriggeredTxRef.current = false;
+    voxVoiceFramesRef.current = 0;
     setMicLevel(0);
     if (pttSegmentIntervalRef.current) {
       window.clearInterval(pttSegmentIntervalRef.current);
       pttSegmentIntervalRef.current = null;
+    }
+    if (txLockHeartbeatRef.current) {
+      window.clearInterval(txLockHeartbeatRef.current);
+      txLockHeartbeatRef.current = null;
     }
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
@@ -513,24 +584,49 @@ export default function App() {
         // Ignore stop error
       }
     }
-    // Physically mute hardware mic track while in RX mode, then restore VOX standby after cooldown
+    if (isPcmRecordingRef.current) {
+      isPcmRecordingRef.current = false;
+      pcmChunksRef.current = [];
+      try {
+        pcmProcessorRef.current?.disconnect();
+        pcmZeroGainRef.current?.disconnect();
+      } catch {
+        // Ignore PCM disconnect error
+      }
+      pcmProcessorRef.current = null;
+      pcmZeroGainRef.current = null;
+    }
+    // Physically mute hardware mic track while in RX / Channel Lockout mode
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getAudioTracks().forEach((track) => {
         track.enabled = false;
       });
     }
-    rxCooldownUntilRef.current = Date.now() + 550;
+    rxCooldownUntilRef.current = Date.now() + 650;
   }, []);
 
-  // Play incoming Base64 voice clip received from another device or loopback test (Strict Half-Duplex Rx)
+  // Play incoming Base64 voice clip received from another device (Compatible with Safari iOS, Chrome Android/HarmonyOS & Background Pocket Mode)
   const playIncomingAudioBase64 = useCallback(
-    (base64Data: string, senderCallsign: string) => {
+    (base64Data: string, senderCallsign: string, senderDeviceId?: string) => {
       if (!soundEnabled) return;
       // STRICT ANTI-ECHO: While PTT/VOX is open (TX active / Receiver OFF), NEVER play any speaker audio!
       if (isTransmittingRef.current || isReceiverOffRef.current) return;
 
-      // Temporarily gate VOX while speaker is playing incoming audio so RX speaker never triggers VOX
-      rxCooldownUntilRef.current = Date.now() + 2500;
+      // Temporarily lock channel & gate VOX while speaker is playing incoming audio so RX speaker never triggers nearby VOX
+      const now = Date.now();
+      rxCooldownUntilRef.current = now + 3000;
+      voxVoiceFramesRef.current = 0;
+      setVoxInputLevel(0);
+      if (senderDeviceId) {
+        const lockObj: ChannelLockInfo = {
+          senderId: senderDeviceId,
+          callsign: senderCallsign,
+          startedAt: channelLockOwnerRef.current?.startedAt || now,
+          updatedAt: now,
+        };
+        channelLockOwnerRef.current = lockObj;
+        setChannelLockOwner(lockObj);
+      }
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getAudioTracks().forEach((track) => {
           track.enabled = false;
@@ -540,59 +636,163 @@ export default function App() {
       playTacticalTone('rx');
       setIncomingSpeaker(senderCallsign);
 
+      // Stop any previous RX playback first
+      if (activeWebAudioRxStopRef.current) {
+        try {
+          activeWebAudioRxStopRef.current();
+        } catch {
+          // Ignore
+        }
+        activeWebAudioRxStopRef.current = null;
+      }
       if (activeAudioElementRef.current) {
         try {
           activeAudioElementRef.current.pause();
-          activeAudioElementRef.current.src = '';
         } catch {
           // Ignore
         }
         activeAudioElementRef.current = null;
       }
 
-      const restoreVoxMicAfterRx = () => {
-        rxCooldownUntilRef.current = Date.now() + 450;
+      let hasReleased = false;
+      const releaseChannelLockAndRestoreVox = () => {
+        if (hasReleased) return;
+        hasReleased = true;
+        activeWebAudioRxStopRef.current = null;
+        // 650ms Anti-Feedback Acoustic Decay Guard after speaker finishes playing
+        rxCooldownUntilRef.current = Date.now() + 650;
+        if (
+          !remoteActiveTxRef.current ||
+          remoteActiveTxRef.current === senderCallsign
+        ) {
+          remoteActiveTxRef.current = null;
+          channelLockOwnerRef.current = null;
+          setChannelLockOwner(null);
+          setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
+        }
         window.setTimeout(() => {
           if (
             voxEnabledRef.current &&
             !isTransmittingRef.current &&
             !remoteActiveTxRef.current &&
+            !channelLockOwnerRef.current &&
             mediaStreamRef.current
           ) {
             mediaStreamRef.current.getAudioTracks().forEach((track) => {
               track.enabled = true;
             });
           }
-        }, 420);
+        }, 620);
       };
 
-      const audio = new Audio(base64Data);
-      audio.muted = false;
-      audio.volume = 1.0; // Strict Half-Duplex: Max volume only when Receiver is ON
-      activeAudioElementRef.current = audio;
-      audio.onended = () => {
-        restoreVoxMicAfterRx();
-        if (remoteActiveTxRef.current !== senderCallsign) {
-          setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
-          if (!isTransmittingRef.current && !isReceiverOffRef.current) {
-            playTacticalTone('end');
-          }
+      const handlePlaybackFinished = () => {
+        releaseChannelLockAndRestoreVox();
+        if (!isTransmittingRef.current && !isReceiverOffRef.current) {
+          playTacticalTone('end');
         }
       };
-      audio.onerror = () => {
-        restoreVoxMicAfterRx();
-        if (remoteActiveTxRef.current !== senderCallsign) {
-          setIncomingSpeaker(null);
+
+      // Fallback helper using Web Audio API decodeAudioData (crucial when iOS Safari or background screen-off blocks HTMLAudioElement)
+      const tryWebAudioDecodeFallback = async () => {
+        if (isTransmittingRef.current || isReceiverOffRef.current) {
+          releaseChannelLockAndRestoreVox();
+          return;
+        }
+        const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+        if (!ctx) {
+          releaseChannelLockAndRestoreVox();
+          return;
+        }
+        audioCtxRef.current = ctx;
+        const handle = await playBase64AudioViaWebAudioFallback(
+          ctx,
+          base64Data,
+          handlePlaybackFinished
+        );
+        if (handle) {
+          activeWebAudioRxStopRef.current = handle.stop;
+        } else {
+          releaseChannelLockAndRestoreVox();
         }
       };
-      audio.play().catch(() => {
-        restoreVoxMicAfterRx();
-        if (remoteActiveTxRef.current !== senderCallsign) {
-          setIncomingSpeaker(null);
+
+      // Primary path: Use pre-unlocked reusable HTMLAudioElement with playsinline for mobile Safari/Chrome/HarmonyOS
+      try {
+        if (!reusableRxAudioRef.current) {
+          const el = new Audio();
+          el.setAttribute('playsinline', 'true');
+          el.setAttribute('webkit-playsinline', 'true');
+          reusableRxAudioRef.current = el;
         }
-      });
+        const audio = reusableRxAudioRef.current;
+        audio.pause();
+        audio.src = base64Data;
+        audio.muted = false;
+        audio.volume = 1.0; // Strict Half-Duplex: Max volume only when Receiver is ON
+        activeAudioElementRef.current = audio;
+
+        audio.onended = handlePlaybackFinished;
+        audio.onerror = () => {
+          // If HTMLAudioElement cannot decode format (e.g. WebM on Safari or MP4 on custom WebView), try Web Audio decodeAudioData
+          tryWebAudioDecodeFallback();
+        };
+
+        const playPromise = audio.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(() => {
+            // If mobile autoplay policy or background lockscreen blocked HTML5 <audio>, play directly via Web Audio API!
+            tryWebAudioDecodeFallback();
+          });
+        }
+      } catch {
+        tryWebAudioDecodeFallback();
+      }
     },
     [soundEnabled, playTacticalTone]
+  );
+
+  // Helper to check if an incoming transmission packet collides with an already-active channel lock holder
+  const isCollidingTransmissionPacket = useCallback(
+    (pkt: MeshPacket): boolean => {
+      if (pkt.channel !== channel) return false;
+      const isTxPacket =
+        pkt.type === 'TX_START' ||
+        pkt.type === 'PTT_START' ||
+        pkt.type === 'CHANNEL_LOCK' ||
+        pkt.type === 'VOICE_CLIP';
+      if (!isTxPacket) return false;
+
+      const pktStartTs = pkt.lockStartedAt || pkt.timestamp || Date.now();
+
+      // 1. If THIS device is already transmitting on the channel, check who claimed the floor first
+      if (isTransmittingRef.current) {
+        const myStartTs = localTxStartedAtRef.current || 0;
+        const iStartedFirst =
+          myStartTs < pktStartTs ||
+          (myStartTs === pktStartTs && myDeviceId < pkt.senderId);
+        if (iStartedFirst) {
+          return true;
+        }
+      }
+
+      // 2. If ANOTHER client already holds the Channel Lock on this channel, reject any 2nd client's TX packets
+      const existingLock = channelLockOwnerRef.current;
+      if (
+        existingLock &&
+        existingLock.senderId !== pkt.senderId &&
+        Date.now() - existingLock.updatedAt < 12000
+      ) {
+        const ownerStartedFirst =
+          existingLock.startedAt <= pktStartTs ||
+          existingLock.senderId < pkt.senderId;
+        if (ownerStartedFirst) {
+          return true;
+        }
+      }
+
+      return false;
+    },
+    [channel, myDeviceId]
   );
 
   // Send packet to all connected WebRTC peers + Offline Hotspot LAN DataChannels + Local Hotspot WS Hub + WSS Cloud Mesh + BroadcastChannel
@@ -743,9 +943,12 @@ export default function App() {
         if (!incoming.peerNodeId && conn.peer) {
           incoming.peerNodeId = conn.peer;
         }
+        // ANTI-COLLISION RELAY FILTER: Check collision BEFORE relaying so a 2nd colliding client never interrupts active channel speaker
+        const isBlockedCollision = isCollidingTransmissionPacket(incoming);
         packetHandlerRef.current(incoming);
+        if (isBlockedCollision) return;
 
-        // If this device is Master, relay voice/control packets to other connected WebRTC & Offline LAN clients
+        // If this device is Master, relay non-colliding voice/control packets to other connected WebRTC & Offline LAN clients
         if (
           incoming.type !== 'ANNOUNCE' &&
           incoming.type !== 'PEER_LIST_SYNC' &&
@@ -784,7 +987,7 @@ export default function App() {
       conn.on('close', handleDisconnect);
       conn.on('error', handleDisconnect);
     },
-    [localIp, role]
+    [localIp, role, isCollidingTransmissionPacket]
   );
 
   // Prepare a fresh Offline Hotspot WebRTC Offer on HP MASTER (0% internet required, iceServers: [])
@@ -835,7 +1038,10 @@ export default function App() {
         try {
           const incoming = JSON.parse(String(ev.data)) as MeshPacket;
           if (!incoming) return;
+          // ANTI-COLLISION RELAY FILTER: Do not relay colliding TX/VOICE packets from a 2nd client while channel is locked
+          const isBlockedCollision = isCollidingTransmissionPacket(incoming);
           packetHandlerRef.current(incoming);
+          if (isBlockedCollision) return;
 
           // Master Star-Mesh Relay: forward ANNOUNCE, voice & floor control to all other Offline Hotspot & WebRTC clients
           if (
@@ -939,6 +1145,12 @@ export default function App() {
 
       if (pkt.type === 'PEER_LEAVE') {
         setMembers((prev) => prev.filter((m) => m.id !== pkt.senderId));
+        if (channelLockOwnerRef.current?.senderId === pkt.senderId) {
+          channelLockOwnerRef.current = null;
+          setChannelLockOwner(null);
+          remoteActiveTxRef.current = null;
+          setIncomingSpeaker(null);
+        }
         return;
       }
 
@@ -1070,35 +1282,174 @@ export default function App() {
       // Filter channel-specific packets (voice / PTT floor control / ping) without closing sockets
       if (pkt.channel !== channel) return;
 
-      if (pkt.type === 'TX_START' || pkt.type === 'PTT_START') {
-        // MASTER OVERRIDE: If I am Master and currently transmitting, ignore Client TX_START
-        if (amIMaster && isTransmittingRef.current && !senderIsMaster) {
-          return;
+      // CHANNEL LOCKOUT / ANTI-COLLISION HANDLER OVER WEBSOCKET, WEBRTC & MESH
+      if (pkt.type === 'CHANNEL_BUSY') {
+        // Another peer already holds the channel lock -> if we were transmitting and started later, abort immediately!
+        const ownerId = pkt.lockOwnerId || pkt.senderId;
+        const ownerCallsign = pkt.lockOwnerCallsign || pkt.callsign;
+        const ownerStartTs = pkt.lockStartedAt || pkt.timestamp;
+        if (ownerId !== myDeviceId) {
+          if (isTransmittingRef.current) {
+            const myStartTs = localTxStartedAtRef.current || Date.now();
+            if (ownerStartTs <= myStartTs) {
+              forceStopLocalRecording(true);
+              setCollisionBlockedNotice(
+                `ANTI-COLLISION: SALURAN DIKUNCI OLEH ${ownerCallsign}`
+              );
+              window.setTimeout(() => setCollisionBlockedNotice(null), 2200);
+            }
+          }
+          const lockObj: ChannelLockInfo = {
+            senderId: ownerId,
+            callsign: ownerCallsign,
+            startedAt: ownerStartTs,
+            updatedAt: Date.now(),
+          };
+          channelLockOwnerRef.current = lockObj;
+          setChannelLockOwner(lockObj);
+          remoteActiveTxRef.current = ownerCallsign;
+          setIncomingSpeaker(ownerCallsign);
         }
-        // If Master overrides while this Client is transmitting, force-stop mic and switch to Rx
-        if (isTransmittingRef.current && (!amIMaster || senderIsMaster)) {
-          forceStopLocalRecording();
+        return;
+      }
+
+      if (
+        pkt.type === 'TX_START' ||
+        pkt.type === 'PTT_START' ||
+        pkt.type === 'CHANNEL_LOCK'
+      ) {
+        const now = Date.now();
+        const incomingStartTs = pkt.lockStartedAt || pkt.timestamp || now;
+        const existingLock = channelLockOwnerRef.current;
+
+        // 1. Check if ANOTHER peer already holds the Channel Lock (First-Speaker-Wins Anti-Collision)
+        if (
+          existingLock &&
+          existingLock.senderId !== pkt.senderId &&
+          now - existingLock.updatedAt < 12000
+        ) {
+          const existingStartedFirst =
+            existingLock.startedAt <= incomingStartTs ||
+            existingLock.senderId < pkt.senderId;
+          if (existingStartedFirst) {
+            // Ignore colliding transmission from the 2nd peer & notify them that channel is busy/locked
+            broadcastMeshPacket({
+              type: 'CHANNEL_BUSY',
+              lockOwnerId: existingLock.senderId,
+              lockOwnerCallsign: existingLock.callsign,
+              lockStartedAt: existingLock.startedAt,
+            });
+            return;
+          }
         }
-        if (isTransmittingRef.current || isReceiverOffRef.current) {
-          return;
+
+        // 2. Check if THIS device is currently transmitting (Simultaneous TX Race Condition)
+        if (isTransmittingRef.current) {
+          const myStartTs = localTxStartedAtRef.current || now;
+          const iStartedFirst =
+            myStartTs < incomingStartTs ||
+            (myStartTs === incomingStartTs && myDeviceId < pkt.senderId);
+
+          if (iStartedFirst) {
+            // THIS device started transmitting first -> keep channel lock, ignore remote colliding TX, and notify them!
+            broadcastMeshPacket({
+              type: 'CHANNEL_BUSY',
+              lockOwnerId: myDeviceId,
+              lockOwnerCallsign: myCallsign,
+              lockStartedAt: myStartTs,
+            });
+            return;
+          } else {
+            // Remote peer started transmitting first -> abort our local TX (discard clip) & yield channel lock!
+            forceStopLocalRecording(true);
+            setCollisionBlockedNotice(
+              `ANTI-COLLISION: ${pkt.callsign} LEBIH DULU MENGUNCI SALURAN`
+            );
+            window.setTimeout(() => setCollisionBlockedNotice(null), 2200);
+          }
         }
+
+        // 3. Grant / Refresh Channel Lockout for the active transmitting peer
+        const isNewLockOwner =
+          !existingLock || existingLock.senderId !== pkt.senderId;
+        const lockObj: ChannelLockInfo = {
+          senderId: pkt.senderId,
+          callsign: pkt.callsign,
+          startedAt:
+            existingLock?.senderId === pkt.senderId
+              ? existingLock.startedAt
+              : incomingStartTs,
+          updatedAt: now,
+        };
+        channelLockOwnerRef.current = lockObj;
+        setChannelLockOwner(lockObj);
         remoteActiveTxRef.current = pkt.callsign;
         setIncomingSpeaker(pkt.callsign);
-        playTacticalTone('rx');
-      } else if (pkt.type === 'TX_STOP' || pkt.type === 'PTT_END') {
+
+        // Immediately lock out local VOX & mute hardware mic track so nearby devices never feedback!
+        voxVoiceFramesRef.current = 0;
+        setVoxInputLevel(0);
+        rxCooldownUntilRef.current = now + 2500;
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getAudioTracks().forEach((track) => {
+            track.enabled = false;
+          });
+        }
+
+        if (isNewLockOwner && pkt.type !== 'CHANNEL_LOCK') {
+          playTacticalTone('rx');
+        }
+      } else if (
+        pkt.type === 'TX_STOP' ||
+        pkt.type === 'PTT_END' ||
+        pkt.type === 'CHANNEL_UNLOCK'
+      ) {
+        // Ignore unlock packets from peers who do not hold the current channel lock
+        if (
+          channelLockOwnerRef.current &&
+          channelLockOwnerRef.current.senderId !== pkt.senderId
+        ) {
+          return;
+        }
         if (remoteActiveTxRef.current === pkt.callsign) {
           remoteActiveTxRef.current = null;
         }
+        // Keep 650ms anti-feedback guard so nearby phones' VOX won't trigger on speaker decay
+        rxCooldownUntilRef.current = Date.now() + 650;
         const activeAudio = activeAudioElementRef.current;
         if (!activeAudio || activeAudio.paused || activeAudio.ended) {
+          channelLockOwnerRef.current = null;
+          setChannelLockOwner(null);
           setIncomingSpeaker((curr) => (curr === pkt.callsign ? null : curr));
+          window.setTimeout(() => {
+            if (
+              voxEnabledRef.current &&
+              !isTransmittingRef.current &&
+              !remoteActiveTxRef.current &&
+              !channelLockOwnerRef.current &&
+              mediaStreamRef.current
+            ) {
+              mediaStreamRef.current.getAudioTracks().forEach((track) => {
+                track.enabled = true;
+              });
+            }
+          }, 620);
         }
       } else if (pkt.type === 'VOICE_CLIP' && pkt.audioBase64) {
-        // STRICT ANTI-ECHO: While 1st-click PTT is open (Receiver OFF), drop incoming voice playback completely
+        // 1. STRICT ANTI-ECHO: While local PTT/VOX is open (Receiver OFF), drop incoming voice playback completely
         if (isTransmittingRef.current || isReceiverOffRef.current) {
           return;
         }
-        playIncomingAudioBase64(pkt.audioBase64, pkt.callsign);
+        // 2. STRICT ANTI-COLLISION: If another client holds the Channel Lock, ignore colliding audio clips!
+        const existingLock = channelLockOwnerRef.current;
+        if (
+          existingLock &&
+          existingLock.senderId !== pkt.senderId &&
+          Date.now() - existingLock.updatedAt < 12000
+        ) {
+          return;
+        }
+        playIncomingAudioBase64(pkt.audioBase64, pkt.callsign, pkt.senderId);
       } else if (pkt.type === 'CHAT_MSG' && pkt.chatText) {
         const newMsg: TacticalChatMessage = {
           id: pkt.packetId || `${pkt.senderId}-${pkt.timestamp}`,
@@ -1436,6 +1787,16 @@ export default function App() {
 
       // Prune peers that have neither an open WebRTC/Offline LAN DataChannel nor a recent ANNOUNCE (> 12s)
       const now = Date.now();
+      // Auto-release stale Channel Lockout if remote transmitter dropped offline without sending TX_STOP (> 12s)
+      if (
+        channelLockOwnerRef.current &&
+        now - channelLockOwnerRef.current.updatedAt > 12000
+      ) {
+        channelLockOwnerRef.current = null;
+        setChannelLockOwner(null);
+        remoteActiveTxRef.current = null;
+        setIncomingSpeaker(null);
+      }
       const anyOfflineDcOpen = Array.from(offlineRtcChannelsRef.current.values()).some(
         (dc) => dc.readyState === 'open'
       );
@@ -1498,94 +1859,485 @@ export default function App() {
   // Permanent role lock based on IP '192.168.43.1'
   const isMasterDevice = localIp === '192.168.43.1';
   const permanentRoleLabel = isMasterDevice ? 'HP MASTER' : 'CLIENT';
-  // FLOOR CONTROL & MASTER OVERRIDE:
-  // Clients are locked out of PTT when someone else is transmitting.
-  // HP MASTER (192.168.43.1) is never locked and can override at any time.
-  const isPttLocked = !isMasterDevice && Boolean(incomingSpeaker);
+
+  // Reset channel lock state when switching channels
+  useEffect(() => {
+    channelLockOwnerRef.current = null;
+    setChannelLockOwner(null);
+    remoteActiveTxRef.current = null;
+    setIncomingSpeaker(null);
+  }, [channel]);
+
+  // UNIVERSAL CHANNEL LOCKOUT / ANTI-COLLISION:
+  // When any peer on the same channel is actively transmitting, lock the channel for ALL other peers
+  // (blocking both VOX triggers and overlapping transmissions until the active transmission finishes).
+  const activeLockSpeaker =
+    incomingSpeaker ||
+    (channelLockOwner && channelLockOwner.senderId !== myDeviceId
+      ? channelLockOwner.callsign
+      : null);
+  const isPttLocked = Boolean(activeLockSpeaker);
 
   // Initialize Web Audio API Graph (AudioContext -> MediaStreamSource -> Vocal Bandpass Filter -> AnalyserNode)
+  // Compatible with Safari (iOS), Chrome (Android), and HarmonyOS, with multi-tier getUserMedia fallbacks
   // Never connected to ctx.destination so microphone never leaks to local speaker!
-  const ensureWebAudioVoxGraph = useCallback(async (): Promise<AnalyserNode | null> => {
-    try {
-      if (!mediaStreamRef.current) {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-        });
-        mediaStreamRef.current = stream;
-        setMicPermissionState('granted');
+  const ensureWebAudioVoxGraph = useCallback(
+    async (forceRebuild = false): Promise<AnalyserNode | null> => {
+      try {
+        // Check if existing MediaStream was ended by OS (e.g. iOS background interrupt or TWS headset switch)
+        if (mediaStreamRef.current) {
+          const tracks = mediaStreamRef.current.getAudioTracks();
+          const hasLiveTrack = tracks.some((t) => t.readyState === 'live');
+          if (!hasLiveTrack || forceRebuild) {
+            tracks.forEach((t) => {
+              try {
+                t.stop();
+              } catch {
+                // Ignore
+              }
+            });
+            mediaStreamRef.current = null;
+            try {
+              micSourceRef.current?.disconnect();
+            } catch {
+              // Ignore
+            }
+            micSourceRef.current = null;
+            micAnalyserRef.current = null;
+          }
+        }
+
+        if (!mediaStreamRef.current) {
+          const result = await requestMicrophoneWithFallbacks();
+          if (!result.stream) {
+            setMicPermissionState('denied');
+            setMicConstraintTier(result.constraintTier);
+            if (result.errorMessage) {
+              setMicErrorNotice(result.errorMessage);
+            }
+            return null;
+          }
+
+          mediaStreamRef.current = result.stream;
+          setMicPermissionState('granted');
+          setMicConstraintTier(result.constraintTier);
+          setMicErrorNotice(null);
+
+          // Listen for hardware track end (e.g., Bluetooth TWS disconnect or OS audio interruption) to auto-recover
+          result.stream.getAudioTracks().forEach((track) => {
+            track.onended = () => {
+              mediaStreamRef.current = null;
+              micSourceRef.current = null;
+              micAnalyserRef.current = null;
+            };
+          });
+        }
+
+        const stream = mediaStreamRef.current;
+        if (!stream) return null;
+
+        const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+        if (!ctx) {
+          setMicErrorNotice('Web Audio API tidak didukung pada peramban ini.');
+          return null;
+        }
+        audioCtxRef.current = ctx;
+
+        // Ensure Keep-Alive Silent Audio Stream is running if enabled so mobile browser never sleeps
+        if (keepAliveEnabledRef.current) {
+          if (!keepAliveSessionRef.current) {
+            keepAliveSessionRef.current = createSilentKeepAliveController();
+          }
+          keepAliveSessionRef.current.start(ctx);
+          setIsSilentKeepAliveRunning(true);
+        }
+
+        if (!micSourceRef.current || !micAnalyserRef.current) {
+          const source = ctx.createMediaStreamSource(stream);
+          // Stage 1: High-pass filter (320Hz) to cut wind buffeting, breath pops, and motorcycle/vehicle engine rumble
+          const windCutHighpass = ctx.createBiquadFilter();
+          windCutHighpass.type = 'highpass';
+          windCutHighpass.frequency.value = 320;
+          windCutHighpass.Q.value = 0.7;
+
+          // Stage 2: Bandpass filter (320Hz - 3400Hz human speech presence band) to isolate human voice from background noise
+          const bandpass = ctx.createBiquadFilter();
+          bandpass.type = 'bandpass';
+          bandpass.frequency.value = 1150;
+          bandpass.Q.value = 0.85;
+
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 256;
+          analyser.smoothingTimeConstant = 0.35;
+
+          source.connect(windCutHighpass);
+          windCutHighpass.connect(bandpass);
+          bandpass.connect(analyser);
+
+          micSourceRef.current = source;
+          micFilterRef.current = bandpass;
+          micAnalyserRef.current = analyser;
+        }
+
+        return micAnalyserRef.current;
+      } catch {
+        setMicPermissionState('denied');
+        setMicErrorNotice(
+          'Gagal menginisialisasi mikrofon. Ketuk tombol Izin Audio untuk mengaktifkan ulang.'
+        );
+        return null;
       }
+    },
+    []
+  );
 
-      const stream = mediaStreamRef.current;
-      if (!stream) return null;
-
-      if (!audioCtxRef.current) {
-        audioCtxRef.current = new (window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+  // Handler saat pengguna menekan tombol untuk memberikan / memulihkan izin audio di Safari (iOS) / Chrome (Android/HarmonyOS)
+  const handleGrantOrRecoverAudioPermission = useCallback(async () => {
+    const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+    if (ctx) {
+      audioCtxRef.current = ctx;
+      await unlockMobileAudioSession(ctx, reusableRxAudioRef.current);
+      if (keepAliveEnabledRef.current) {
+        if (!keepAliveSessionRef.current) {
+          keepAliveSessionRef.current = createSilentKeepAliveController();
+        }
+        keepAliveSessionRef.current.start(ctx);
+        setIsSilentKeepAliveRunning(true);
       }
-      const ctx = audioCtxRef.current;
-      if (ctx.state === 'suspended') {
-        await ctx.resume().catch(() => {});
-      }
-
-      if (!micSourceRef.current || !micAnalyserRef.current) {
-        const source = ctx.createMediaStreamSource(stream);
-        // Stage 1: High-pass filter (320Hz) to cut wind buffeting, breath pops, and motorcycle/vehicle engine rumble
-        const windCutHighpass = ctx.createBiquadFilter();
-        windCutHighpass.type = 'highpass';
-        windCutHighpass.frequency.value = 320;
-        windCutHighpass.Q.value = 0.7;
-
-        // Stage 2: Bandpass filter (320Hz - 3400Hz human speech presence band) to isolate human voice from background noise
-        const bandpass = ctx.createBiquadFilter();
-        bandpass.type = 'bandpass';
-        bandpass.frequency.value = 1150;
-        bandpass.Q.value = 0.85;
-
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.35;
-
-        source.connect(windCutHighpass);
-        windCutHighpass.connect(bandpass);
-        bandpass.connect(analyser);
-
-        micSourceRef.current = source;
-        micFilterRef.current = bandpass;
-        micAnalyserRef.current = analyser;
-      }
-
-      return micAnalyserRef.current;
-    } catch {
-      setMicPermissionState('denied');
-      return null;
     }
-  }, []);
+    const analyser = await ensureWebAudioVoxGraph(true);
+    if (analyser) {
+      setMicPermissionState('granted');
+      setMicErrorNotice(null);
+      playTacticalTone('start');
+    }
+  }, [ensureWebAudioVoxGraph, playTacticalTone]);
+
+  // Monitor perubahan status izin mikrofon (Permissions API) & pergantian perangkat audio (TWS Bluetooth)
+  // Saat izin diberikan oleh pengguna di Safari/Chrome, sistem otomatis mengaktifkan Web Audio VOX & Keep-Alive!
+  useEffect(() => {
+    let permissionStatus: PermissionStatus | null = null;
+    let isUnmounted = false;
+
+    const handlePermissionChange = () => {
+      if (isUnmounted || !permissionStatus) return;
+      if (permissionStatus.state === 'granted') {
+        setMicPermissionState('granted');
+        setMicErrorNotice(null);
+        const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+        if (ctx) {
+          audioCtxRef.current = ctx;
+          unlockMobileAudioSession(ctx, reusableRxAudioRef.current);
+        }
+        ensureWebAudioVoxGraph(true);
+      } else if (permissionStatus.state === 'denied') {
+        setMicPermissionState('denied');
+      }
+    };
+
+    if (
+      typeof navigator !== 'undefined' &&
+      'permissions' in navigator &&
+      typeof navigator.permissions?.query === 'function'
+    ) {
+      navigator.permissions
+        .query({ name: 'microphone' as PermissionName })
+        .then((status) => {
+          if (isUnmounted) return;
+          permissionStatus = status;
+          if (status.state === 'granted') {
+            setMicPermissionState('granted');
+            setMicErrorNotice(null);
+          } else if (status.state === 'denied') {
+            setMicPermissionState('denied');
+          }
+          status.onchange = handlePermissionChange;
+        })
+        .catch(() => {
+          // Safari versions that do not support 'microphone' query in navigator.permissions will use getUserMedia directly
+        });
+    }
+
+    const handleDeviceChange = () => {
+      if (isUnmounted) return;
+      // Rebuild microphone stream if user connects/disconnects TWS earbuds or wired headset
+      if (isSetupCompleted && (voxEnabledRef.current || isTransmittingRef.current)) {
+        ensureWebAudioVoxGraph(true);
+      }
+    };
+
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.addEventListener === 'function'
+    ) {
+      navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
+    }
+
+    return () => {
+      isUnmounted = true;
+      if (permissionStatus) {
+        permissionStatus.onchange = null;
+      }
+      if (
+        typeof navigator !== 'undefined' &&
+        navigator.mediaDevices &&
+        typeof navigator.mediaDevices.removeEventListener === 'function'
+      ) {
+        navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
+      }
+    };
+  }, [isSetupCompleted, ensureWebAudioVoxGraph]);
+
+  // SISTEM KEEP-ALIVE LATAR BELAKANG (SILENT AUDIO STREAM VIA WEB AUDIO API PADA VISIBILITYCHANGE EVENT)
+  // Mencegah browser Android (Chrome/HarmonyOS) & iOS (Safari) membekukan aliran WebSocket, VOX,
+  // dan pemutaran suara masuk saat layar HP dimatikan atau dimasukkan ke dalam saku saat berkendara.
+  useEffect(() => {
+    if (!isSetupCompleted || !myCallsign) return;
+
+    if (!keepAliveSessionRef.current) {
+      keepAliveSessionRef.current = createSilentKeepAliveController();
+    }
+    const controller = keepAliveSessionRef.current;
+    let backgroundSocketHeartbeat: number | null = null;
+
+    const syncKeepAliveState = () => {
+      if (!keepAliveEnabled) {
+        controller.stop();
+        setIsSilentKeepAliveRunning(false);
+        return;
+      }
+      const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+      if (ctx) {
+        audioCtxRef.current = ctx;
+        controller.start(ctx);
+        setIsSilentKeepAliveRunning(controller.isActive());
+      }
+    };
+
+    syncKeepAliveState();
+
+    const handleVisibilityChange = () => {
+      const isHidden = document.visibilityState === 'hidden' || document.hidden;
+      setIsBackgroundMode(isHidden);
+
+      const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+      if (ctx) {
+        audioCtxRef.current = ctx;
+        if (keepAliveEnabledRef.current) {
+          controller.pulseOnVisibilityChange(ctx, isHidden);
+          setIsSilentKeepAliveRunning(true);
+        }
+      }
+
+      if (isHidden) {
+        // Saat layar HP mati / masuk saku (background): jalankan detak jantung WebSocket/WebRTC tiap 4 detik
+        // agar soket jaringan dan pemutaran suara masuk tetap hidup 100%
+        if (backgroundSocketHeartbeat) {
+          window.clearInterval(backgroundSocketHeartbeat);
+        }
+        broadcastMeshPacket({ type: 'ANNOUNCE' });
+        backgroundSocketHeartbeat = window.setInterval(() => {
+          // Pastikan AudioContext tidak dibekukan oleh OS
+          if (audioCtxRef.current) {
+            const st = audioCtxRef.current.state as string;
+            if (st === 'suspended' || st === 'interrupted') {
+              audioCtxRef.current.resume().catch(() => {});
+            }
+            if (keepAliveEnabledRef.current) {
+              controller.pulseOnVisibilityChange(audioCtxRef.current, true);
+            }
+          }
+          // Kirim paket keep-alive ANNOUNCE ke WebSocket / MQTT / WebRTC agar aliran data tetap aktif
+          broadcastMeshPacket({ type: 'ANNOUNCE' });
+          if (peerRef.current && peerRef.current.disconnected && !peerRef.current.destroyed) {
+            try {
+              peerRef.current.reconnect();
+            } catch {
+              // Ignore
+            }
+          }
+        }, 4000);
+      } else {
+        // Saat layar HP kembali menyala (visible): bersihkan timer latar belakang & pulihkan AudioContext/Mic
+        if (backgroundSocketHeartbeat) {
+          window.clearInterval(backgroundSocketHeartbeat);
+          backgroundSocketHeartbeat = null;
+        }
+        if (audioCtxRef.current) {
+          const st = audioCtxRef.current.state as string;
+          if (st === 'suspended' || st === 'interrupted') {
+            audioCtxRef.current.resume().catch(() => {});
+          }
+        }
+        if (voxEnabledRef.current) {
+          ensureWebAudioVoxGraph();
+        }
+        broadcastMeshPacket({ type: 'ANNOUNCE' });
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handleVisibilityChange);
+    window.addEventListener('pageshow', handleVisibilityChange);
+    window.addEventListener('blur', handleVisibilityChange);
+    window.addEventListener('focus', handleVisibilityChange);
+
+    return () => {
+      if (backgroundSocketHeartbeat) {
+        window.clearInterval(backgroundSocketHeartbeat);
+      }
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handleVisibilityChange);
+      window.removeEventListener('pageshow', handleVisibilityChange);
+      window.removeEventListener('blur', handleVisibilityChange);
+      window.removeEventListener('focus', handleVisibilityChange);
+    };
+  }, [
+    isSetupCompleted,
+    myCallsign,
+    keepAliveEnabled,
+    broadcastMeshPacket,
+    ensureWebAudioVoxGraph,
+  ]);
+
+  // Helper untuk mengirim Blob rekaman suara (baik dari MediaRecorder maupun fallback WAV) ke jaringan
+  const dispatchRecordedVoiceBlob = useCallback(
+    (blob: Blob) => {
+      // Keep mic enabled ONLY if VOX is active and no incoming speaker is playing; otherwise disable track
+      if (mediaStreamRef.current) {
+        const keepOpenForVox =
+          voxEnabledRef.current &&
+          !remoteActiveTxRef.current &&
+          !channelLockOwnerRef.current;
+        mediaStreamRef.current.getAudioTracks().forEach((track) => {
+          track.enabled = keepOpenForVox;
+        });
+      }
+
+      // If this recording was aborted due to Anti-Collision, discard the audio clip so it never collides!
+      if (abortDiscardRecordingRef.current) {
+        abortDiscardRecordingRef.current = false;
+        return;
+      }
+
+      if (blob.size > 200) {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64Audio = reader.result as string;
+          if (base64Audio) {
+            broadcastMeshPacket({
+              type: 'VOICE_CLIP',
+              audioBase64: base64Audio,
+              mimeType: blob.type || 'audio/wav',
+              lockOwnerId: myDeviceId,
+              lockOwnerCallsign: myCallsign,
+              lockStartedAt: localTxStartedAtRef.current,
+            });
+
+            // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
+            if (
+              !isTransmittingRef.current &&
+              !isReceiverOffRef.current &&
+              echoTestMode &&
+              membersRef.current.length === 0
+            ) {
+              window.setTimeout(() => {
+                playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
+              }, 350);
+            }
+          }
+        };
+        reader.readAsDataURL(blob);
+      }
+    },
+    [broadcastMeshPacket, myDeviceId, myCallsign, echoTestMode, playIncomingAudioBase64]
+  );
 
   // onStartTransmit (Dipanggil otomatis oleh VOX saat suara melewati threshold, atau saat Klik Pertama tombol PTT)
   const onStartTransmit = useCallback(
     async (triggerSource: 'VOX' | 'MANUAL' = 'MANUAL') => {
       if (isTransmittingRef.current) return;
-      if (isPttLocked) return;
+
+      // 0. CHANNEL LOCKOUT / ANTI-COLLISION CHECK:
+      // Reject VOX or manual PTT if another client is currently transmitting or playing audio on this channel
+      const now = Date.now();
+      const existingLock = channelLockOwnerRef.current;
+      const isChannelLockedByOther =
+        Boolean(remoteActiveTxRef.current) ||
+        Boolean(
+          existingLock &&
+            existingLock.senderId !== myDeviceId &&
+            now - existingLock.updatedAt < 12000
+        ) ||
+        Boolean(
+          activeAudioElementRef.current &&
+            !activeAudioElementRef.current.paused &&
+            !activeAudioElementRef.current.ended
+        ) ||
+        Boolean(activeWebAudioRxStopRef.current) ||
+        (triggerSource === 'VOX' && now < rxCooldownUntilRef.current);
+
+      if (isChannelLockedByOther || isPttLocked) {
+        voxVoiceFramesRef.current = 0;
+        setVoxInputLevel(0);
+        if (triggerSource === 'MANUAL') {
+          const holder =
+            existingLock?.callsign || remoteActiveTxRef.current || 'REKAN';
+          setCollisionBlockedNotice(
+            `ANTI-COLLISION: SALURAN SEDANG DIGUNAKAN OLEH ${holder}`
+          );
+          window.setTimeout(() => setCollisionBlockedNotice(null), 2000);
+        }
+        return;
+      }
 
       // 1. STRICT HALF-DUPLEX (ANTI-ECHO): Matikan Receiver (Speaker RX OFF, Volume 0) SEBELUM membuka transmisi!
       muteAndDisableReceiver();
 
+      const txStartTs = Date.now();
+      localTxStartedAtRef.current = txStartTs;
+      abortDiscardRecordingRef.current = false;
       remoteActiveTxRef.current = null;
       setIncomingSpeaker(null);
       setIsTransmitting(true);
       isTransmittingRef.current = true;
       isVoxTriggeredTxRef.current = triggerSource === 'VOX';
-      lastVoiceActiveTimeRef.current = Date.now();
-      broadcastMeshPacket({ type: 'TX_START' });
+      lastVoiceActiveTimeRef.current = txStartTs;
+
+      // 2. Klaim Penguncian Saluran (CHANNEL_LOCK + TX_START) ke seluruh klien WebSocket / WebRTC / Mesh
+      broadcastMeshPacket({
+        type: 'CHANNEL_LOCK',
+        lockOwnerId: myDeviceId,
+        lockOwnerCallsign: myCallsign,
+        lockStartedAt: txStartTs,
+      });
+      broadcastMeshPacket({
+        type: 'TX_START',
+        lockOwnerId: myDeviceId,
+        lockOwnerCallsign: myCallsign,
+        lockStartedAt: txStartTs,
+      });
+
+      // 3. Heartbeat CHANNEL_LOCK setiap 2 detik selama transmisi aktif agar klien yang baru gabung tetap terkunci
+      if (txLockHeartbeatRef.current) {
+        window.clearInterval(txLockHeartbeatRef.current);
+      }
+      txLockHeartbeatRef.current = window.setInterval(() => {
+        if (!isTransmittingRef.current) return;
+        broadcastMeshPacket({
+          type: 'CHANNEL_LOCK',
+          lockOwnerId: myDeviceId,
+          lockOwnerCallsign: myCallsign,
+          lockStartedAt: localTxStartedAtRef.current,
+        });
+      }, 2000);
 
       try {
         const analyser = await ensureWebAudioVoxGraph();
         const stream = mediaStreamRef.current;
-        if (stream && analyser) {
+        const ctx = audioCtxRef.current;
+        if (stream && analyser && ctx) {
           stream.getAudioTracks().forEach((track) => {
             track.enabled = true;
           });
@@ -1600,65 +2352,80 @@ export default function App() {
           };
           updateMeter();
 
-          const segmentChunks: Blob[] = [];
-          recordedChunksRef.current = segmentChunks;
+          // Negotiate best supported audio MIME type for Chrome (Android/HarmonyOS) or Safari (iOS)
+          const negotiatedMime = getSupportedAudioMimeType();
+          let startedMediaRecorder = false;
 
-          let recorder: MediaRecorder;
-          try {
-            recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
-          } catch {
-            recorder = new MediaRecorder(stream);
-          }
+          if (typeof MediaRecorder !== 'undefined') {
+            try {
+              const segmentChunks: Blob[] = [];
+              recordedChunksRef.current = segmentChunks;
 
-          recorder.ondataavailable = (e) => {
-            if (e.data && e.data.size > 0) {
-              segmentChunks.push(e.data);
-            }
-          };
+              const recorderOptions: MediaRecorderOptions = {
+                audioBitsPerSecond: 24000,
+              };
+              if (negotiatedMime) {
+                recorderOptions.mimeType = negotiatedMime;
+              }
 
-          recorder.onstop = () => {
-            // Keep mic enabled ONLY if VOX is active and no incoming speaker is playing; otherwise disable track
-            if (mediaStreamRef.current) {
-              const keepOpenForVox =
-                voxEnabledRef.current && !remoteActiveTxRef.current;
-              mediaStreamRef.current.getAudioTracks().forEach((track) => {
-                track.enabled = keepOpenForVox;
-              });
-            }
+              let recorder: MediaRecorder;
+              try {
+                recorder = new MediaRecorder(stream, recorderOptions);
+              } catch {
+                recorder = negotiatedMime
+                  ? new MediaRecorder(stream, { mimeType: negotiatedMime })
+                  : new MediaRecorder(stream);
+              }
 
-            const blob = new Blob(segmentChunks, {
-              type: recorder.mimeType || 'audio/webm',
-            });
-            if (blob.size > 200) {
-              const reader = new FileReader();
-              reader.onloadend = () => {
-                const base64Audio = reader.result as string;
-                if (base64Audio) {
-                  broadcastMeshPacket({
-                    type: 'VOICE_CLIP',
-                    audioBase64: base64Audio,
-                    mimeType: blob.type,
-                  });
-
-                  // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
-                  if (
-                    !isTransmittingRef.current &&
-                    !isReceiverOffRef.current &&
-                    echoTestMode &&
-                    membersRef.current.length === 0
-                  ) {
-                    window.setTimeout(() => {
-                      playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
-                    }, 350);
-                  }
+              recorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) {
+                  segmentChunks.push(e.data);
                 }
               };
-              reader.readAsDataURL(blob);
-            }
-          };
 
-          mediaRecorderRef.current = recorder;
-          recorder.start();
+              recorder.onstop = () => {
+                const effectiveMime =
+                  recorder.mimeType || negotiatedMime || 'audio/mp4';
+                const blob = new Blob(segmentChunks, { type: effectiveMime });
+                dispatchRecordedVoiceBlob(blob);
+              };
+
+              mediaRecorderRef.current = recorder;
+              recorder.start();
+              startedMediaRecorder = true;
+            } catch {
+              startedMediaRecorder = false;
+            }
+          }
+
+          // Fallback: Web Audio API ScriptProcessor PCM-to-WAV Recorder (for older iOS Safari / HarmonyOS WebViews)
+          if (!startedMediaRecorder && micSourceRef.current) {
+            pcmChunksRef.current = [];
+            isPcmRecordingRef.current = true;
+            const processor = ctx.createScriptProcessor(4096, 1, 1);
+            const zeroGain = ctx.createGain();
+            zeroGain.gain.value = 0; // Mute output so mic never feeds back into local speaker!
+
+            processor.onaudioprocess = (ev) => {
+              if (!isPcmRecordingRef.current) return;
+              const inputData = ev.inputBuffer.getChannelData(0);
+              pcmChunksRef.current.push(new Float32Array(inputData));
+            };
+
+            micSourceRef.current.connect(processor);
+            processor.connect(zeroGain);
+            zeroGain.connect(ctx.destination);
+            pcmProcessorRef.current = processor;
+            pcmZeroGainRef.current = zeroGain;
+          }
+        } else {
+          // If microphone permission is not yet granted, fallback visual meter so UI remains responsive
+          const fallbackTick = () => {
+            if (!isTransmittingRef.current) return;
+            setMicLevel(Math.floor(40 + Math.random() * 55));
+            animFrameRef.current = requestAnimationFrame(fallbackTick);
+          };
+          fallbackTick();
         }
       } catch {
         setMicPermissionState('denied');
@@ -1671,13 +2438,13 @@ export default function App() {
       }
     },
     [
+      myDeviceId,
       isPttLocked,
       muteAndDisableReceiver,
       broadcastMeshPacket,
       ensureWebAudioVoxGraph,
-      echoTestMode,
+      dispatchRecordedVoiceBlob,
       myCallsign,
-      playIncomingAudioBase64,
     ]
   );
 
@@ -1695,6 +2462,11 @@ export default function App() {
       pttSegmentIntervalRef.current = null;
     }
 
+    if (txLockHeartbeatRef.current) {
+      window.clearInterval(txLockHeartbeatRef.current);
+      txLockHeartbeatRef.current = null;
+    }
+
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
@@ -1707,7 +2479,7 @@ export default function App() {
       });
     }
 
-    // Hentikan perekam & kirim paket VOICE_CLIP
+    // Hentikan perekam MediaRecorder & kirim paket VOICE_CLIP
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop();
@@ -1716,12 +2488,48 @@ export default function App() {
       }
     }
 
-    // Aktifkan kembali Receiver (RX ON) + beri cooldown singkat agar Roger Beep tidak memicu ulang VOX
-    rxCooldownUntilRef.current = Date.now() + 380;
+    // Hentikan perekam fallback PCM-to-WAV jika aktif (Safari iOS / HarmonyOS fallback)
+    if (isPcmRecordingRef.current) {
+      isPcmRecordingRef.current = false;
+      const recordedChunks = pcmChunksRef.current;
+      pcmChunksRef.current = [];
+      try {
+        pcmProcessorRef.current?.disconnect();
+        pcmZeroGainRef.current?.disconnect();
+      } catch {
+        // Ignore disconnect error
+      }
+      pcmProcessorRef.current = null;
+      pcmZeroGainRef.current = null;
+
+      if (recordedChunks.length > 0) {
+        const sampleRate = audioCtxRef.current?.sampleRate || 44100;
+        const wavBlob = encodePcmChunksToWavBlob(recordedChunks, sampleRate);
+        dispatchRecordedVoiceBlob(wavBlob);
+      }
+    }
+
+    // Aktifkan kembali Receiver (RX ON) + beri cooldown 550ms agar Roger Beep & pantulan akustik tidak memicu ulang VOX
+    rxCooldownUntilRef.current = Date.now() + 550;
     isReceiverOffRef.current = false;
     playTacticalTone('end');
-    broadcastMeshPacket({ type: 'TX_STOP' });
-  }, [playTacticalTone, broadcastMeshPacket]);
+    broadcastMeshPacket({
+      type: 'TX_STOP',
+      lockOwnerId: myDeviceId,
+      lockOwnerCallsign: myCallsign,
+    });
+    broadcastMeshPacket({
+      type: 'CHANNEL_UNLOCK',
+      lockOwnerId: myDeviceId,
+      lockOwnerCallsign: myCallsign,
+    });
+  }, [
+    myDeviceId,
+    myCallsign,
+    playTacticalTone,
+    broadcastMeshPacket,
+    dispatchRecordedVoiceBlob,
+  ]);
 
   const handlePttStart = () => onStartTransmit('MANUAL');
   const handlePttEnd = () => onStopTransmit();
@@ -1777,7 +2585,11 @@ export default function App() {
       const analyser = await ensureWebAudioVoxGraph();
       if (isCancelled || !analyser) return;
 
-      if (mediaStreamRef.current && !remoteActiveTxRef.current) {
+      if (
+        mediaStreamRef.current &&
+        !remoteActiveTxRef.current &&
+        !channelLockOwnerRef.current
+      ) {
         mediaStreamRef.current.getAudioTracks().forEach((t) => {
           t.enabled = true;
         });
@@ -1789,25 +2601,53 @@ export default function App() {
       voxTimer = window.setInterval(() => {
         if (isCancelled) return;
 
-        // Auto-resume AudioContext if mobile browser suspended it
-        if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
-          audioCtxRef.current.resume().catch(() => {});
+        // Auto-resume AudioContext if mobile browser (Safari iOS / Chrome Android / HarmonyOS) suspended or interrupted it
+        if (audioCtxRef.current) {
+          const st = audioCtxRef.current.state as string;
+          if (st === 'suspended' || st === 'interrupted') {
+            audioCtxRef.current.resume().catch(() => {});
+          }
         }
 
-        // Strict Half-Duplex Gate: Do not trigger VOX while receiving incoming audio from another peer or in cooldown
-        const isReceivingNow =
+        // Strict Channel Lockout & Half-Duplex Anti-Collision Gate:
+        // Never allow VOX to sample or trigger while another peer holds the channel lock, is playing RX audio, or in cooldown
+        const now = Date.now();
+        const activeLock = channelLockOwnerRef.current;
+        const isChannelLockedOrReceiving =
           Boolean(remoteActiveTxRef.current) ||
+          Boolean(
+            activeLock &&
+              activeLock.senderId !== myDeviceId &&
+              now - activeLock.updatedAt < 12000
+          ) ||
           Boolean(
             activeAudioElementRef.current &&
               !activeAudioElementRef.current.paused &&
               !activeAudioElementRef.current.ended
           ) ||
-          Date.now() < rxCooldownUntilRef.current;
+          Boolean(activeWebAudioRxStopRef.current) ||
+          now < rxCooldownUntilRef.current;
 
-        if (isReceivingNow && !isTransmittingRef.current) {
+        if (isChannelLockedOrReceiving && !isTransmittingRef.current) {
           voxVoiceFramesRef.current = 0;
           setVoxInputLevel(0);
+          if (mediaStreamRef.current) {
+            mediaStreamRef.current.getAudioTracks().forEach((t) => {
+              if (t.enabled) t.enabled = false;
+            });
+          }
           return;
+        }
+
+        // Re-enable mic track for VOX standby once channel lock & cooldown are completely clear
+        if (
+          voxEnabledRef.current &&
+          !isTransmittingRef.current &&
+          mediaStreamRef.current
+        ) {
+          mediaStreamRef.current.getAudioTracks().forEach((t) => {
+            if (!t.enabled) t.enabled = true;
+          });
         }
 
         analyser.getByteTimeDomainData(timeDomainBuf);
@@ -1835,13 +2675,12 @@ export default function App() {
         );
         setVoxInputLevel(voiceEnergy);
 
-        const now = Date.now();
         const threshold = voxThresholdRef.current;
         // In noisy/windy environments (threshold >= 38%), require 3 consecutive vocal frames (~165ms) to reject gusts/impulses
         const requiredFrames = threshold >= 38 ? 3 : 2;
 
         if (!isTransmittingRef.current) {
-          // Standby Listening -> Check if voice exceeds VOX threshold
+          // Standby Listening -> Check if voice exceeds VOX threshold (only when channel is NOT locked)
           if (voxEnabledRef.current && !isPttLocked && voiceEnergy >= threshold) {
             voxVoiceFramesRef.current += 1;
             if (voxVoiceFramesRef.current >= requiredFrames) {
@@ -1869,10 +2708,16 @@ export default function App() {
 
     startContinuousVoxMonitor();
 
-    // Ensure AudioContext unlocks on any touch/click if browser initially suspended it on reload
+    // Ensure AudioContext, reusable HTMLAudioElement & Keep-Alive Silent Stream unlock on any touch/click (iOS Safari & Android Chrome)
     const unlockAudioOnInteraction = () => {
-      if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
-        audioCtxRef.current.resume().catch(() => {});
+      const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+      if (ctx) {
+        audioCtxRef.current = ctx;
+        unlockMobileAudioSession(ctx, reusableRxAudioRef.current);
+        if (keepAliveEnabledRef.current && keepAliveSessionRef.current) {
+          keepAliveSessionRef.current.start(ctx);
+          setIsSilentKeepAliveRunning(true);
+        }
       }
       if (voxEnabledRef.current && !mediaStreamRef.current) {
         ensureWebAudioVoxGraph();
@@ -1892,6 +2737,7 @@ export default function App() {
   }, [
     isSetupCompleted,
     myCallsign,
+    myDeviceId,
     voxEnabled,
     isPttLocked,
     ensureWebAudioVoxGraph,
@@ -2991,17 +3837,17 @@ export default function App() {
               </div>
             </div>
 
-            {/* Baris Tengah: Panel Sakelar VOX (VOX On/Off Switch) & Pengatur Sensitivitas (Threshold Slider Anti-Bising/Angin) */}
+            {/* Baris Tengah: Panel Sakelar VOX (VOX On/Off Switch), Keep-Alive Saku/Layar Mati & Pengatur Sensitivitas (Threshold Slider Anti-Bising/Angin) */}
             <div className="tactical-panel rounded-xl px-2.5 py-1.5 flex flex-col gap-1 border border-[#23dcff]/60">
-              {/* Baris 1: Tombol Sakelar VOX (On/Off Switch) + Mode Preset Anti-Bising/Angin + Hold Time */}
-              <div className="flex items-center justify-between gap-1.5">
+              {/* Baris 1: Tombol Sakelar VOX (On/Off Switch) + Mode Preset Anti-Bising/Angin + Keep-Alive Saku + Hold Time */}
+              <div className="flex items-center justify-between gap-1">
                 {/* Tombol Sakelar VOX (VOX On/Off Switch) */}
                 <button
                   type="button"
                   role="switch"
                   aria-checked={voxEnabled}
                   onClick={handleToggleVoxSwitch}
-                  className={`px-2 py-0.5 rounded-lg border flex items-center gap-1.5 transition-all shrink-0 cursor-pointer ${
+                  className={`px-2 py-0.5 rounded-lg border flex items-center gap-1 transition-all shrink-0 cursor-pointer ${
                     voxEnabled
                       ? 'bg-[#073b61] border-[#23dcff] text-white shadow-[0_0_10px_rgba(35,220,255,0.3)]'
                       : 'bg-[#031829] border-cyan-500/35 text-cyan-200/75'
@@ -3009,18 +3855,18 @@ export default function App() {
                 >
                   {/* Visual Sliding Switch Track & Knob */}
                   <div
-                    className={`w-7 h-4 rounded-full p-0.5 flex items-center transition-colors ${
+                    className={`w-6.5 h-3.5 rounded-full p-0.5 flex items-center transition-colors ${
                       voxEnabled ? 'bg-[#23dcff] justify-end' : 'bg-[#02101c] border border-cyan-500/40 justify-start'
                     }`}
                   >
                     <span
-                      className={`w-3 h-3 rounded-full transition-transform ${
+                      className={`w-2.5 h-2.5 rounded-full transition-transform ${
                         voxEnabled ? 'bg-[#02182b] shadow-xs' : 'bg-cyan-300/70'
                       }`}
                     />
                   </div>
-                  <span className="font-tactical text-[11.5px] font-extrabold tracking-wider">
-                    {voxEnabled ? 'VOX: ON' : 'VOX: OFF'}
+                  <span className="font-tactical text-[11px] font-extrabold tracking-wider">
+                    {voxEnabled ? 'VOX:ON' : 'VOX:OFF'}
                   </span>
                 </button>
 
@@ -3038,7 +3884,7 @@ export default function App() {
                         type="button"
                         onClick={() => setVoxThreshold(preset.val)}
                         title={`Set Sensitivitas VOX ke Mode ${preset.label} (${preset.val}%)`}
-                        className={`px-1.5 py-0.5 rounded font-telemetry text-[8.5px] font-bold transition-colors cursor-pointer ${
+                        className={`px-1.5 py-0.5 rounded font-telemetry text-[8px] font-bold transition-colors cursor-pointer ${
                           isActivePreset
                             ? 'bg-[#23dcff] text-[#02182b] font-extrabold'
                             : 'bg-[#042138] hover:bg-[#083456] text-cyan-100 border border-cyan-400/35'
@@ -3050,17 +3896,46 @@ export default function App() {
                   })}
                 </div>
 
-                {/* Tombol Jeda Hening (Hold Time) */}
+                {/* Tombol Sakelar Keep-Alive (Silent Audio Stream Mode Saku / Layar Mati) */}
                 <button
                   type="button"
-                  onClick={() =>
-                    setVoxHoldMs((prev) => (prev === 1100 ? 1600 : prev === 1600 ? 750 : 1100))
-                  }
-                  title="Jeda Hening Penutup Otomatis (Hold Time)"
-                  className="px-1.5 py-0.5 rounded bg-[#052542] hover:bg-[#093862] border border-cyan-400/45 font-telemetry text-[8.5px] font-bold text-cyan-100 shrink-0 cursor-pointer"
+                  onClick={() => setKeepAliveEnabled((prev) => !prev)}
+                  title="Keep-Alive Silent Audio Stream (Agar WebSocket & Audio Tetap Hidup Saat Layar HP Mati / Masuk Saku)"
+                  className={`px-1.5 py-0.5 rounded border font-telemetry text-[8px] font-extrabold transition-colors shrink-0 cursor-pointer ${
+                    keepAliveEnabled
+                      ? 'bg-[#06385c] border-[#23dcff] text-[#23dcff]'
+                      : 'bg-[#031829] border-cyan-500/30 text-cyan-300/60'
+                  }`}
                 >
-                  {(voxHoldMs / 1000).toFixed(1)}s
+                  {keepAliveEnabled
+                    ? isBackgroundMode
+                      ? 'SAKU:AKTIF'
+                      : 'KEEP:ON'
+                    : 'KEEP:OFF'}
                 </button>
+
+                {/* Tombol Jeda Hening (Hold Time) atau Tombol Pulihkan Izin Mic jika Ditolak */}
+                {micPermissionState === 'denied' || micErrorNotice ? (
+                  <button
+                    type="button"
+                    onClick={handleGrantOrRecoverAudioPermission}
+                    title={micErrorNotice || 'Aktifkan Izin Mikrofon & Web Audio'}
+                    className="px-1.5 py-0.5 rounded bg-amber-400 text-[#02182b] font-telemetry text-[8px] font-extrabold shrink-0 cursor-pointer animate-pulse"
+                  >
+                    IZIN MIC
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setVoxHoldMs((prev) => (prev === 1100 ? 1600 : prev === 1600 ? 750 : 1100))
+                    }
+                    title="Jeda Hening Penutup Otomatis (Hold Time)"
+                    className="px-1.5 py-0.5 rounded bg-[#052542] hover:bg-[#093862] border border-cyan-400/45 font-telemetry text-[8px] font-bold text-cyan-100 shrink-0 cursor-pointer"
+                  >
+                    {(voxHoldMs / 1000).toFixed(1)}s
+                  </button>
+                )}
               </div>
 
               {/* Baris 2: Pengatur Sensitivitas VOX (Threshold Slider) + Indikator Level Suara vs Ambang Bising */}
@@ -3104,7 +3979,9 @@ export default function App() {
                 </div>
 
                 <span className="font-telemetry text-[9px] text-cyan-100/95 shrink-0 min-w-[82px] text-right">
-                  {voxEnabled
+                  {isPttLocked
+                    ? `LOCKED (${activeLockSpeaker})`
+                    : voxEnabled
                     ? `MIC:${voxInputLevel}% (${getVoxNoiseGateLabel(voxThreshold)})`
                     : 'MANUAL PTT'}
                 </span>
@@ -3155,7 +4032,7 @@ export default function App() {
                 {activeChannelPeers.map((member) => {
                   const isHighlighted =
                     selectedMemberId === member.id ||
-                    incomingSpeaker === member.callsign ||
+                    activeLockSpeaker === member.callsign ||
                     member.isTargeted;
                   return (
                     <div
@@ -3217,7 +4094,7 @@ export default function App() {
                         : `${h * 0.65}px`,
                     }}
                     className={`w-1.5 rounded-full transition-all duration-75 ${
-                      isTransmitting || incomingSpeaker
+                      isTransmitting || activeLockSpeaker
                         ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
                         : 'bg-[#23dcff]/55'
                     }`}
@@ -3225,7 +4102,7 @@ export default function App() {
                 ))}
               </div>
 
-              {/* Tombol Lingkaran PTT (VOX Hands-Free Otomatis + Klik Manual) */}
+              {/* Tombol Lingkaran PTT (VOX Hands-Free Otomatis + Klik Manual + Channel Lockout) */}
               <button
                 type="button"
                 disabled={isPttLocked}
@@ -3283,10 +4160,8 @@ export default function App() {
                       ? voxEnabled
                         ? 'VOX TRANSMIT'
                         : 'KLIK TUTUP PTT'
-                      : incomingSpeaker
-                      ? isPttLocked
-                        ? `RX ${incomingSpeaker}`
-                        : `OVERRIDE`
+                      : isPttLocked
+                      ? `LOCK: ${activeLockSpeaker}`
                       : voxEnabled
                       ? 'VOX STANDBY'
                       : isMasterDevice
@@ -3295,11 +4170,11 @@ export default function App() {
                   </span>
                   <span className="font-telemetry text-[8px] font-bold text-cyan-100/95 leading-none mt-0.5">
                     {isTransmitting
-                      ? 'RX OFF • ANTI-ECHO'
+                      ? 'SALURAN DIKUNCI • RX OFF'
                       : isPttLocked
-                      ? 'MIC OFF • RX ON'
+                      ? 'VOX & TX LOCKED'
                       : voxEnabled
-                      ? 'BICARA OTOMATIS'
+                      ? 'ANTI-COLLISION SIAP'
                       : 'KLIK BUKA PTT'}
                   </span>
                 </div>
@@ -3318,7 +4193,7 @@ export default function App() {
                         : `${h * 0.65}px`,
                     }}
                     className={`w-1.5 rounded-full transition-all duration-75 ${
-                      isTransmitting || incomingSpeaker
+                      isTransmitting || activeLockSpeaker
                         ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
                         : 'bg-[#23dcff]/55'
                     }`}
@@ -3327,7 +4202,7 @@ export default function App() {
               </div>
             </section>
 
-            {/* BANNER STATUS BAWAH (VOX OTOMATIS & KLIK MANUAL) */}
+            {/* BANNER STATUS BAWAH (CHANNEL LOCKOUT / ANTI-COLLISION & VOX OTOMATIS) */}
             <button
               type="button"
               disabled={isPttLocked}
@@ -3338,16 +4213,16 @@ export default function App() {
                   : 'cyan-btn-glow shadow-[0_0_15px_rgba(35,220,255,0.35)] cursor-pointer'
               }`}
             >
-              {isTransmitting
+              {collisionBlockedNotice
+                ? collisionBlockedNotice
+                : isTransmitting
                 ? voxEnabled
-                  ? 'VOX TX AKTIF (RX OFF) • HENING OTOMATIS TUTUP PTT'
-                  : 'TX AKTIF (RECEIVER OFF) • KLIK KEDUA TUTUP PTT'
-                : incomingSpeaker
-                ? isMasterDevice
-                  ? `RECEIVING FROM ${incomingSpeaker} (KLIK UNTUK OVERRIDE)`
-                  : `RECEIVING FROM ${incomingSpeaker} (PTT LOCKED)`
+                  ? 'SALURAN DIKUNCI (TX AKTIF • RX OFF) • HENING UTK LEPAS KUNCI'
+                  : 'SALURAN DIKUNCI (TX AKTIF • RX OFF) • KLIK KEDUA TUTUP PTT'
+                : isPttLocked
+                ? `CHANNEL LOCKED: ${activeLockSpeaker} BICARA (VOX & TX DIKUNCI)`
                 : voxEnabled
-                ? 'VOX AKTIF • LANGSUNG BICARA TANPA TEKAN TOMBOL'
+                ? 'VOX & ANTI-COLLISION AKTIF • LANGSUNG BICARA'
                 : isMasterDevice
                 ? 'MASTER READY • KLIK UNTUK BUKA PTT'
                 : 'CLIENT READY • KLIK UNTUK BUKA PTT'}
@@ -4178,6 +5053,84 @@ export default function App() {
                         </div>
                       </div>
 
+                      {/* Keep-Alive Latar Belakang (Silent Audio Stream via Web Audio API pada visibilitychange) */}
+                      <div className="p-3 rounded-xl bg-[#021526] border border-[#23dcff]/45 space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div>
+                            <div className="text-white font-bold">
+                              Keep-Alive Mode Saku / Layar Mati
+                            </div>
+                            <div className="text-[10px] text-cyan-200/75">
+                              Silent Audio Stream (Web Audio API + visibilitychange) agar WebSocket &amp; suara masuk tidak dibekukan Android/iOS saat layar HP mati atau di dalam saku
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setKeepAliveEnabled((prev) => !prev)}
+                            className={`px-3 py-1.5 rounded-lg font-bold shrink-0 cursor-pointer ${
+                              keepAliveEnabled
+                                ? 'bg-[#23dcff] text-[#02182b]'
+                                : 'bg-cyan-950 text-cyan-300'
+                            }`}
+                          >
+                            {keepAliveEnabled ? 'AKTIF (ON)' : 'OFF'}
+                          </button>
+                        </div>
+                        <div className="flex items-center justify-between text-[10.5px] pt-1.5 border-t border-cyan-500/20">
+                          <span className="text-cyan-200">Status Aliran Audio Kosong:</span>
+                          <span className="font-bold text-[#23dcff]">
+                            {keepAliveEnabled
+                              ? isSilentKeepAliveRunning
+                                ? isBackgroundMode
+                                  ? 'AKTIF DI LATAR BELAKANG (MODE SAKU)'
+                                  : 'SIAGA AKTIF (SILENT STREAM RUNNING)'
+                                : 'SIAP AKTIF SAAT SENTUH LAYAR'
+                              : 'NONAKTIF'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Kompatibilitas Peramban Seluler (Safari iOS / Chrome Android / HarmonyOS) & Pemulihan Izin Mic */}
+                      <div className="p-3 rounded-xl bg-[#021526] border border-cyan-400/35 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-cyan-200">Platform &amp; Mode Fallback Mic:</span>
+                          <span className="font-bold text-white">
+                            {mobilePlatformInfo.label} • {micConstraintTier}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-cyan-200">Status Izin Microphone:</span>
+                          <span
+                            className={`font-bold uppercase ${
+                              micPermissionState === 'granted'
+                                ? 'text-[#23dcff]'
+                                : 'text-amber-300'
+                            }`}
+                          >
+                            {micPermissionState === 'granted'
+                              ? 'DIBERIKAN (SIAP VOX & PTT)'
+                              : 'BELUM DIBERIKAN / FALLBACK'}
+                          </span>
+                        </div>
+                        {micErrorNotice && (
+                          <div className="p-2 rounded-lg bg-amber-500/15 border border-amber-400/50 text-amber-200 text-[10.5px]">
+                            {micErrorNotice}
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          onClick={handleGrantOrRecoverAudioPermission}
+                          className="w-full py-2 px-3 rounded-lg bg-[#063256] hover:bg-[#0a4678] border border-[#23dcff] text-white font-bold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          <Mic className="w-3.5 h-3.5 text-[#23dcff]" />
+                          <span>
+                            {micPermissionState === 'granted'
+                              ? 'Segarkan & Kalibrasi Ulang Web Audio + Mikrofon'
+                              : 'Berikan Izin Mikrofon & Buka Kunci Audio (iOS/Android)'}
+                          </span>
+                        </button>
+                      </div>
+
                       <div className="flex items-center justify-between py-2 border-b border-cyan-500/20">
                         <div>
                           <div className="text-white font-bold">
@@ -4213,7 +5166,7 @@ export default function App() {
                         </button>
                       </div>
 
-                      <div className="flex items-center justify-between py-2 border-b border-cyan-500/20">
+                      <div className="flex items-center justify-between py-2">
                         <span className="text-cyan-200">Proporsi Layar</span>
                         <button
                           onClick={() => setFullScreenStretch((s) => !s)}
@@ -4221,15 +5174,6 @@ export default function App() {
                         >
                           {fullScreenStretch ? 'Full Lebar Layar' : 'Mode Potret HP'}
                         </button>
-                      </div>
-
-                      <div className="flex items-center justify-between py-2">
-                        <span className="text-cyan-200">Status Izin Microphone</span>
-                        <span className="font-bold text-[#23dcff] uppercase">
-                          {micPermissionState === 'granted'
-                            ? 'AKTIF (SIAP REKAM)'
-                            : 'TEKAN PTT UTK IZIN MIC'}
-                        </span>
                       </div>
                     </div>
                   )}
