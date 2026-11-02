@@ -2369,18 +2369,23 @@ class _TacticalPttHomePageState extends State<TacticalPttHomePage> {
 
     String centerLabel;
     if (isTx) {
-      centerLabel = net.isMaster ? 'MASTER TX' : 'TRANSMITTING';
+      centerLabel = 'KLIK TUTUP PTT\n(RX OFF • ANTI-ECHO)';
     } else if (isRx) {
       centerLabel = net.isMaster
-          ? 'RX: $speakerName\n(TAP OVERRIDE)'
+          ? 'RX: $speakerName\n(KLIK OVERRIDE)'
           : 'RECEIVING FROM\n$speakerName';
     } else {
-      centerLabel = net.isMaster ? 'MASTER READY' : 'CLIENT READY';
+      centerLabel = net.isMaster ? 'MASTER READY\n(KLIK BUKA PTT)' : 'CLIENT READY\n(KLIK BUKA PTT)';
     }
 
     return GestureDetector(
-      onLongPress: () => onStartTransmit(context, net, audioService),
-      onLongPressEnd: (_) => onStopTransmit(net, audioService),
+      onTap: () {
+        if (isTx) {
+          onStopTransmit(net, audioService);
+        } else {
+          onStartTransmit(context, net, audioService);
+        }
+      },
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 150),
         width: 215,

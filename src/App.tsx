@@ -266,7 +266,8 @@ export default function App() {
   const [micLevel, setMicLevel] = useState<number>(0);
   const [micPermissionState, setMicPermissionState] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
-  const [echoTestMode, setEchoTestMode] = useState<boolean>(true);
+  // Default Echo Test to false so real Walkie-Talkie operation never echoes local speech
+  const [echoTestMode, setEchoTestMode] = useState<boolean>(false);
   const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
 
   // Bottom Navigation Modal States & On-Screen Tactical Chat States
@@ -300,6 +301,8 @@ export default function App() {
 
   // Audio, WebRTC, Offline Hotspot LAN & WSS Cloud Mesh refs
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micAnalyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
@@ -422,14 +425,34 @@ export default function App() {
   const remoteActiveTxRef = useRef<string | null>(null);
   const pttSegmentIntervalRef = useRef<number | null>(null);
   const isTransmittingRef = useRef<boolean>(false);
+  // Strict Half-Duplex: Receiver (RX) is forced OFF while PTT is open (from 1st click until 2nd click)
+  const isReceiverOffRef = useRef<boolean>(false);
   useEffect(() => {
     isTransmittingRef.current = isTransmitting;
+    isReceiverOffRef.current = isTransmitting;
   }, [isTransmitting]);
 
-  // Helper to force-stop microphone recording (Strict Half-Duplex when switching to Rx)
+  // Helper to immediately mute & shut off Receiver (Speaker) during 1st-click PTT Open
+  const muteAndDisableReceiver = useCallback(() => {
+    isReceiverOffRef.current = true;
+    if (activeAudioElementRef.current) {
+      try {
+        activeAudioElementRef.current.muted = true;
+        activeAudioElementRef.current.volume = 0.0;
+        activeAudioElementRef.current.pause();
+        activeAudioElementRef.current.src = '';
+      } catch {
+        // Ignore audio element cleanup error
+      }
+      activeAudioElementRef.current = null;
+    }
+  }, []);
+
+  // Helper to force-stop microphone recording & re-enable Receiver (Strict Half-Duplex when switching to Rx)
   const forceStopLocalRecording = useCallback(() => {
     setIsTransmitting(false);
     isTransmittingRef.current = false;
+    isReceiverOffRef.current = false;
     setMicLevel(0);
     if (pttSegmentIntervalRef.current) {
       window.clearInterval(pttSegmentIntervalRef.current);
@@ -446,31 +469,44 @@ export default function App() {
         // Ignore stop error
       }
     }
+    // Physically mute hardware mic track while in RX mode
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = false;
+      });
+    }
   }, []);
 
   // Play incoming Base64 voice clip received from another device or loopback test (Strict Half-Duplex Rx)
   const playIncomingAudioBase64 = useCallback(
     (base64Data: string, senderCallsign: string) => {
       if (!soundEnabled) return;
-      // Strict Half-Duplex: If local device is transmitting, do not play speaker audio unless forced into Rx
-      if (isTransmittingRef.current) return;
+      // STRICT ANTI-ECHO: While 1st-click PTT is open (TX active / Receiver OFF), NEVER play any speaker audio!
+      if (isTransmittingRef.current || isReceiverOffRef.current) return;
 
       playTacticalTone('rx');
       setIncomingSpeaker(senderCallsign);
 
       if (activeAudioElementRef.current) {
-        activeAudioElementRef.current.pause();
+        try {
+          activeAudioElementRef.current.pause();
+          activeAudioElementRef.current.src = '';
+        } catch {
+          // Ignore
+        }
         activeAudioElementRef.current = null;
       }
 
       const audio = new Audio(base64Data);
-      audio.volume = 1.0; // Strict Half-Duplex: Max volume on Rx
+      audio.muted = false;
+      audio.volume = 1.0; // Strict Half-Duplex: Max volume only when Receiver is ON
       activeAudioElementRef.current = audio;
       audio.onended = () => {
-        // Keep floor locked if remote sender still has Toggle PTT open (hasn't clicked 2nd time to close PTT yet)
         if (remoteActiveTxRef.current !== senderCallsign) {
           setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
-          playTacticalTone('end');
+          if (!isTransmittingRef.current && !isReceiverOffRef.current) {
+            playTacticalTone('end');
+          }
         }
       };
       audio.onerror = () => {
@@ -971,6 +1007,9 @@ export default function App() {
         if (isTransmittingRef.current && (!amIMaster || senderIsMaster)) {
           forceStopLocalRecording();
         }
+        if (isTransmittingRef.current || isReceiverOffRef.current) {
+          return;
+        }
         remoteActiveTxRef.current = pkt.callsign;
         setIncomingSpeaker(pkt.callsign);
         playTacticalTone('rx');
@@ -983,7 +1022,8 @@ export default function App() {
           setIncomingSpeaker((curr) => (curr === pkt.callsign ? null : curr));
         }
       } else if (pkt.type === 'VOICE_CLIP' && pkt.audioBase64) {
-        if (amIMaster && isTransmittingRef.current && !senderIsMaster) {
+        // STRICT ANTI-ECHO: While 1st-click PTT is open (Receiver OFF), drop incoming voice playback completely
+        if (isTransmittingRef.current || isReceiverOffRef.current) {
           return;
         }
         playIncomingAudioBase64(pkt.audioBase64, pkt.callsign);
@@ -1003,7 +1043,10 @@ export default function App() {
           return [...prev.slice(-79), newMsg];
         });
         setUnreadChatCount((c) => (isOnScreenChatOpen ? 0 : c + 1));
-        playTacticalTone('rx');
+        // Only play chat notification beep if Receiver is ON (PTT is not open)
+        if (!isTransmittingRef.current && !isReceiverOffRef.current) {
+          playTacticalTone('rx');
+        }
       } else if (pkt.type === 'PING') {
         broadcastMeshPacket({ type: 'PONG' });
       } else if (pkt.type === 'PONG') {
@@ -1388,23 +1431,18 @@ export default function App() {
   // HP MASTER (192.168.43.1) is never locked and can override at any time.
   const isPttLocked = !isMasterDevice && Boolean(incomingSpeaker);
 
-  // Klik Pertama: Buka PTT & Mulai Bicara -> Mengirim TX_START & merekam suara mikrofon
+  // Klik Pertama: Buka PTT & Mulai Bicara -> Receiver (RX) WAJIB OFF (Muted 0%) & Mic (TX) ON
   const handlePttStart = async () => {
     if (isTransmittingRef.current) return;
     if (isPttLocked) return;
 
-    // Strict Half-Duplex: Immediately mute (volume 0) and stop speaker playback before opening mic
-    if (activeAudioElementRef.current) {
-      activeAudioElementRef.current.volume = 0.0;
-      activeAudioElementRef.current.pause();
-      activeAudioElementRef.current = null;
-    }
+    // 1. STRICT HALF-DUPLEX (ANTI-ECHO): Matikan Receiver (Speaker RX OFF, Volume 0) SEBELUM membuka Mic!
+    muteAndDisableReceiver();
 
     remoteActiveTxRef.current = null;
     setIncomingSpeaker(null);
     setIsTransmitting(true);
     isTransmittingRef.current = true;
-    playTacticalTone('start');
     broadcastMeshPacket({ type: 'TX_START' });
 
     try {
@@ -1422,19 +1460,30 @@ export default function App() {
 
       const stream = mediaStreamRef.current;
       if (stream) {
-        // Real-time audio level meter for the left/right cyan wave bars
+        // Enable hardware microphone tracks ONLY while PTT is open
+        stream.getAudioTracks().forEach((track) => {
+          track.enabled = true;
+        });
+
+        // Real-time audio level meter (connected ONLY to AnalyserNode, NEVER to speaker destination!)
         if (!audioCtxRef.current) {
           audioCtxRef.current = new (window.AudioContext ||
             (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
         }
         const ctx = audioCtxRef.current;
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 64;
-        source.connect(analyser);
+        if (!micSourceRef.current || !micAnalyserRef.current) {
+          const source = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 64;
+          source.connect(analyser);
+          micSourceRef.current = source;
+          micAnalyserRef.current = analyser;
+        }
+        const analyser = micAnalyserRef.current;
         const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
         const updateMeter = () => {
+          if (!isTransmittingRef.current) return;
           analyser.getByteFrequencyData(dataArray);
           const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
           setMicLevel(Math.min(100, Math.max(25, avg * 1.4)));
@@ -1442,81 +1491,71 @@ export default function App() {
         };
         updateMeter();
 
-        // Start a self-contained MediaRecorder segment so voice is streamed both during long Toggle PTT sessions and when closed on 2nd click
-        const startRecorderSegment = () => {
-          if (!isTransmittingRef.current || !stream.active) return;
-          const segmentChunks: Blob[] = [];
-          recordedChunksRef.current = segmentChunks;
+        // Record voice while PTT is open, and ONLY transmit/play after 2nd click closes PTT
+        // so that neither local nor nearby receiver speakers ever play audio while the mic is open!
+        const segmentChunks: Blob[] = [];
+        recordedChunksRef.current = segmentChunks;
 
-          let recorder: MediaRecorder;
-          try {
-            recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
-          } catch {
-            recorder = new MediaRecorder(stream);
+        let recorder: MediaRecorder;
+        try {
+          recorder = new MediaRecorder(stream, { audioBitsPerSecond: 24000 });
+        } catch {
+          recorder = new MediaRecorder(stream);
+        }
+
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            segmentChunks.push(e.data);
           }
-
-          recorder.ondataavailable = (e) => {
-            if (e.data && e.data.size > 0) {
-              segmentChunks.push(e.data);
-            }
-          };
-
-          recorder.onstop = () => {
-            const blob = new Blob(segmentChunks, {
-              type: recorder.mimeType || 'audio/webm',
-            });
-            if (blob.size > 200) {
-              const reader = new FileReader();
-              reader.onloadend = () => {
-                const base64Audio = reader.result as string;
-                if (base64Audio) {
-                  broadcastMeshPacket({
-                    type: 'VOICE_CLIP',
-                    audioBase64: base64Audio,
-                    mimeType: blob.type,
-                  });
-
-                  // If Echo Test Mode is enabled (and no remote peer is active), play back captured voice after PTT is closed
-                  if (
-                    !isTransmittingRef.current &&
-                    echoTestMode &&
-                    membersRef.current.length === 0
-                  ) {
-                    window.setTimeout(() => {
-                      playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
-                    }, 350);
-                  }
-                }
-              };
-              reader.readAsDataURL(blob);
-            }
-          };
-
-          mediaRecorderRef.current = recorder;
-          recorder.start();
         };
 
-        startRecorderSegment();
-
-        if (pttSegmentIntervalRef.current) {
-          window.clearInterval(pttSegmentIntervalRef.current);
-        }
-        pttSegmentIntervalRef.current = window.setInterval(() => {
-          if (!isTransmittingRef.current) return;
-          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-            try {
-              mediaRecorderRef.current.stop();
-            } catch {
-              // Ignore stop error
-            }
-            startRecorderSegment();
+        recorder.onstop = () => {
+          // Ensure mic hardware tracks are OFF before sending or playing anything
+          if (mediaStreamRef.current) {
+            mediaStreamRef.current.getAudioTracks().forEach((track) => {
+              track.enabled = false;
+            });
           }
-        }, 3500);
+
+          const blob = new Blob(segmentChunks, {
+            type: recorder.mimeType || 'audio/webm',
+          });
+          if (blob.size > 200) {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const base64Audio = reader.result as string;
+              if (base64Audio) {
+                broadcastMeshPacket({
+                  type: 'VOICE_CLIP',
+                  audioBase64: base64Audio,
+                  mimeType: blob.type,
+                });
+
+                // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
+                if (
+                  !isTransmittingRef.current &&
+                  !isReceiverOffRef.current &&
+                  echoTestMode &&
+                  membersRef.current.length === 0
+                ) {
+                  window.setTimeout(() => {
+                    playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
+                  }, 350);
+                }
+              }
+            };
+            reader.readAsDataURL(blob);
+          }
+        };
+
+        mediaRecorderRef.current = recorder;
+        recorder.start();
       }
     } catch {
       // Fallback animated waveform if mic permission isn't granted yet
       setMicPermissionState('denied');
       const fallbackTick = () => {
+        if (!isTransmittingRef.current) return;
         setMicLevel(Math.floor(40 + Math.random() * 55));
         animFrameRef.current = requestAnimationFrame(fallbackTick);
       };
@@ -1524,7 +1563,7 @@ export default function App() {
     }
   };
 
-  // Klik Kedua: Tutup PTT -> Menghentikan mic, mengirim paket suara terakhir & TX_STOP
+  // Klik Kedua: Tutup PTT -> Matikan Mic (TX OFF), Kirim Suara & TX_STOP, lalu Nyalakan Kembali Receiver (RX ON)
   const handlePttEnd = () => {
     if (!isTransmittingRef.current) return;
     setIsTransmitting(false);
@@ -1541,6 +1580,14 @@ export default function App() {
       animFrameRef.current = null;
     }
 
+    // 1. Matikan track mikrofon hardware terlebih dahulu agar tidak menangkap suara speaker
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = false;
+      });
+    }
+
+    // 2. Hentikan perekam & kirim paket VOICE_CLIP
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop();
@@ -1549,11 +1596,13 @@ export default function App() {
       }
     }
 
+    // 3. Aktifkan kembali Receiver (RX ON) setelah mikrofon benar-benar mati
+    isReceiverOffRef.current = false;
     playTacticalTone('end');
     broadcastMeshPacket({ type: 'TX_STOP' });
   };
 
-  // Toggle PTT (Klik Pertama = Buka PTT & Bicara, Klik Kedua = Tutup PTT)
+  // Toggle PTT (Klik Pertama = Buka PTT & Receiver OFF, Klik Kedua = Tutup PTT & Receiver ON)
   const handlePttToggle = () => {
     if (isPttLocked) return;
     if (isTransmittingRef.current || isTransmitting) {
@@ -1626,6 +1675,13 @@ export default function App() {
     const realLanIp = await detectLocalHotspotIpWebRTC(550);
     if (realLanIp) {
       detectedLanIpRef.current = realLanIp;
+    }
+
+    // Keep microphone hardware tracks disabled (OFF) while in Standby / RX mode until 1st-click PTT Open
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = false;
+      });
     }
 
     const assignedIp =
@@ -2836,9 +2892,9 @@ export default function App() {
                   </span>
                   <span className="font-telemetry text-[8.5px] font-bold text-cyan-100/95 leading-none mt-0.5">
                     {isTransmitting
-                      ? 'SEDANG BICARA'
+                      ? 'RX OFF • ANTI-ECHO'
                       : isPttLocked
-                      ? 'TERKUNCI'
+                      ? 'MIC OFF • RX ON'
                       : 'KLIK BUKA PTT'}
                   </span>
                 </div>
@@ -2864,19 +2920,19 @@ export default function App() {
               </div>
             </section>
 
-            {/* BANNER STATUS BAWAH (KLIK 1 = BUKA PTT, KLIK 2 = TUTUP PTT) */}
+            {/* BANNER STATUS BAWAH (KLIK 1 = BUKA PTT [RX OFF], KLIK 2 = TUTUP PTT [RX ON]) */}
             <button
               type="button"
               disabled={isPttLocked}
               onClick={isPttLocked ? undefined : handlePttToggle}
-              className={`w-full py-2 rounded-xl font-tactical text-[15px] sm:text-[16px] font-extrabold tracking-[0.07em] text-white text-center shrink-0 transition-all ${
+              className={`w-full py-2 rounded-xl font-tactical text-[14.5px] sm:text-[16px] font-extrabold tracking-[0.06em] text-white text-center shrink-0 transition-all ${
                 isPttLocked
                   ? 'bg-red-950/90 border border-red-400/80 text-red-100 cursor-not-allowed'
                   : 'cyan-btn-glow shadow-[0_0_15px_rgba(35,220,255,0.35)] cursor-pointer'
               }`}
             >
               {isTransmitting
-                ? 'BICARA AKTIF • KLIK KEDUA UNTUK TUTUP PTT'
+                ? 'TX AKTIF (RECEIVER OFF) • KLIK KEDUA TUTUP PTT'
                 : incomingSpeaker
                 ? isMasterDevice
                   ? `RECEIVING FROM ${incomingSpeaker} (KLIK UNTUK OVERRIDE)`
