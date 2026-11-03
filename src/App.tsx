@@ -211,6 +211,212 @@ function extractInviteParamsFromUrl() {
   };
 }
 
+// ============================================================================
+// ISOLATED LIVE AUDIO METER PUB-SUB STORE & REACT.MEMO DYNAMIC AUDIO COMPONENTS
+// Prevents high-frequency VOX/Microphone level updates from re-rendering the root App page!
+// ============================================================================
+interface LiveAudioMeterSnapshot {
+  voxInputLevel: number;
+  micLevel: number;
+  isVocalPatternConfirmed: boolean;
+  ambientNoiseFloor: number;
+}
+
+class LiveAudioMeterStore {
+  private state: LiveAudioMeterSnapshot = {
+    voxInputLevel: 0,
+    micLevel: 0,
+    isVocalPatternConfirmed: false,
+    ambientNoiseFloor: 4,
+  };
+  private listeners = new Set<() => void>();
+  private lastEmitTs = 0;
+
+  getSnapshot = (): LiveAudioMeterSnapshot => this.state;
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
+  update(partial: Partial<LiveAudioMeterSnapshot>, forceImmediate = false) {
+    const nextVox =
+      partial.voxInputLevel !== undefined ? partial.voxInputLevel : this.state.voxInputLevel;
+    const nextMic =
+      partial.micLevel !== undefined ? partial.micLevel : this.state.micLevel;
+    const nextConfirmed =
+      partial.isVocalPatternConfirmed !== undefined
+        ? partial.isVocalPatternConfirmed
+        : this.state.isVocalPatternConfirmed;
+    const nextFloor =
+      partial.ambientNoiseFloor !== undefined
+        ? partial.ambientNoiseFloor
+        : this.state.ambientNoiseFloor;
+
+    const voxDiff = Math.abs(nextVox - this.state.voxInputLevel);
+    const micDiff = Math.abs(nextMic - this.state.micLevel);
+    const confirmedChanged = nextConfirmed !== this.state.isVocalPatternConfirmed;
+    const zeroTransition =
+      (nextVox === 0 && this.state.voxInputLevel !== 0) ||
+      (nextMic === 0 && this.state.micLevel !== 0);
+
+    // Deadband filter: ignore tiny sub-2% fluctuations unless state transitioned to 0 or confirmed changed
+    if (!forceImmediate && !confirmedChanged && !zeroTransition && voxDiff < 2 && micDiff < 3) {
+      return;
+    }
+
+    const now = Date.now();
+    // Throttle UI indicator updates to ~95ms max cadence unless forced or confirmed changed
+    if (!forceImmediate && !confirmedChanged && !zeroTransition && now - this.lastEmitTs < 95) {
+      return;
+    }
+
+    this.lastEmitTs = now;
+    this.state = {
+      voxInputLevel: nextVox,
+      micLevel: nextMic,
+      isVocalPatternConfirmed: nextConfirmed,
+      ambientNoiseFloor: nextFloor,
+    };
+    this.listeners.forEach((l) => l());
+  }
+}
+
+const liveAudioMeterStore = new LiveAudioMeterStore();
+
+function useLiveAudioMeter(): LiveAudioMeterSnapshot {
+  const [snap, setSnap] = useState<LiveAudioMeterSnapshot>(() =>
+    liveAudioMeterStore.getSnapshot()
+  );
+  useEffect(() => {
+    return liveAudioMeterStore.subscribe(() => {
+      setSnap(liveAudioMeterStore.getSnapshot());
+    });
+  }, []);
+  return snap;
+}
+
+// Komponen Indikator Slider & Bar Level Vokal VOX yang Terisolasi (React.memo)
+// Hanya merender ulang bar indikator kecil ini saat level suara berubah, bukan seluruh halaman utama!
+const VoxThresholdSliderRow = React.memo(function VoxThresholdSliderRow({
+  voxThreshold,
+  onChangeThreshold,
+  isPttLocked,
+  activeLockSpeaker,
+  voxEnabled,
+}: {
+  voxThreshold: number;
+  onChangeThreshold: (val: number) => void;
+  isPttLocked: boolean;
+  activeLockSpeaker: string | null;
+  voxEnabled: boolean;
+}) {
+  const { voxInputLevel, isVocalPatternConfirmed } = useLiveAudioMeter();
+
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        title="Ambang Batas Sensitivitas VOX (Kalibrasi Seimbang 18%–22%, Default 20% — Stabil & Manual)"
+        className="font-telemetry text-[9px] font-bold text-cyan-100 shrink-0"
+      >
+        THR <strong className="text-[#23dcff]">{voxThreshold}%</strong>
+      </span>
+
+      <div className="relative flex-1 h-4 flex items-center">
+        {/* Track Background + Live Vocal Level Bar */}
+        <div className="w-full h-2 rounded-full bg-[#021220] border border-cyan-400/40 overflow-hidden relative">
+          <div
+            style={{ width: `${Math.min(100, voxInputLevel)}%` }}
+            className={`h-full transition-all duration-100 ${
+              voxInputLevel >= voxThreshold && isVocalPatternConfirmed
+                ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
+                : 'bg-cyan-500/55'
+            }`}
+          />
+        </div>
+
+        {/* Garis Batas Ambang Manual/Preset (Sesuai Posisi Slider Pengguna) */}
+        <div
+          style={{
+            left: `${((voxThreshold - 5) / (85 - 5)) * 100}%`,
+          }}
+          className="absolute top-0 bottom-0 w-1 -ml-0.5 rounded-full bg-white shadow-[0_0_6px_#23dcff] pointer-events-none"
+        />
+
+        {/* Input Range Slider Interaktif (Lancar Digeser Manual 5% - 85%) */}
+        <input
+          type="range"
+          min={5}
+          max={85}
+          step={1}
+          value={voxThreshold}
+          onChange={(e) => onChangeThreshold(Number(e.target.value))}
+          aria-label="Pengatur Sensitivitas VOX Threshold Slider"
+          className="absolute inset-0 w-full h-full accent-[#23dcff] opacity-90 cursor-pointer"
+        />
+      </div>
+
+      <span className="font-telemetry text-[8.5px] text-cyan-100/95 shrink-0 min-w-[88px] text-right">
+        {isPttLocked
+          ? `LOCKED (${activeLockSpeaker})`
+          : voxEnabled
+          ? `MIC:${voxInputLevel}%•THR:${voxThreshold}%`
+          : 'MANUAL PTT'}
+      </span>
+    </div>
+  );
+});
+
+// Komponen Indikator Gelombang Suara Kiri/Kanan Tombol PTT yang Terisolasi (React.memo)
+const LEFT_WAVE_HEIGHTS = [6, 8, 10, 12, 15, 18, 21, 24];
+const RIGHT_WAVE_HEIGHTS = [24, 21, 18, 15, 12, 10, 8, 6];
+
+const PttSoundWaveSideBars = React.memo(function PttSoundWaveSideBars({
+  side,
+  isTransmitting,
+  voxEnabled,
+  hasActiveLockSpeaker,
+}: {
+  side: 'left' | 'right';
+  isTransmitting: boolean;
+  voxEnabled: boolean;
+  hasActiveLockSpeaker: boolean;
+}) {
+  const { voxInputLevel, micLevel } = useLiveAudioMeter();
+  const heights = side === 'left' ? LEFT_WAVE_HEIGHTS : RIGHT_WAVE_HEIGHTS;
+  const activeLevel = Math.max(micLevel, voxInputLevel);
+
+  return (
+    <div className="flex items-center gap-1">
+      {heights.map((h, i) => (
+        <span
+          key={`${side}-${i}`}
+          style={{
+            height: isTransmitting
+              ? `${Math.max(6, ((h * Math.max(25, activeLevel)) / 55) % 34)}px`
+              : voxEnabled && voxInputLevel > 5
+              ? `${Math.max(5, ((h * voxInputLevel) / 85) % 22)}px`
+              : `${h * 0.65}px`,
+          }}
+          className={`w-1.5 rounded-full transition-all duration-100 ${
+            isTransmitting || hasActiveLockSpeaker
+              ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
+              : 'bg-[#23dcff]/55'
+          }`}
+        />
+      ))}
+    </div>
+  );
+});
+
+// Komponen Indikator Level Mic pada Floating Mini Widget yang Terisolasi (React.memo)
+const MiniWidgetMicLevelText = React.memo(function MiniWidgetMicLevelText() {
+  const { voxInputLevel } = useLiveAudioMeter();
+  return <span>MIC: {voxInputLevel}%</span>;
+});
+
 export default function App() {
   const { isInstallable, isInstalled, install } = usePWAInstall();
 
@@ -314,6 +520,10 @@ export default function App() {
   const [activeBoundPeerId, setActiveBoundPeerId] =
     useState<string>(preferredPeerId);
   const myPeerNodeId = activeBoundPeerId || preferredPeerId;
+  const activeBoundPeerIdRef = useRef<string>(myPeerNodeId);
+  useEffect(() => {
+    activeBoundPeerIdRef.current = myPeerNodeId;
+  }, [myPeerNodeId]);
 
   // Target Master Host Peer ID from Barcode Invite Link or manual paste
   const [invitedHostPeer, setInvitedHostPeer] = useState<string>(urlInviteParams.hostPeer);
@@ -327,7 +537,7 @@ export default function App() {
   // In-App Camera Barcode Scanner states (prevents external browser 404 errors)
   const [barcodeTab, setBarcodeTab] = useState<'show' | 'scan'>('show');
   const [isSetupScannerOpen, setIsSetupScannerOpen] = useState<boolean>(false);
-  const [isCameraScanning, setIsCameraScanning] = useState<boolean>(false);
+  const [, setIsCameraScanning] = useState<boolean>(false);
   const [scannerError, setScannerError] = useState<string | null>(null);
   const scannerVideoRef = useRef<HTMLVideoElement | null>(null);
   const scannerCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -337,7 +547,7 @@ export default function App() {
   const [pingMs, setPingMs] = useState<number>(18);
   const [pingDelta, setPingDelta] = useState<number>(2);
   const [isRefreshingPing, setIsRefreshingPing] = useState<boolean>(false);
-  const [talkAll, setTalkAll] = useState<boolean>(true);
+  const [talkAll] = useState<boolean>(true);
   // Real Peers Only: Starts empty and only populates when real peers announce on the channel
   const [members, setMembers] = useState<TacticalMember[]>([]);
   const [selectedMemberId, setSelectedMemberId] = useState<string>('');
@@ -348,21 +558,20 @@ export default function App() {
   const [mobilePlatformInfo] = useState(() => detectMobileAudioPlatform());
   const [isTransmitting, setIsTransmitting] = useState<boolean>(false);
   const [incomingSpeaker, setIncomingSpeaker] = useState<string | null>(null);
-  const [micLevel, setMicLevel] = useState<number>(0);
   const [micPermissionState, setMicPermissionState] = useState<'prompt' | 'granted' | 'denied'>('prompt');
   const [micConstraintTier, setMicConstraintTier] = useState<string>('STANDBY');
   const [micErrorNotice, setMicErrorNotice] = useState<string | null>(null);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   // Default Echo Test to false so real Walkie-Talkie operation never echoes local speech
   const [echoTestMode, setEchoTestMode] = useState<boolean>(false);
-  const [connectedPeersCount, setConnectedPeersCount] = useState<number>(0);
+  const [, setConnectedPeersCount] = useState<number>(0);
 
   // Background Keep-Alive (Silent Audio Stream via Web Audio API + Screen Wake Lock + Service Worker)
   const [keepAliveEnabled, setKeepAliveEnabled] = useState<boolean>(() => {
     const saved = localStorage.getItem('diskomlekau_keepalive_enabled');
     return saved !== null ? saved === 'true' : true;
   });
-  const [isSilentKeepAliveRunning, setIsSilentKeepAliveRunning] = useState<boolean>(false);
+  const [, setIsSilentKeepAliveRunning] = useState<boolean>(false);
   const [isBackgroundMode, setIsBackgroundMode] = useState<boolean>(false);
   // Mode Minimasi (Floating Mini Button / Background Mode tanpa memutus WebSocket & Web Audio API)
   const [isMinimizedMode, setIsMinimizedMode] = useState<boolean>(false);
@@ -408,10 +617,21 @@ export default function App() {
   });
   // Status Tombol Kontrol Prioritas Override (Menghentikan transmisi klien lain seketika)
   const [isPriorityOverride, setIsPriorityOverride] = useState<boolean>(false);
-  const [voxInputLevel, setVoxInputLevel] = useState<number>(0);
-  // Indikator Kebisingan Latar (Hanya indikator visual pasif — tidak pernah menggeser nilai slider voxThreshold)
-  const [ambientNoiseFloor, setAmbientNoiseFloor] = useState<number>(4);
-  const [isVocalPatternConfirmed, setIsVocalPatternConfirmed] = useState<boolean>(false);
+
+  // Helper terpusat untuk memperbarui indikator level audio dinamis (via LiveAudioMeterStore)
+  // tanpa memicu re-render pada halaman utama App!
+  const setVoxInputLevel = useCallback((val: number, force = false) => {
+    liveAudioMeterStore.update({ voxInputLevel: val }, force);
+  }, []);
+  const setMicLevel = useCallback((val: number, force = false) => {
+    liveAudioMeterStore.update({ micLevel: val }, force);
+  }, []);
+  const setIsVocalPatternConfirmed = useCallback((val: boolean) => {
+    liveAudioMeterStore.update({ isVocalPatternConfirmed: val });
+  }, []);
+  const setAmbientNoiseFloor = useCallback((val: number) => {
+    liveAudioMeterStore.update({ ambientNoiseFloor: val });
+  }, []);
 
   const getVoxNoiseGateLabel = (thr: number) => {
     if (thr <= 24) return 'TENANG';
@@ -516,6 +736,7 @@ export default function App() {
   const [isHotspotLanHubConnected, setIsHotspotLanHubConnected] = useState<boolean>(false);
   const seenPacketIdsRef = useRef<Set<string>>(new Set());
   const lastAnnounceReplyRef = useRef<Map<string, number>>(new Map());
+  const memberLastSeenMapRef = useRef<Map<string, number>>(new Map());
   const membersRef = useRef<TacticalMember[]>([]);
   useEffect(() => {
     membersRef.current = members;
@@ -551,7 +772,8 @@ export default function App() {
     }
   }, [voxEnabled, voxThreshold, voxHoldMs, keepAliveEnabled, rxGainBoost, opusBitrateKbps]);
 
-  // Persist tactical chat messages & auto-scroll to latest message
+  // Persist tactical chat messages & scroll internal container without shifting page viewport
+  const prevChatLenRef = useRef<number>(chatMessages.length);
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -561,8 +783,17 @@ export default function App() {
     } catch {
       // Ignore quota error
     }
-    onScreenChatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    modalChatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (chatMessages.length !== prevChatLenRef.current) {
+      prevChatLenRef.current = chatMessages.length;
+      const onScreenParent = onScreenChatEndRef.current?.parentElement;
+      if (onScreenParent) {
+        onScreenParent.scrollTop = onScreenParent.scrollHeight;
+      }
+      const modalParent = modalChatEndRef.current?.parentElement;
+      if (modalParent) {
+        modalParent.scrollTop = modalParent.scrollHeight;
+      }
+    }
   }, [chatMessages]);
 
   // Integrasi Screen Wake Lock API + Background Service Worker Keep-Alive (/tactical-bg-sw.js)
@@ -580,13 +811,14 @@ export default function App() {
     const requestWakeLock = async () => {
       try {
         if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+          if (wakeLock && !wakeLock.released) return;
           wakeLock = await navigator.wakeLock.request('screen');
           if (!isUnmounted) {
-            setIsWakeLockActive(true);
+            setIsWakeLockActive((prev) => (prev ? prev : true));
           }
           wakeLock.addEventListener('release', () => {
             if (!isUnmounted) {
-              setIsWakeLockActive(false);
+              setIsWakeLockActive((prev) => (!prev ? prev : false));
             }
           });
         }
@@ -600,11 +832,11 @@ export default function App() {
     // Register Tactical Background Keep-Alive Service Worker (/tactical-bg-sw.js)
     registerTacticalBackgroundServiceWorker(() => {
       if (!isUnmounted) {
-        setIsSwKeepAliveActive(true);
+        setIsSwKeepAliveActive((prev) => (prev ? prev : true));
       }
     }).then((reg) => {
       if (reg && !isUnmounted) {
-        setIsSwKeepAliveActive(true);
+        setIsSwKeepAliveActive((prev) => (prev ? prev : true));
         sendServiceWorkerKeepAlivePing({
           callsign: myCallsign || 'UNIT',
           channel,
@@ -614,7 +846,7 @@ export default function App() {
       }
     });
 
-    // Periodic Service Worker Keep-Alive Ping (every 3.5s) to prevent background thread suspension
+    // Periodic Service Worker Keep-Alive Ping (every 4s) to prevent background thread suspension
     swHeartbeatTimer = window.setInterval(() => {
       sendServiceWorkerKeepAlivePing({
         callsign: myCallsign || 'UNIT',
@@ -625,7 +857,7 @@ export default function App() {
       if (document.visibilityState === 'visible' && (!wakeLock || wakeLock.released)) {
         requestWakeLock();
       }
-    }, 3500);
+    }, 4000);
 
     const handleVisibilityOrFocusWakeLock = () => {
       if (document.visibilityState === 'visible') {
@@ -640,16 +872,12 @@ export default function App() {
     };
 
     document.addEventListener('visibilitychange', handleVisibilityOrFocusWakeLock);
-    window.addEventListener('focus', handleVisibilityOrFocusWakeLock);
-    window.addEventListener('pointerdown', handleVisibilityOrFocusWakeLock, { passive: true });
     return () => {
       isUnmounted = true;
       if (swHeartbeatTimer) {
         window.clearInterval(swHeartbeatTimer);
       }
       document.removeEventListener('visibilitychange', handleVisibilityOrFocusWakeLock);
-      window.removeEventListener('focus', handleVisibilityOrFocusWakeLock);
-      window.removeEventListener('pointerdown', handleVisibilityOrFocusWakeLock);
       wakeLock?.release().catch(() => {});
     };
   }, [myCallsign, channel]);
@@ -1114,12 +1342,12 @@ export default function App() {
         packetId: pktId,
         senderId: myDeviceId,
         callsign: myCallsign,
-        ip: localIp,
+        ip: detectedLanIpRef.current || localIp,
         role,
         isMaster: localIp === '192.168.43.1' || role === 'MASTER',
         channel,
         timestamp: Date.now(),
-        peerNodeId: myPeerNodeId,
+        peerNodeId: activeBoundPeerIdRef.current,
       };
 
       const serialized = JSON.stringify(fullPacket);
@@ -1176,7 +1404,7 @@ export default function App() {
         }
       });
     },
-    [myDeviceId, myCallsign, localIp, role, channel, myPeerNodeId]
+    [myDeviceId, myCallsign, localIp, role, channel]
   );
 
   // Build and broadcast PEER_LIST_SYNC from Master to all connected Clients
@@ -1188,10 +1416,10 @@ export default function App() {
       const currentList = overrideMembers ?? membersRef.current;
       const syncList: PeerSyncEntry[] = [
         {
-          peerId: myPeerNodeId,
+          peerId: activeBoundPeerIdRef.current,
           senderId: myDeviceId,
           callsign: myCallsign,
-          ip: localIp,
+          ip: detectedLanIpRef.current || localIp,
           role: 'MASTER',
           channel,
         },
@@ -1212,7 +1440,7 @@ export default function App() {
         peerList: syncList,
       });
     },
-    [role, localIp, myCallsign, myPeerNodeId, myDeviceId, channel, broadcastMeshPacket]
+    [role, localIp, myCallsign, myDeviceId, channel, broadcastMeshPacket]
   );
 
   // Helper to attach listeners to a PeerJS DataConnection
@@ -1414,7 +1642,7 @@ export default function App() {
   // Helper to initiate a non-duplicate WebRTC connection to a remote peerId
   const connectToPeerNodeIfNeeded = useCallback(
     (remotePeerId?: string) => {
-      if (!remotePeerId || remotePeerId === myPeerNodeId) return;
+      if (!remotePeerId || remotePeerId === activeBoundPeerIdRef.current) return;
       const activePeer = directNodePeerRef.current || peerRef.current;
       if (!activePeer || activePeer.disconnected || activePeer.destroyed) return;
 
@@ -1436,7 +1664,7 @@ export default function App() {
         pendingConnectTimestampRef.current.delete(remotePeerId);
       }
     },
-    [myPeerNodeId, registerPeerConnection]
+    [registerPeerConnection]
   );
 
   // Handle incoming mesh packets (from WebRTC PeerJS DataChannel, WSS Cloud Mesh, or BroadcastChannel)
@@ -1455,7 +1683,11 @@ export default function App() {
       }
 
       if (pkt.type === 'PEER_LEAVE') {
-        setMembers((prev) => prev.filter((m) => m.id !== pkt.senderId));
+        memberLastSeenMapRef.current.delete(pkt.senderId);
+        setMembers((prev) => {
+          const next = prev.filter((m) => m.id !== pkt.senderId);
+          return next.length === prev.length ? prev : next;
+        });
         if (channelLockOwnerRef.current?.senderId === pkt.senderId) {
           channelLockOwnerRef.current = null;
           setChannelLockOwner(null);
@@ -1466,50 +1698,62 @@ export default function App() {
       }
 
       const amIMaster = localIp === '192.168.43.1' || role === 'MASTER';
-      const senderIsMaster =
-        pkt.ip === '192.168.43.1' ||
-        pkt.role === 'MASTER' ||
-        pkt.peerNodeId === MASTER_PEER_ID ||
-        Boolean(pkt.isMaster);
 
       if (pkt.type === 'ANNOUNCE') {
         const senderPeerId = pkt.peerNodeId || pkt.senderId;
         const now = Date.now();
+        memberLastSeenMapRef.current.set(pkt.senderId, now);
+
         setMembers((prev) => {
-          const exists = prev.some(
+          const existingIdx = prev.findIndex(
             (m) => m.id === pkt.senderId || m.peerId === senderPeerId
           );
-          const next = exists
-            ? prev.map((m) =>
-                m.id === pkt.senderId || m.peerId === senderPeerId
-                  ? {
-                      ...m,
-                      id: pkt.senderId,
-                      callsign: pkt.callsign,
-                      ip: pkt.ip,
-                      role: pkt.role,
-                      channel: pkt.channel,
-                      peerId: senderPeerId,
-                      lastSeen: now,
-                    }
-                  : m
-              )
-            : [
-                ...prev,
-                {
-                  id: pkt.senderId,
-                  callsign: pkt.callsign,
-                  ip: pkt.ip,
-                  role: pkt.role,
-                  statusText: pkt.role === 'MASTER' ? 'MASTER HOST' : 'P2P AKTIF',
-                  isTargeted: true,
-                  isTalking: false,
-                  pingMs: 24,
-                  channel: pkt.channel,
-                  peerId: senderPeerId,
-                  lastSeen: now,
-                },
-              ];
+          if (existingIdx >= 0) {
+            const curr = prev[existingIdx];
+            // Avoid re-rendering App if member's visible metadata has not changed!
+            if (
+              curr.id === pkt.senderId &&
+              curr.callsign === pkt.callsign &&
+              curr.ip === pkt.ip &&
+              curr.role === pkt.role &&
+              curr.channel === pkt.channel &&
+              curr.peerId === senderPeerId
+            ) {
+              return prev;
+            }
+            const next = [...prev];
+            next[existingIdx] = {
+              ...curr,
+              id: pkt.senderId,
+              callsign: pkt.callsign,
+              ip: pkt.ip,
+              role: pkt.role,
+              channel: pkt.channel,
+              peerId: senderPeerId,
+              lastSeen: now,
+            };
+            if (amIMaster) {
+              window.setTimeout(() => broadcastPeerListSync(next), 60);
+            }
+            return next;
+          }
+
+          const next: TacticalMember[] = [
+            ...prev,
+            {
+              id: pkt.senderId,
+              callsign: pkt.callsign,
+              ip: pkt.ip,
+              role: pkt.role,
+              statusText: pkt.role === 'MASTER' ? 'MASTER HOST' : 'P2P AKTIF',
+              isTargeted: true,
+              isTalking: false,
+              pingMs: 24,
+              channel: pkt.channel,
+              peerId: senderPeerId,
+              lastSeen: now,
+            },
+          ];
 
           if (amIMaster) {
             window.setTimeout(() => broadcastPeerListSync(next), 60);
@@ -1524,7 +1768,7 @@ export default function App() {
 
         // Instant reply so newly joined peer immediately sees this device (< 200ms)
         const lastReply = lastAnnounceReplyRef.current.get(pkt.senderId) || 0;
-        if (now - lastReply > 1500 && myCallsign) {
+        if (now - lastReply > 2500 && myCallsign) {
           lastAnnounceReplyRef.current.set(pkt.senderId, now);
           broadcastMeshPacket({ type: 'ANNOUNCE' });
         }
@@ -1535,27 +1779,45 @@ export default function App() {
         const now = Date.now();
         const incomingPeers = pkt.peerList.filter(
           (entry) =>
-            entry.senderId !== myDeviceId && entry.peerId !== myPeerNodeId
+            entry.senderId !== myDeviceId &&
+            entry.peerId !== activeBoundPeerIdRef.current
         );
 
+        incomingPeers.forEach((entry) => {
+          memberLastSeenMapRef.current.set(entry.senderId, now);
+        });
+
         setMembers((prev) => {
+          let changed = false;
           const updated: TacticalMember[] = [...prev];
           incomingPeers.forEach((entry) => {
             const idx = updated.findIndex(
               (m) => m.id === entry.senderId || m.peerId === entry.peerId
             );
             if (idx >= 0) {
-              updated[idx] = {
-                ...updated[idx],
-                id: entry.senderId,
-                callsign: entry.callsign,
-                ip: entry.ip,
-                role: entry.role,
-                channel: entry.channel,
-                peerId: entry.peerId,
-                lastSeen: now,
-              };
+              const curr = updated[idx];
+              if (
+                curr.id !== entry.senderId ||
+                curr.callsign !== entry.callsign ||
+                curr.ip !== entry.ip ||
+                curr.role !== entry.role ||
+                curr.channel !== entry.channel ||
+                curr.peerId !== entry.peerId
+              ) {
+                changed = true;
+                updated[idx] = {
+                  ...curr,
+                  id: entry.senderId,
+                  callsign: entry.callsign,
+                  ip: entry.ip,
+                  role: entry.role,
+                  channel: entry.channel,
+                  peerId: entry.peerId,
+                  lastSeen: now,
+                };
+              }
             } else {
+              changed = true;
               updated.push({
                 id: entry.senderId,
                 callsign: entry.callsign,
@@ -1571,7 +1833,7 @@ export default function App() {
               });
             }
           });
-          return updated;
+          return changed ? updated : prev;
         });
 
         // Form direct P2P WebRTC connections with all other peers discovered via PEER_LIST_SYNC
@@ -1583,12 +1845,8 @@ export default function App() {
         return;
       }
 
-      // Refresh lastSeen for any active packet from this sender
-      setMembers((prev) =>
-        prev.map((m) =>
-          m.id === pkt.senderId ? { ...m, lastSeen: Date.now() } : m
-        )
-      );
+      // Refresh lastSeen timestamp in ref without triggering React re-render
+      memberLastSeenMapRef.current.set(pkt.senderId, Date.now());
 
       // Filter channel-specific packets (voice / PTT floor control / ping) without closing sockets
       if (pkt.channel !== channel) return;
@@ -1912,11 +2170,36 @@ export default function App() {
     ]
   );
 
-  // Keep latest packet handler in a ref so sockets never get destroyed on state updates
+  // Keep latest callbacks in refs so WebSocket/PeerJS/MQTT effects NEVER tear down or enter infinite loops
   const packetHandlerRef = useRef(handleIncomingMeshPacket);
   useEffect(() => {
     packetHandlerRef.current = handleIncomingMeshPacket;
   }, [handleIncomingMeshPacket]);
+
+  const broadcastMeshPacketRef = useRef(broadcastMeshPacket);
+  useEffect(() => {
+    broadcastMeshPacketRef.current = broadcastMeshPacket;
+  }, [broadcastMeshPacket]);
+
+  const broadcastPeerListSyncRef = useRef(broadcastPeerListSync);
+  useEffect(() => {
+    broadcastPeerListSyncRef.current = broadcastPeerListSync;
+  }, [broadcastPeerListSync]);
+
+  const connectToPeerNodeIfNeededRef = useRef(connectToPeerNodeIfNeeded);
+  useEffect(() => {
+    connectToPeerNodeIfNeededRef.current = connectToPeerNodeIfNeeded;
+  }, [connectToPeerNodeIfNeeded]);
+
+  const registerPeerConnectionRef = useRef(registerPeerConnection);
+  useEffect(() => {
+    registerPeerConnectionRef.current = registerPeerConnection;
+  }, [registerPeerConnection]);
+
+  const prepareNextOfflineMasterOfferRef = useRef(prepareNextOfflineMasterOffer);
+  useEffect(() => {
+    prepareNextOfflineMasterOfferRef.current = prepareNextOfflineMasterOffer;
+  }, [prepareNextOfflineMasterOffer]);
 
   const announcePacketBuilderRef = useRef<() => MeshPacket | null>(() => null);
   useEffect(() => {
@@ -1927,39 +2210,34 @@ export default function App() {
         type: 'ANNOUNCE',
         senderId: myDeviceId,
         callsign: myCallsign,
-        ip: localIp,
+        ip: detectedLanIpRef.current || localIp,
         role,
         channel,
         timestamp: Date.now(),
-        peerNodeId: myPeerNodeId,
+        peerNodeId: activeBoundPeerIdRef.current,
       };
     };
-  }, [myDeviceId, myCallsign, isPasscodeAuthenticated, localIp, role, channel, myPeerNodeId]);
+  }, [myDeviceId, myCallsign, isPasscodeAuthenticated, localIp, role, channel]);
 
   // Hybrid Cloud + Offline Hotspot LAN Signaling Engine + Auto-Reconnect Watchdog (2.5s):
-  // Wajib terautentikasi Passcode Operasional ("DISKOMLEKAU") sebelum WebSocket/WebRTC diizinkan aktif!
+  // Stabilized dependencies: never tears down or loops when activeBoundPeerId or localIp updates!
   useEffect(() => {
     if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
 
     let isCancelled = false;
 
-    // Pre-generate Offline Hotspot WebRTC Offer so QR Barcode works 100% offline without internet
-    prepareNextOfflineMasterOffer();
-
-    // Auto-detect real Hotspot IP via local WebRTC host ICE candidate & probe Local Hotspot WS Hub
+    // Auto-detect real Hotspot IP via local WebRTC host ICE candidate & prepare Offline Master Offer once
     let detectedSubnetGateway = '192.168.43.1';
-    detectLocalHotspotIpWebRTC().then((detectedIp) => {
-      if (isCancelled || !detectedIp) return;
-      detectedLanIpRef.current = detectedIp;
-      if (role === 'CLIENT' && localIp.startsWith('192.168.43.') && detectedIp !== '192.168.43.1') {
-        setLocalIp(detectedIp);
+    detectLocalHotspotIpWebRTC(500).then((detectedIp) => {
+      if (isCancelled) return;
+      if (detectedIp) {
+        detectedLanIpRef.current = detectedIp;
+        const parts = detectedIp.split('.');
+        if (parts.length === 4) {
+          detectedSubnetGateway = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
+        }
       }
-      const parts = detectedIp.split('.');
-      if (parts.length === 4) {
-        detectedSubnetGateway = `${parts[0]}.${parts[1]}.${parts[2]}.1`;
-      }
-      // Refresh Master Offline Offer once real LAN IP is known
-      prepareNextOfflineMasterOffer();
+      prepareNextOfflineMasterOfferRef.current();
     });
 
     const tryConnectLocalHotspotWsHub = () => {
@@ -1990,7 +2268,7 @@ export default function App() {
               return;
             }
             localHotspotWsRef.current = ws;
-            setIsHotspotLanHubConnected(true);
+            setIsHotspotLanHubConnected((prev) => (prev ? prev : true));
             const pkt = announcePacketBuilderRef.current();
             if (pkt) {
               try {
@@ -2012,7 +2290,7 @@ export default function App() {
           ws.onclose = () => {
             if (localHotspotWsRef.current === ws) {
               localHotspotWsRef.current = null;
-              setIsHotspotLanHubConnected(false);
+              setIsHotspotLanHubConnected((prev) => (!prev ? prev : false));
             }
           };
           ws.onerror = () => {
@@ -2049,7 +2327,7 @@ export default function App() {
             .substring(2, 6)}`,
           clean: true,
           keepalive: 30,
-          reconnectPeriod: 2500,
+          reconnectPeriod: 3500,
           connectTimeout: 8000,
         });
 
@@ -2094,7 +2372,7 @@ export default function App() {
 
       // Connect to static 'PTT-MASTER-01' whenever this node is not 'PTT-MASTER-01' itself
       if (myCurrentId !== MASTER_PEER_ID) {
-        connectToPeerNodeIfNeeded(MASTER_PEER_ID);
+        connectToPeerNodeIfNeededRef.current(MASTER_PEER_ID);
       }
 
       // Connect to custom Barcode invitedHostPeer if specified
@@ -2103,7 +2381,7 @@ export default function App() {
         invitedHostPeer !== MASTER_PEER_ID &&
         invitedHostPeer !== myCurrentId
       ) {
-        connectToPeerNodeIfNeeded(invitedHostPeer);
+        connectToPeerNodeIfNeededRef.current(invitedHostPeer);
       }
 
       // Also ensure direct P2P connections to any already-known members
@@ -2113,7 +2391,7 @@ export default function App() {
           m.peerId.startsWith('PTT-') &&
           m.peerId !== myCurrentId
         ) {
-          connectToPeerNodeIfNeeded(m.peerId);
+          connectToPeerNodeIfNeededRef.current(m.peerId);
         }
       });
     };
@@ -2121,7 +2399,8 @@ export default function App() {
     const initializePeerNode = (candidateId: string, allowFallback: boolean) => {
       if (isCancelled) return;
       boundId = candidateId;
-      setActiveBoundPeerId(candidateId);
+      activeBoundPeerIdRef.current = candidateId;
+      setActiveBoundPeerId((prev) => (prev === candidateId ? prev : candidateId));
 
       const peer = new Peer(candidateId, {
         config: {
@@ -2137,12 +2416,13 @@ export default function App() {
           peer.destroy();
           return;
         }
-        setActiveBoundPeerId(openedId);
+        activeBoundPeerIdRef.current = openedId;
+        setActiveBoundPeerId((prev) => (prev === openedId ? prev : openedId));
         connectToMasterAndPeers(peer, openedId);
       });
 
       peer.on('connection', (conn) => {
-        registerPeerConnection(conn);
+        registerPeerConnectionRef.current(conn);
       });
 
       peer.on('disconnected', () => {
@@ -2157,8 +2437,7 @@ export default function App() {
 
       peer.on('error', (err: { type?: string }) => {
         if (isCancelled) return;
-        // Critical fix for Vercel: if 'PTT-MASTER-01' is already taken (by another HP or a recent page reload),
-        // automatically bind uniqueClientPeerId and connect to 'PTT-MASTER-01' so the device never gets stuck!
+        // If 'PTT-MASTER-01' is already taken on 0.peerjs.com, fall back once to uniqueClientPeerId without re-running effect!
         if (err.type === 'unavailable-id' && allowFallback) {
           try {
             peer.destroy();
@@ -2196,12 +2475,11 @@ export default function App() {
         connectToMasterAndPeers(currentPeer, boundId);
       }
       if (isMasterRole) {
-        broadcastPeerListSync();
+        broadcastPeerListSyncRef.current();
       }
 
-      // Prune peers that have neither an open WebRTC/Offline LAN DataChannel nor a recent ANNOUNCE (> 12s)
+      // Prune peers that have neither an open WebRTC/Offline LAN DataChannel nor a recent ANNOUNCE (> 14s)
       const now = Date.now();
-      // Auto-release stale Channel Lockout if remote transmitter dropped offline without sending TX_STOP (> 12s)
       if (
         channelLockOwnerRef.current &&
         now - channelLockOwnerRef.current.updatedAt > 12000
@@ -2215,12 +2493,14 @@ export default function App() {
         (dc) => dc.readyState === 'open'
       );
       setMembers((prev) => {
+        if (prev.length === 0) return prev;
         const filtered = prev.filter((m) => {
           const hasOpenRtc =
             (m.peerId && peerConnectionsRef.current.get(m.peerId)?.open) ||
             peerConnectionsRef.current.get(m.id)?.open ||
             anyOfflineDcOpen;
-          const recentlySeen = now - (m.lastSeen || now) < 12000;
+          const lastSeenTs = memberLastSeenMapRef.current.get(m.id) || m.lastSeen || now;
+          const recentlySeen = now - lastSeenTs < 14000;
           return Boolean(hasOpenRtc || recentlySeen);
         });
         return filtered.length === prev.length ? prev : filtered;
@@ -2229,7 +2509,7 @@ export default function App() {
 
     // Send graceful PEER_LEAVE on tab/app close so other phones update immediately
     const handleBeforeUnload = () => {
-      broadcastMeshPacket({ type: 'PEER_LEAVE' });
+      broadcastMeshPacketRef.current({ type: 'PEER_LEAVE' });
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('pagehide', handleBeforeUnload);
@@ -2244,7 +2524,6 @@ export default function App() {
       pendingConnectTimestampRef.current.clear();
       localHotspotWsRef.current?.close();
       localHotspotWsRef.current = null;
-      setConnectedPeersCount(offlineRtcChannelsRef.current.size);
       currentPeer?.destroy();
       activeMqttClients.forEach((c) => {
         try {
@@ -2261,14 +2540,8 @@ export default function App() {
     myCallsign,
     myDeviceId,
     role,
-    localIp,
     uniqueClientPeerId,
     invitedHostPeer,
-    registerPeerConnection,
-    connectToPeerNodeIfNeeded,
-    broadcastPeerListSync,
-    broadcastMeshPacket,
-    prepareNextOfflineMasterOffer,
   ]);
 
   // Permanent role lock based on IP '192.168.43.1'
@@ -2550,14 +2823,14 @@ export default function App() {
 
     const handleVisibilityChange = () => {
       const isHidden = document.visibilityState === 'hidden' || document.hidden;
-      setIsBackgroundMode(isHidden);
+      setIsBackgroundMode((prev) => (prev === isHidden ? prev : isHidden));
 
       const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
       if (ctx) {
         audioCtxRef.current = ctx;
         if (keepAliveEnabledRef.current) {
           controller.pulseOnVisibilityChange(ctx, isHidden);
-          setIsSilentKeepAliveRunning(true);
+          setIsSilentKeepAliveRunning((prev) => (prev ? prev : true));
         }
       }
 
@@ -2567,9 +2840,8 @@ export default function App() {
         if (backgroundSocketHeartbeat) {
           window.clearInterval(backgroundSocketHeartbeat);
         }
-        broadcastMeshPacket({ type: 'ANNOUNCE' });
+        broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
         backgroundSocketHeartbeat = window.setInterval(() => {
-          // Pastikan AudioContext tidak dibekukan oleh OS
           if (audioCtxRef.current) {
             const st = audioCtxRef.current.state as string;
             if (st === 'suspended' || st === 'interrupted') {
@@ -2579,8 +2851,7 @@ export default function App() {
               controller.pulseOnVisibilityChange(audioCtxRef.current, true);
             }
           }
-          // Kirim paket keep-alive ANNOUNCE ke WebSocket / MQTT / WebRTC agar aliran data tetap aktif
-          broadcastMeshPacket({ type: 'ANNOUNCE' });
+          broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
           if (peerRef.current && peerRef.current.disconnected && !peerRef.current.destroyed) {
             try {
               peerRef.current.reconnect();
@@ -2601,18 +2872,16 @@ export default function App() {
             audioCtxRef.current.resume().catch(() => {});
           }
         }
-        if (voxEnabledRef.current) {
+        if (voxEnabledRef.current && !mediaStreamRef.current) {
           ensureWebAudioVoxGraph();
         }
-        broadcastMeshPacket({ type: 'ANNOUNCE' });
+        broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
       }
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('pagehide', handleVisibilityChange);
     window.addEventListener('pageshow', handleVisibilityChange);
-    window.addEventListener('blur', handleVisibilityChange);
-    window.addEventListener('focus', handleVisibilityChange);
 
     return () => {
       if (backgroundSocketHeartbeat) {
@@ -2621,15 +2890,12 @@ export default function App() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('pagehide', handleVisibilityChange);
       window.removeEventListener('pageshow', handleVisibilityChange);
-      window.removeEventListener('blur', handleVisibilityChange);
-      window.removeEventListener('focus', handleVisibilityChange);
     };
   }, [
     isPasscodeAuthenticated,
     isSetupCompleted,
     myCallsign,
     keepAliveEnabled,
-    broadcastMeshPacket,
     ensureWebAudioVoxGraph,
   ]);
 
@@ -2820,14 +3086,16 @@ export default function App() {
           });
 
           const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          const updateMeter = () => {
+          if (animFrameRef.current) {
+            window.clearInterval(animFrameRef.current);
+          }
+          // Throttled 110ms meter update via isolated LiveAudioMeterStore (0 re-renders on main App!)
+          animFrameRef.current = window.setInterval(() => {
             if (!isTransmittingRef.current) return;
             analyser.getByteFrequencyData(dataArray);
             const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-            setMicLevel(Math.min(100, Math.max(25, avg * 1.45)));
-            animFrameRef.current = requestAnimationFrame(updateMeter);
-          };
-          updateMeter();
+            setMicLevel(Math.min(100, Math.max(25, Math.round(avg * 1.45))));
+          }, 110);
 
           // Negotiate Opus Codec with Low-Bitrate (16 kbps - 24 kbps) & Optimal 45ms Timeslice (40ms - 50ms window)
           let startedMediaRecorder = false;
@@ -2939,22 +3207,24 @@ export default function App() {
             }, 2300);
           }
         } else {
-          // If microphone permission is not yet granted, fallback visual meter so UI remains responsive
-          const fallbackTick = () => {
+          // If microphone permission is not yet granted, fallback visual meter at throttled 120ms interval
+          if (animFrameRef.current) {
+            window.clearInterval(animFrameRef.current);
+          }
+          animFrameRef.current = window.setInterval(() => {
             if (!isTransmittingRef.current) return;
             setMicLevel(Math.floor(40 + Math.random() * 55));
-            animFrameRef.current = requestAnimationFrame(fallbackTick);
-          };
-          fallbackTick();
+          }, 120);
         }
       } catch {
         setMicPermissionState('denied');
-        const fallbackTick = () => {
+        if (animFrameRef.current) {
+          window.clearInterval(animFrameRef.current);
+        }
+        animFrameRef.current = window.setInterval(() => {
           if (!isTransmittingRef.current) return;
           setMicLevel(Math.floor(40 + Math.random() * 55));
-          animFrameRef.current = requestAnimationFrame(fallbackTick);
-        };
-        fallbackTick();
+        }, 120);
       }
     },
     [
@@ -2965,6 +3235,8 @@ export default function App() {
       ensureWebAudioVoxGraph,
       dispatchRecordedVoiceBlob,
       myCallsign,
+      setMicLevel,
+      setVoxInputLevel,
     ]
   );
 
@@ -2976,7 +3248,7 @@ export default function App() {
     isVoxTriggeredTxRef.current = false;
     voxVoiceFramesRef.current = 0;
     voiceOnsetStartTimeRef.current = 0;
-    setMicLevel(0);
+    setMicLevel(0, true);
 
     if (pttSegmentIntervalRef.current) {
       window.clearInterval(pttSegmentIntervalRef.current);
@@ -2989,6 +3261,7 @@ export default function App() {
     }
 
     if (animFrameRef.current) {
+      window.clearInterval(animFrameRef.current);
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
     }
@@ -3156,24 +3429,42 @@ export default function App() {
     }
   };
 
+  // Stable refs for VOX monitor so the VOX interval NEVER restarts or loops when TX/RX state changes
+  const isPttLockedRef = useRef<boolean>(isPttLocked);
+  useEffect(() => {
+    isPttLockedRef.current = isPttLocked;
+  }, [isPttLocked]);
+
+  const onStartTransmitRef = useRef(onStartTransmit);
+  useEffect(() => {
+    onStartTransmitRef.current = onStartTransmit;
+  }, [onStartTransmit]);
+
+  const onStopTransmitRef = useRef(onStopTransmit);
+  useEffect(() => {
+    onStopTransmitRef.current = onStopTransmit;
+  }, [onStopTransmit]);
+
+  const ensureWebAudioVoxGraphRef = useRef(ensureWebAudioVoxGraph);
+  useEffect(() => {
+    ensureWebAudioVoxGraphRef.current = ensureWebAudioVoxGraph;
+  }, [ensureWebAudioVoxGraph]);
+
   // MESIN UTAMA VOX CERDAS BERBASIS WEB AUDIO API:
-  // 1. Adaptive Threshold / Noise Gate (Kalibrasi Otomatis Ambient Noise Floor)
-  // 2. Bandpass Filter Vokal (300 Hz - 3.400 Hz)
-  // 3. Voice Pattern Verification & Hysteresis Debounce (175-200 ms)
+  // Semua pembaruan level audio disalurkan ke LiveAudioMeterStore (React.memo) sehingga TIDAK memicu re-render halaman utama!
   useEffect(() => {
     if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
 
     let isCancelled = false;
     let voxTimer: number | null = null;
 
-    // Reset kalibrasi awal kebisingan latar belakang saat pertama kali terhubung
     isInitialNoiseCalibratingRef.current = true;
     noiseCalibrationSamplesRef.current = [];
     voiceOnsetStartTimeRef.current = 0;
 
     const startContinuousVoxMonitor = async () => {
       if (!voxEnabled && !isTransmittingRef.current) {
-        setVoxInputLevel(0);
+        setVoxInputLevel(0, true);
         setIsVocalPatternConfirmed(false);
         if (mediaStreamRef.current && !isTransmittingRef.current) {
           mediaStreamRef.current.getAudioTracks().forEach((t) => {
@@ -3183,7 +3474,7 @@ export default function App() {
         return;
       }
 
-      const analyser = await ensureWebAudioVoxGraph();
+      const analyser = await ensureWebAudioVoxGraphRef.current();
       if (isCancelled || !analyser) return;
 
       if (
@@ -3202,7 +3493,6 @@ export default function App() {
       voxTimer = window.setInterval(() => {
         if (isCancelled) return;
 
-        // Auto-resume AudioContext if mobile browser (Safari iOS / Chrome Android / HarmonyOS) suspended or interrupted it
         if (audioCtxRef.current) {
           const st = audioCtxRef.current.state as string;
           if (st === 'suspended' || st === 'interrupted') {
@@ -3210,8 +3500,6 @@ export default function App() {
           }
         }
 
-        // Strict Channel Lockout & Half-Duplex Anti-Collision Gate:
-        // Never allow VOX to sample or trigger while another peer holds the channel lock, is playing RX audio, or in cooldown
         const now = Date.now();
         const activeLock = channelLockOwnerRef.current;
         const isChannelLockedOrReceiving =
@@ -3242,7 +3530,6 @@ export default function App() {
           return;
         }
 
-        // Re-enable mic track for VOX standby once channel lock & cooldown are completely clear
         if (
           voxEnabledRef.current &&
           !isTransmittingRef.current &&
@@ -3267,7 +3554,7 @@ export default function App() {
 
         // 2. Analisis Spektral Pita Vokal Manusia Natural (250 Hz - 3.400 Hz) vs Bising Luar
         const sampleRate = audioCtxRef.current?.sampleRate || 48000;
-        const binHz = sampleRate / analyser.fftSize; // ~93.75 Hz per bin (fftSize=512)
+        const binHz = sampleRate / analyser.fftSize;
         const minVocalBin = Math.max(1, Math.floor(250 / binHz));
         const maxVocalBin = Math.min(
           freqDomainBuf.length - 1,
@@ -3293,45 +3580,39 @@ export default function App() {
         const vocalBandAvg = vocalBinCount > 0 ? vocalBandSum / vocalBinCount : 0;
         const nonVocalAvg = nonVocalCount > 0 ? nonVocalSum / nonVocalCount : 0;
 
-        // Kalibrasi Sensitivitas VOX Seimbang (Optimal untuk THR 18% - 22%):
-        // Meredam bising latar belakang lingkungan rendah (< 0.008 RMS / < 5 dB spektral) agar tetap di bawah 18%,
-        // namun responsif terhadap suara vokal manusia tanpa hambatan berlebihan.
         const cleanRms = rms < 0.008 ? 0 : rms - 0.008;
         const rmsScore = Math.sqrt(cleanRms) * 114;
         const spectralScore = Math.max(0, vocalBandAvg - 5) * 0.96;
         const rawEnergy = Math.max(rmsScore, spectralScore);
-        // Jika didominasi desis/gemuruh non-vokal, redam sedikit agar tidak salah memicu di ambang 18%-22%
         const isVocalDominant = vocalBandAvg >= nonVocalAvg * 0.85;
         const voiceEnergy = Math.min(
           100,
           Math.round(isVocalDominant ? rawEnergy : rawEnergy * 0.72)
         );
-        setVoxInputLevel(voiceEnergy);
 
-        // 3. AMBANG BATAS (THRESHOLD) SEIMBANG & SLIDER STABIL 100%:
-        // Nilai slider (lockedThreshold) dikunci sesuai pilihan pengguna/preset (default 20% di kisaran 18%-22%)
-        // dan TIDAK PERNAH bergeser sendiri akibat kalibrasi otomatis.
         const lockedThreshold = voxThresholdRef.current;
         const isVocalPatternValid = voiceEnergy >= lockedThreshold && isVocalDominant;
-        setIsVocalPatternConfirmed(isVocalPatternValid);
 
-        // 4. INDIKATOR KEBISINGAN LATAR PASIF (Hanya telemetri visual, tidak menggeser nilai slider voxThreshold):
         if (!isTransmittingRef.current && voiceOnsetStartTimeRef.current === 0 && voiceEnergy < lockedThreshold) {
           ambientNoiseFloorRef.current = Math.max(
             2,
             Math.min(35, ambientNoiseFloorRef.current * 0.9 + voiceEnergy * 0.1)
           );
-          setAmbientNoiseFloor(Math.round(ambientNoiseFloorRef.current));
         }
 
-        // 5. PEMICU TRANSMISI VOX SEIMBANG (Verifikasi pola vokal singkat ~135ms / 3 frame):
-        // Menolak bising ketukan sesaat namun langsung membuka PTT saat pengguna mulai berbicara.
+        // Update isolated LiveAudioMeterStore (throttled + deadband, 0 re-renders on App!)
+        liveAudioMeterStore.update({
+          voxInputLevel: voiceEnergy,
+          isVocalPatternConfirmed: isVocalPatternValid,
+          ambientNoiseFloor: Math.round(ambientNoiseFloorRef.current),
+        });
+
         const requiredConfirmMs = 135;
 
         if (!isTransmittingRef.current) {
           if (
             voxEnabledRef.current &&
-            !isPttLocked &&
+            !isPttLockedRef.current &&
             isVocalPatternValid
           ) {
             if (voiceOnsetStartTimeRef.current === 0) {
@@ -3345,10 +3626,9 @@ export default function App() {
               voiceOnsetStartTimeRef.current = 0;
               voxVoiceFramesRef.current = 0;
               lastVoiceActiveTimeRef.current = now;
-              onStartTransmit('VOX');
+              onStartTransmitRef.current('VOX');
             }
           } else {
-            // Toleransi alami antar suku kata (120ms)
             if (
               voiceOnsetStartTimeRef.current > 0 &&
               now - (lastVocalDipTimeRef.current || now) <= 120 &&
@@ -3364,7 +3644,6 @@ export default function App() {
             }
           }
         } else {
-          // Saat sedang Transmisi (TX Aktif) -> Gunakan ambang histeresis bawah seimbang (55% dari lockedThreshold)
           const sustainThreshold = Math.max(
             6,
             Math.round(lockedThreshold * 0.55)
@@ -3378,40 +3657,42 @@ export default function App() {
           ) {
             const silentMs = now - lastVoiceActiveTimeRef.current;
             if (silentMs >= voxHoldMsRef.current) {
-              onStopTransmit();
+              onStopTransmitRef.current();
             }
           }
         }
-      }, 45);
+      }, 65);
     };
 
     startContinuousVoxMonitor();
 
-    // Ensure AudioContext, reusable HTMLAudioElement & Keep-Alive Silent Stream unlock on any touch/click (iOS Safari & Android Chrome)
+    // Unlock AudioContext on first user interaction only if not already running (prevents redundant setState on every click!)
     const unlockAudioOnInteraction = () => {
-      const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
+      const existingCtx = audioCtxRef.current;
+      if (existingCtx && existingCtx.state === 'running' && mediaStreamRef.current) {
+        return;
+      }
+      const ctx = getOrCreateCompatibleAudioContext(existingCtx);
       if (ctx) {
         audioCtxRef.current = ctx;
-        unlockMobileAudioSession(ctx, reusableRxAudioRef.current);
-        if (keepAliveEnabledRef.current && keepAliveSessionRef.current) {
+        if (ctx.state !== 'running') {
+          unlockMobileAudioSession(ctx, reusableRxAudioRef.current);
+        }
+        if (keepAliveEnabledRef.current && keepAliveSessionRef.current && !keepAliveSessionRef.current.isActive()) {
           keepAliveSessionRef.current.start(ctx);
-          setIsSilentKeepAliveRunning(true);
+          setIsSilentKeepAliveRunning((prev) => (prev ? prev : true));
         }
       }
       if (voxEnabledRef.current && !mediaStreamRef.current) {
-        ensureWebAudioVoxGraph();
+        ensureWebAudioVoxGraphRef.current();
       }
     };
     window.addEventListener('pointerdown', unlockAudioOnInteraction, { passive: true });
-    window.addEventListener('touchstart', unlockAudioOnInteraction, { passive: true });
-    window.addEventListener('keydown', unlockAudioOnInteraction, { passive: true });
 
     return () => {
       isCancelled = true;
       if (voxTimer) window.clearInterval(voxTimer);
       window.removeEventListener('pointerdown', unlockAudioOnInteraction);
-      window.removeEventListener('touchstart', unlockAudioOnInteraction);
-      window.removeEventListener('keydown', unlockAudioOnInteraction);
     };
   }, [
     isPasscodeAuthenticated,
@@ -3419,10 +3700,8 @@ export default function App() {
     myCallsign,
     myDeviceId,
     voxEnabled,
-    isPttLocked,
-    ensureWebAudioVoxGraph,
-    onStartTransmit,
-    onStopTransmit,
+    setVoxInputLevel,
+    setIsVocalPatternConfirmed,
   ]);
 
   // Toggle Native Browser/WebView FullScreen when clicking [FULL]
@@ -3451,7 +3730,7 @@ export default function App() {
         keepAliveSessionRef.current = createSilentKeepAliveController();
       }
       keepAliveSessionRef.current.pulseOnVisibilityChange(ctx, true);
-      setIsSilentKeepAliveRunning(true);
+      setIsSilentKeepAliveRunning((prev) => (prev ? prev : true));
     }
     sendServiceWorkerKeepAlivePing({
       callsign: myCallsign || 'UNIT',
@@ -3484,7 +3763,7 @@ export default function App() {
   // Refresh Ping handler (Ultra-Low Latency < 50ms check)
   const handleRefreshPing = () => {
     setIsRefreshingPing(true);
-    broadcastMeshPacket({ type: 'PING' });
+    broadcastMeshPacketRef.current({ type: 'PING' });
     window.setTimeout(() => {
       const nextPing = Math.floor(14 + Math.random() * 24);
       setPingDelta(Math.abs(nextPing - pingMs));
@@ -3493,15 +3772,15 @@ export default function App() {
     }, 180);
   };
 
-  // Constant 1-second ANNOUNCE broadcast once connected (mirrors Flutter Timer.periodic 1s)
+  // Periodic ANNOUNCE broadcast once connected (uses stable ref so effect never restarts on state updates)
   useEffect(() => {
     if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
-    broadcastMeshPacket({ type: 'ANNOUNCE' });
+    broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
     const interval = window.setInterval(() => {
-      broadcastMeshPacket({ type: 'ANNOUNCE' });
-    }, 1000);
+      broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
+    }, 2200);
     return () => window.clearInterval(interval);
-  }, [isPasscodeAuthenticated, isSetupCompleted, myCallsign, broadcastMeshPacket]);
+  }, [isPasscodeAuthenticated, isSetupCompleted, myCallsign]);
 
   // TOMBOL EMERGENCY CLEAR (PEMBERSIHAN DARURAT MILITER)
   // Memutuskan koneksi WebSocket/WebRTC/MQTT secara instan, menghentikan seluruh stream mikrofon (MediaStreamTrack.stop()),
@@ -4702,7 +4981,7 @@ export default function App() {
                   </span>
                 </div>
                 <div className="font-telemetry text-[9.5px] text-cyan-200 flex items-center gap-2 mt-0.5">
-                  <span>MIC: {voxInputLevel}%</span>
+                  <MiniWidgetMicLevelText />
                   <span>•</span>
                   <span className="text-[#23dcff] font-bold underline">
                     Ketuk Ikon untuk Buka Penuh
@@ -5100,58 +5379,14 @@ export default function App() {
                 )}
               </div>
 
-              {/* Baris 2: Pengatur Sensitivitas VOX (Default Balance — Slider Manual Lancar & Stabil) */}
-              <div className="flex items-center gap-2">
-                <span
-                  title="Ambang Batas Sensitivitas VOX (Default Balance 18% — Dapat digeser manual secara bebas)"
-                  className="font-telemetry text-[9px] font-bold text-cyan-100 shrink-0"
-                >
-                  THR <strong className="text-[#23dcff]">{voxThreshold}%</strong>
-                </span>
-
-                <div className="relative flex-1 h-4 flex items-center">
-                  {/* Track Background + Live Vocal Level Bar */}
-                  <div className="w-full h-2 rounded-full bg-[#021220] border border-cyan-400/40 overflow-hidden relative">
-                    {/* Level Suara Vokal Saat Ini */}
-                    <div
-                      style={{ width: `${Math.min(100, voxInputLevel)}%` }}
-                      className={`h-full transition-all duration-75 ${
-                        voxInputLevel >= voxThreshold && isVocalPatternConfirmed
-                          ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
-                          : 'bg-cyan-500/55'
-                      }`}
-                    />
-                  </div>
-
-                  {/* Garis Batas Ambang Manual/Preset (Sesuai Posisi Slider Pengguna) */}
-                  <div
-                    style={{
-                      left: `${((voxThreshold - 5) / (85 - 5)) * 100}%`,
-                    }}
-                    className="absolute top-0 bottom-0 w-1 -ml-0.5 rounded-full bg-white shadow-[0_0_6px_#23dcff] pointer-events-none"
-                  />
-
-                  {/* Input Range Slider Interaktif (Lancar Digeser Manual 5% - 85%) */}
-                  <input
-                    type="range"
-                    min={5}
-                    max={85}
-                    step={1}
-                    value={voxThreshold}
-                    onChange={(e) => setVoxThreshold(Number(e.target.value))}
-                    aria-label="Pengatur Sensitivitas VOX Threshold Slider"
-                    className="absolute inset-0 w-full h-full accent-[#23dcff] opacity-90 cursor-pointer"
-                  />
-                </div>
-
-                <span className="font-telemetry text-[8.5px] text-cyan-100/95 shrink-0 min-w-[88px] text-right">
-                  {isPttLocked
-                    ? `LOCKED (${activeLockSpeaker})`
-                    : voxEnabled
-                    ? `MIC:${voxInputLevel}%•THR:${voxThreshold}%`
-                    : 'MANUAL PTT'}
-                </span>
-              </div>
+              {/* Baris 2: Pengatur Sensitivitas VOX Terisolasi (React.memo — Hanya merender ulang bar indikator ini, bukan seluruh halaman) */}
+              <VoxThresholdSliderRow
+                voxThreshold={voxThreshold}
+                onChangeThreshold={setVoxThreshold}
+                isPttLocked={isPttLocked}
+                activeLockSpeaker={activeLockSpeaker}
+                voxEnabled={voxEnabled}
+              />
             </div>
 
             {/* Baris Bawah: Real Peers atau Status Pencarian */}
@@ -5247,26 +5482,13 @@ export default function App() {
           {/* 5. AREA UTAMA PTT + GELOMBANG SUARA + BANNER STATUS (FLEX-1 MAXIMIZED) */}
           <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-1.5 py-0.5">
             <section className="flex items-center justify-center gap-3.5">
-              {/* Indikator Gelombang Suara Kiri */}
-              <div className="flex items-center gap-1">
-                {[6, 8, 10, 12, 15, 18, 21, 24].map((h, i) => (
-                  <span
-                    key={`lw-${i}`}
-                    style={{
-                      height: isTransmitting
-                        ? `${Math.max(6, ((h * Math.max(micLevel, voxInputLevel)) / 55) % 34)}px`
-                        : voxEnabled && voxInputLevel > 5
-                        ? `${Math.max(5, ((h * voxInputLevel) / 85) % 22)}px`
-                        : `${h * 0.65}px`,
-                    }}
-                    className={`w-1.5 rounded-full transition-all duration-75 ${
-                      isTransmitting || activeLockSpeaker
-                        ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
-                        : 'bg-[#23dcff]/55'
-                    }`}
-                  />
-                ))}
-              </div>
+              {/* Indikator Gelombang Suara Kiri Terisolasi (React.memo) */}
+              <PttSoundWaveSideBars
+                side="left"
+                isTransmitting={isTransmitting}
+                voxEnabled={voxEnabled}
+                hasActiveLockSpeaker={Boolean(activeLockSpeaker)}
+              />
 
               {/* Tombol Lingkaran PTT (VOX Hands-Free Otomatis + Klik Manual + Channel Lockout) */}
               <button
@@ -5346,26 +5568,13 @@ export default function App() {
                 </div>
               </button>
 
-              {/* Indikator Gelombang Suara Kanan */}
-              <div className="flex items-center gap-1">
-                {[24, 21, 18, 15, 12, 10, 8, 6].map((h, i) => (
-                  <span
-                    key={`rw-${i}`}
-                    style={{
-                      height: isTransmitting
-                        ? `${Math.max(6, ((h * Math.max(micLevel, voxInputLevel)) / 55) % 34)}px`
-                        : voxEnabled && voxInputLevel > 5
-                        ? `${Math.max(5, ((h * voxInputLevel) / 85) % 22)}px`
-                        : `${h * 0.65}px`,
-                    }}
-                    className={`w-1.5 rounded-full transition-all duration-75 ${
-                      isTransmitting || activeLockSpeaker
-                        ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
-                        : 'bg-[#23dcff]/55'
-                    }`}
-                  />
-                ))}
-              </div>
+              {/* Indikator Gelombang Suara Kanan Terisolasi (React.memo) */}
+              <PttSoundWaveSideBars
+                side="right"
+                isTransmitting={isTransmitting}
+                voxEnabled={voxEnabled}
+                hasActiveLockSpeaker={Boolean(activeLockSpeaker)}
+              />
             </section>
 
             {/* BANNER STATUS BAWAH (CHANNEL LOCKOUT / ANTI-COLLISION & VOX OTOMATIS) */}
