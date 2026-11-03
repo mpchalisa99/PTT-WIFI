@@ -50,6 +50,7 @@ import {
   detectMobileAudioPlatform,
   getOrCreateCompatibleAudioContext,
   unlockMobileAudioSession,
+  enforceHardwareEchoCancellationOnStream,
   requestMicrophoneWithFallbacks,
   getSupportedAudioMimeType,
   OPTIMAL_MEDIA_RECORDER_TIMESLICE_MS,
@@ -62,6 +63,7 @@ import {
   createSilentKeepAliveController,
   registerTacticalBackgroundServiceWorker,
   sendServiceWorkerKeepAlivePing,
+  subscribeToBackgroundWorkerTicks,
   SilentKeepAliveSession,
 } from './utils/mobileAudioEngine';
 import {
@@ -742,6 +744,8 @@ export default function App() {
   // Audio, WebRTC, Offline Hotspot LAN & WSS Cloud Mesh refs
   const audioCtxRef = useRef<AudioContext | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const voxPreAmpGainRef = useRef<GainNode | null>(null);
+  const micLoopbackKeepAliveGainRef = useRef<GainNode | null>(null);
   const micFilterRef = useRef<BiquadFilterNode | null>(null);
   const micAnalyserRef = useRef<AnalyserNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -894,13 +898,13 @@ export default function App() {
           });
         }
       } catch {
-        // Ignore if not supported in current browser frame
+        // Ignore if browser requires a user gesture first; pointerdown listener below will re-request
       }
     };
 
     requestWakeLock();
 
-    // Register Tactical Background Keep-Alive Service Worker (/tactical-bg-sw.js)
+    // Register Tactical Background Keep-Alive Worker
     registerTacticalBackgroundServiceWorker(() => {
       if (!isUnmounted) {
         setIsSwKeepAliveActive((prev) => (prev ? prev : true));
@@ -917,7 +921,7 @@ export default function App() {
       }
     });
 
-    // Periodic Service Worker Keep-Alive Ping (every 4s) to prevent background thread suspension
+    // Periodic Keep-Alive Ping (every 4s) to prevent background thread suspension
     swHeartbeatTimer = window.setInterval(() => {
       sendServiceWorkerKeepAlivePing({
         callsign: myCallsign || 'UNIT',
@@ -942,13 +946,27 @@ export default function App() {
       });
     };
 
+    const handleUserGestureWakeLock = () => {
+      if (document.visibilityState === 'visible' && (!wakeLock || wakeLock.released)) {
+        requestWakeLock();
+      }
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityOrFocusWakeLock);
+    window.addEventListener('focus', handleVisibilityOrFocusWakeLock);
+    window.addEventListener('pageshow', handleVisibilityOrFocusWakeLock);
+    window.addEventListener('pointerdown', handleUserGestureWakeLock, { passive: true });
+    window.addEventListener('touchstart', handleUserGestureWakeLock, { passive: true });
     return () => {
       isUnmounted = true;
       if (swHeartbeatTimer) {
         window.clearInterval(swHeartbeatTimer);
       }
       document.removeEventListener('visibilitychange', handleVisibilityOrFocusWakeLock);
+      window.removeEventListener('focus', handleVisibilityOrFocusWakeLock);
+      window.removeEventListener('pageshow', handleVisibilityOrFocusWakeLock);
+      window.removeEventListener('pointerdown', handleUserGestureWakeLock);
+      window.removeEventListener('touchstart', handleUserGestureWakeLock);
       wakeLock?.release().catch(() => {});
     };
   }, [myCallsign, channel]);
@@ -1098,9 +1116,11 @@ export default function App() {
       if (!soundEnabled) return;
       // STRICT ANTI-ECHO: While PTT/VOX is open (TX active / Receiver OFF), NEVER play any speaker audio!
       if (isTransmittingRef.current || isReceiverOffRef.current) return;
+      // Prevent self-echo if own packet ever loops back from a relay broker
+      if (senderDeviceId && senderDeviceId === myDeviceId) return;
 
       const now = Date.now();
-      rxCooldownUntilRef.current = now + 3000;
+      rxCooldownUntilRef.current = now + 3200;
       voxVoiceFramesRef.current = 0;
       voiceOnsetStartTimeRef.current = 0;
       setVoxInputLevel(0);
@@ -1118,6 +1138,16 @@ export default function App() {
         setChannelLockOwner(lockObj);
       }
 
+      // ISOLASI TOTAL SPEAKER-KE-MIKROFON (ANTI-ECHO GATE SAAT PLAYBACK PENERIMA):
+      // Matikan track mikrofon & kunci gain input mikrofon ke 0.0 selama speaker memutar suara masuk
+      // agar suara dari speaker tidak pernah bocor atau terpantul masuk kembali ke mikrofon perangkat yang sama!
+      if (voxPreAmpGainRef.current && audioCtxRef.current) {
+        try {
+          voxPreAmpGainRef.current.gain.setValueAtTime(0, audioCtxRef.current.currentTime);
+        } catch {
+          voxPreAmpGainRef.current.gain.value = 0;
+        }
+      }
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getAudioTracks().forEach((track) => {
           track.enabled = false;
@@ -1181,7 +1211,8 @@ export default function App() {
       const finalizeQueueAndRestoreVox = (lastSpeaker: string) => {
         isRxQueuePlayingRef.current = false;
         activeWebAudioRxStopRef.current = null;
-        rxCooldownUntilRef.current = Date.now() + 550;
+        // 800ms Acoustic Tail Guard so speaker room reflection completely decays before mic re-opens
+        rxCooldownUntilRef.current = Date.now() + 800;
 
         if (
           !remoteActiveTxRef.current ||
@@ -1199,18 +1230,28 @@ export default function App() {
 
         window.setTimeout(() => {
           if (
-            voxEnabledRef.current &&
             !isTransmittingRef.current &&
             !remoteActiveTxRef.current &&
             !channelLockOwnerRef.current &&
-            !isRxQueuePlayingRef.current &&
-            mediaStreamRef.current
+            !isRxQueuePlayingRef.current
           ) {
-            mediaStreamRef.current.getAudioTracks().forEach((track) => {
-              track.enabled = true;
-            });
+            if (voxPreAmpGainRef.current && audioCtxRef.current) {
+              try {
+                voxPreAmpGainRef.current.gain.setValueAtTime(
+                  1.65,
+                  audioCtxRef.current.currentTime
+                );
+              } catch {
+                voxPreAmpGainRef.current.gain.value = 1.65;
+              }
+            }
+            if (voxEnabledRef.current && mediaStreamRef.current) {
+              mediaStreamRef.current.getAudioTracks().forEach((track) => {
+                track.enabled = true;
+              });
+            }
           }
-        }, 520);
+        }, 780);
       };
 
       const playNextSegmentInQueue = () => {
@@ -2096,11 +2137,18 @@ export default function App() {
         remoteActiveTxRef.current = pkt.callsign;
         setIncomingSpeaker(pkt.callsign);
 
-        // Immediately lock out local VOX & mute hardware mic track so nearby devices never feedback!
+        // Immediately lock out local VOX & mute hardware mic track + pre-amp so nearby/same device speaker never feedbacks!
         voxVoiceFramesRef.current = 0;
         voiceOnsetStartTimeRef.current = 0;
         setVoxInputLevel(0);
-        rxCooldownUntilRef.current = now + 2500;
+        rxCooldownUntilRef.current = now + 2800;
+        if (voxPreAmpGainRef.current && audioCtxRef.current) {
+          try {
+            voxPreAmpGainRef.current.gain.setValueAtTime(0, audioCtxRef.current.currentTime);
+          } catch {
+            voxPreAmpGainRef.current.gain.value = 0;
+          }
+        }
         if (mediaStreamRef.current) {
           mediaStreamRef.current.getAudioTracks().forEach((track) => {
             track.enabled = false;
@@ -2695,6 +2743,9 @@ export default function App() {
         const stream = mediaStreamRef.current;
         if (!stream) return null;
 
+        // Eksplisit paksa fitur bawaan WebRTC Echo Cancellation, Noise Suppression, & Auto Gain Control aktif pada stream
+        await enforceHardwareEchoCancellationOnStream(stream);
+
         const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
         if (!ctx) {
           setMicErrorNotice('Web Audio API tidak didukung pada peramban ini.');
@@ -2714,10 +2765,11 @@ export default function App() {
         if (!micSourceRef.current || !micAnalyserRef.current) {
           const source = ctx.createMediaStreamSource(stream);
 
-          // PRE-AMP GAIN SENSOR VOX SEIMBANG (Default Balance 1.65x):
-          // Menangkap suara vokal secara wajar dan responsif tanpa penguncian yang kaku maupun amplifikasi berlebihan.
+          // PRE-AMP GAIN SENSOR VOX SEIMBANG (Default Balance 1.65x) + ANTI-ECHO GATE:
+          // Saat speaker RX berbunyi, gain ini langsung dikunci ke 0.0 agar suara speaker tidak bocor ke mikrofon.
           const voxPreAmpGain = ctx.createGain();
-          voxPreAmpGain.gain.value = 1.65;
+          voxPreAmpGain.gain.setValueAtTime(1.65, ctx.currentTime);
+          voxPreAmpGainRef.current = voxPreAmpGain;
 
           // FILTER FREKUENSI VOKAL NATURAL (250 Hz - 3.400 Hz) VIA WEB AUDIO API BiquadFilterNode:
           // Stage 1: High-Pass Filter (250 Hz, Butterworth Q = 0.707)
@@ -2740,10 +2792,20 @@ export default function App() {
           analyser.maxDecibels = -18;
           analyser.smoothingTimeConstant = 0.25;
 
+          // WEB AUDIO API ANALYSER / GAINNODE LOOP-BACK RINGAN (GAIN = 0.0 -> DESTINATION):
+          // Menjaga agar peramban seluler (Chrome Android / Safari iOS / HarmonyOS) tetap menarik sampel dari
+          // MediaStream mikrofon saat pengguna beralih membuka aplikasi lain di HP (Background Mode),
+          // dengan gain tepat 0.0 sehingga suara mikrofon sendiri TIDAK PERNAH bocor/menggema ke speaker!
+          const micLoopbackKeepAliveGain = ctx.createGain();
+          micLoopbackKeepAliveGain.gain.setValueAtTime(0, ctx.currentTime);
+          micLoopbackKeepAliveGainRef.current = micLoopbackKeepAliveGain;
+
           source.connect(voxPreAmpGain);
           voxPreAmpGain.connect(highpassVocal);
           highpassVocal.connect(lowpassVocal);
           lowpassVocal.connect(analyser);
+          analyser.connect(micLoopbackKeepAliveGain);
+          micLoopbackKeepAliveGain.connect(ctx.destination);
 
           micSourceRef.current = source;
           micFilterRef.current = lowpassVocal;
@@ -2906,10 +2968,20 @@ export default function App() {
       }
 
       if (isHidden) {
-        // Saat layar HP mati / masuk saku (background): jalankan detak jantung WebSocket/WebRTC tiap 4 detik
-        // agar soket jaringan dan pemutaran suara masuk tetap hidup 100%
+        // Saat pengguna beralih membuka aplikasi lain di HP / layar mati (background):
+        // Jaga aliran mikrofon (MediaStream), AudioContext, WebSocket, MQTT, & PeerJS tetap aktif tanpa terputus!
         if (backgroundSocketHeartbeat) {
           window.clearInterval(backgroundSocketHeartbeat);
+        }
+        if (
+          voxEnabledRef.current &&
+          !isRxQueuePlayingRef.current &&
+          !remoteActiveTxRef.current &&
+          mediaStreamRef.current
+        ) {
+          mediaStreamRef.current.getAudioTracks().forEach((t) => {
+            if (!t.enabled) t.enabled = true;
+          });
         }
         broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
         backgroundSocketHeartbeat = window.setInterval(() => {
@@ -2920,6 +2992,18 @@ export default function App() {
             }
             if (keepAliveEnabledRef.current) {
               controller.pulseOnVisibilityChange(audioCtxRef.current, true);
+            }
+          }
+          if (voxEnabledRef.current && !isRxQueuePlayingRef.current && !remoteActiveTxRef.current) {
+            const hasLiveMic = mediaStreamRef.current
+              ?.getAudioTracks()
+              .some((t) => t.readyState === 'live');
+            if (!hasLiveMic) {
+              ensureWebAudioVoxGraphRef.current(true);
+            } else if (mediaStreamRef.current) {
+              mediaStreamRef.current.getAudioTracks().forEach((t) => {
+                if (!t.enabled) t.enabled = true;
+              });
             }
           }
           broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
@@ -2943,18 +3027,60 @@ export default function App() {
             audioCtxRef.current.resume().catch(() => {});
           }
         }
-        if (voxEnabledRef.current && !mediaStreamRef.current) {
-          ensureWebAudioVoxGraph();
+        if (voxEnabledRef.current) {
+          const hasLiveMic = mediaStreamRef.current
+            ?.getAudioTracks()
+            .some((t) => t.readyState === 'live');
+          if (!hasLiveMic) {
+            ensureWebAudioVoxGraphRef.current(true);
+          }
         }
         broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
       }
     };
+
+    // Unthrottled Web Worker Heartbeat Listener: tetap berjalan meskipun tab/browser di-background-kan oleh OS HP!
+    const unsubscribeWorkerHeartbeat = subscribeToBackgroundWorkerTicks({
+      onHeartbeatTick: () => {
+        if (!document.hidden && !isMinimizedModeRef.current) return;
+        if (audioCtxRef.current) {
+          const st = audioCtxRef.current.state as string;
+          if (st === 'suspended' || st === 'interrupted') {
+            audioCtxRef.current.resume().catch(() => {});
+          }
+          if (keepAliveEnabledRef.current) {
+            controller.pulseOnVisibilityChange(audioCtxRef.current, true);
+          }
+        }
+        if (voxEnabledRef.current && !isRxQueuePlayingRef.current && !remoteActiveTxRef.current) {
+          const hasLiveMic = mediaStreamRef.current
+            ?.getAudioTracks()
+            .some((t) => t.readyState === 'live');
+          if (!hasLiveMic) {
+            ensureWebAudioVoxGraphRef.current(true);
+          } else if (mediaStreamRef.current) {
+            mediaStreamRef.current.getAudioTracks().forEach((t) => {
+              if (!t.enabled) t.enabled = true;
+            });
+          }
+        }
+        broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
+        if (peerRef.current && peerRef.current.disconnected && !peerRef.current.destroyed) {
+          try {
+            peerRef.current.reconnect();
+          } catch {
+            // Ignore
+          }
+        }
+      },
+    });
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
     window.addEventListener('pagehide', handleVisibilityChange);
     window.addEventListener('pageshow', handleVisibilityChange);
 
     return () => {
+      unsubscribeWorkerHeartbeat();
       if (backgroundSocketHeartbeat) {
         window.clearInterval(backgroundSocketHeartbeat);
       }
@@ -3561,7 +3687,7 @@ export default function App() {
       const timeDomainBuf = new Uint8Array(analyser.fftSize);
       const freqDomainBuf = new Uint8Array(analyser.frequencyBinCount);
 
-      voxTimer = window.setInterval(() => {
+      const runVoxMonitorTick = () => {
         if (isCancelled) return;
 
         if (audioCtxRef.current) {
@@ -3580,6 +3706,7 @@ export default function App() {
               activeLock.senderId !== myDeviceId &&
               now - activeLock.updatedAt < 12000
           ) ||
+          Boolean(isRxQueuePlayingRef.current) ||
           Boolean(
             activeAudioElementRef.current &&
               !activeAudioElementRef.current.paused &&
@@ -3593,12 +3720,30 @@ export default function App() {
           voiceOnsetStartTimeRef.current = 0;
           setIsVocalPatternConfirmed(false);
           setVoxInputLevel(0);
+          if (voxPreAmpGainRef.current && audioCtxRef.current) {
+            try {
+              voxPreAmpGainRef.current.gain.setValueAtTime(0, audioCtxRef.current.currentTime);
+            } catch {
+              voxPreAmpGainRef.current.gain.value = 0;
+            }
+          }
           if (mediaStreamRef.current) {
             mediaStreamRef.current.getAudioTracks().forEach((t) => {
               if (t.enabled) t.enabled = false;
             });
           }
           return;
+        }
+
+        // Restore microphone pre-amp gain & track once RX playback and acoustic tail guard have completed
+        if (voxPreAmpGainRef.current && audioCtxRef.current) {
+          if (voxPreAmpGainRef.current.gain.value < 1.0) {
+            try {
+              voxPreAmpGainRef.current.gain.setValueAtTime(1.65, audioCtxRef.current.currentTime);
+            } catch {
+              voxPreAmpGainRef.current.gain.value = 1.65;
+            }
+          }
         }
 
         if (
@@ -3671,7 +3816,7 @@ export default function App() {
           );
         }
 
-        // Update isolated LiveAudioMeterStore (throttled + deadband, 0 re-renders on App!)
+        // Update isolated LiveAudioMeterStore (direct DOM via useRef, 0 React setState calls!)
         liveAudioMeterStore.update({
           voxInputLevel: voiceEnergy,
           isVocalPatternConfirmed: isVocalPatternValid,
@@ -3732,9 +3877,21 @@ export default function App() {
             }
           }
         }
-      }, 65);
+      };
+
+      voxTimer = window.setInterval(runVoxMonitorTick, 65);
+      // When user switches to another mobile app (document.hidden), window.setInterval is throttled by the OS,
+      // so the unthrottled background Worker thread drives runVoxMonitorTick seamlessly!
+      unsubscribeBgVoxTick = subscribeToBackgroundWorkerTicks({
+        onVoxTick: () => {
+          if (document.hidden || isMinimizedModeRef.current) {
+            runVoxMonitorTick();
+          }
+        },
+      });
     };
 
+    let unsubscribeBgVoxTick: (() => void) | null = null;
     startContinuousVoxMonitor();
 
     // Unlock AudioContext on first user interaction only if not already running (prevents redundant setState on every click!)
@@ -3763,6 +3920,7 @@ export default function App() {
     return () => {
       isCancelled = true;
       if (voxTimer) window.clearInterval(voxTimer);
+      if (unsubscribeBgVoxTick) unsubscribeBgVoxTick();
       window.removeEventListener('pointerdown', unlockAudioOnInteraction);
     };
   }, [

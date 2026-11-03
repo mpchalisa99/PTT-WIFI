@@ -174,25 +174,57 @@ export async function unlockMobileAudioSession(
 }
 
 /**
- * Multi-tier getUserMedia microphone acquisition with automatic fallback for Safari (iOS), Chrome (Android), and HarmonyOS
+ * Explicitly enforces hardware/OS Acoustic Echo Cancellation (AEC), Noise Suppression (NS),
+ * and Auto Gain Control (AGC) on all audio tracks of a MediaStream.
+ */
+export async function enforceHardwareEchoCancellationOnStream(
+  stream: MediaStream | null
+): Promise<void> {
+  if (!stream) return;
+  const audioTracks = stream.getAudioTracks();
+  for (const track of audioTracks) {
+    try {
+      if ('contentHint' in track) {
+        (track as MediaStreamTrack & { contentHint?: string }).contentHint = 'speech';
+      }
+      if (typeof track.applyConstraints === 'function') {
+        await track.applyConstraints({
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        });
+      }
+    } catch {
+      // Ignore if specific mobile WebView does not support post-acquisition applyConstraints
+    }
+  }
+}
+
+/**
+ * Multi-tier getUserMedia microphone acquisition with explicit Echo Cancellation, Noise Suppression,
+ * and Auto Gain Control for Safari (iOS), Chrome (Android), and HarmonyOS
  */
 export async function requestMicrophoneWithFallbacks(): Promise<MicAcquisitionResult> {
-  // Tier 1: Ideal Tactical DSP + Ultra-Low Latency (<50ms, 10ms ideal) + 16kHz Wideband Vocal Mono for Opus 16-24 kbps
+  // Tier 1: Explicit WebRTC Hardware AEC/NS/AGC + Ultra-Low Latency + 16kHz Wideband Vocal Mono for Opus 16-24 kbps
   const tier1Constraints: MediaStreamConstraints = {
     audio: {
-      echoCancellation: { ideal: true },
-      noiseSuppression: { ideal: true },
-      autoGainControl: { ideal: true },
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
       channelCount: { ideal: 1 },
       sampleRate: { ideal: 16000 },
       sampleSize: { ideal: 16 },
-      // @ts-expect-error latency constraint is supported in WebRTC/Chromium for <50ms capture buffer
+      // @ts-expect-error WebRTC/Chromium explicit hardware echo cancellation & latency parameters
+      googEchoCancellation: true,
+      googAutoGainControl: true,
+      googNoiseSuppression: true,
+      googHighpassFilter: true,
       latency: { ideal: 0.01, max: 0.04 },
     },
     video: false,
   };
 
-  // Tier 2: Standard boolean constraints (compatible with older Safari iOS & Android WebViews)
+  // Tier 2: Explicit boolean constraints { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
   const tier2Constraints: MediaStreamConstraints = {
     audio: {
       echoCancellation: true,
@@ -202,7 +234,8 @@ export async function requestMicrophoneWithFallbacks(): Promise<MicAcquisitionRe
     video: false,
   };
 
-  // Tier 3: Raw audio fallback (when Bluetooth TWS SCO or HarmonyOS rejects specific constraint keys)
+  // Tier 3: Raw audio fallback (when Bluetooth TWS SCO or HarmonyOS rejects specific constraint keys),
+  // followed immediately by track.applyConstraints({ echoCancellation: true, noiseSuppression: true, autoGainControl: true })
   const tier3Constraints: MediaStreamConstraints = {
     audio: true,
     video: false,
@@ -211,6 +244,7 @@ export async function requestMicrophoneWithFallbacks(): Promise<MicAcquisitionRe
   if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
     try {
       const stream = await navigator.mediaDevices.getUserMedia(tier1Constraints);
+      await enforceHardwareEchoCancellationOnStream(stream);
       return {
         stream,
         constraintTier: 'OPT_DSP',
@@ -232,6 +266,7 @@ export async function requestMicrophoneWithFallbacks(): Promise<MicAcquisitionRe
 
       try {
         const stream = await navigator.mediaDevices.getUserMedia(tier2Constraints);
+        await enforceHardwareEchoCancellationOnStream(stream);
         return {
           stream,
           constraintTier: 'STD_DSP',
@@ -241,6 +276,7 @@ export async function requestMicrophoneWithFallbacks(): Promise<MicAcquisitionRe
       } catch {
         try {
           const stream = await navigator.mediaDevices.getUserMedia(tier3Constraints);
+          await enforceHardwareEchoCancellationOnStream(stream);
           return {
             stream,
             constraintTier: 'RAW_FALLBACK',
@@ -976,10 +1012,36 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
 
 // Dedicated background Web Worker keep-alive instance (avoids Service Worker scope '/' controllerchange reload loops)
 let tacticalBgWorker: Worker | null = null;
+const bgVoxTickListeners = new Set<() => void>();
+const bgHeartbeatListeners = new Set<() => void>();
+
+/**
+ * Subscribes to unthrottled background Web Worker ticks so VOX standby and WebSocket connections
+ * stay active even when the mobile browser tab is hidden / user switches to another phone app.
+ */
+export function subscribeToBackgroundWorkerTicks(handlers: {
+  onVoxTick?: () => void;
+  onHeartbeatTick?: () => void;
+}): () => void {
+  if (handlers.onVoxTick) {
+    bgVoxTickListeners.add(handlers.onVoxTick);
+  }
+  if (handlers.onHeartbeatTick) {
+    bgHeartbeatListeners.add(handlers.onHeartbeatTick);
+  }
+  return () => {
+    if (handlers.onVoxTick) {
+      bgVoxTickListeners.delete(handlers.onVoxTick);
+    }
+    if (handlers.onHeartbeatTick) {
+      bgHeartbeatListeners.delete(handlers.onHeartbeatTick);
+    }
+  };
+}
 
 /**
  * Initializes a lightweight Background Keep-Alive Worker thread (and cleans up any legacy competing Service Worker)
- * so VOX standby and audio connections stay alive without triggering Service Worker controllerchange page reloads.
+ * so VOX standby, MediaStream loop-back, and WebSocket connections stay alive in the background.
  */
 export async function registerTacticalBackgroundServiceWorker(
   onKeepAliveAck?: (ackTimestamp: number) => void
@@ -1007,6 +1069,12 @@ export async function registerTacticalBackgroundServiceWorker(
   try {
     if (!tacticalBgWorker && typeof Worker !== 'undefined') {
       const workerCode = `
+        var voxInterval = setInterval(function() {
+          self.postMessage({ type: 'BG_VOX_TICK', timestamp: Date.now() });
+        }, 105);
+        var hbInterval = setInterval(function() {
+          self.postMessage({ type: 'BG_WS_HEARTBEAT', timestamp: Date.now() });
+        }, 3500);
         self.onmessage = function(e) {
           var data = e.data;
           if (data && data.type === 'KEEP_ALIVE_PING') {
@@ -1021,8 +1089,13 @@ export async function registerTacticalBackgroundServiceWorker(
       const url = URL.createObjectURL(blob);
       tacticalBgWorker = new Worker(url);
       tacticalBgWorker.onmessage = (event) => {
-        if (event.data && event.data.type === 'KEEP_ALIVE_ACK') {
+        const msgType = event.data?.type;
+        if (msgType === 'KEEP_ALIVE_ACK') {
           onKeepAliveAck?.(event.data.timestamp || Date.now());
+        } else if (msgType === 'BG_VOX_TICK') {
+          bgVoxTickListeners.forEach((cb) => cb());
+        } else if (msgType === 'BG_WS_HEARTBEAT') {
+          bgHeartbeatListeners.forEach((cb) => cb());
         }
       };
     }
