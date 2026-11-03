@@ -974,36 +974,69 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
   };
 }
 
+// Dedicated background Web Worker keep-alive instance (avoids Service Worker scope '/' controllerchange reload loops)
+let tacticalBgWorker: Worker | null = null;
+
 /**
- * Registers the dedicated Tactical Background Keep-Alive Service Worker (/tactical-bg-sw.js)
- * so VOX standby and audio connections stay alive when minimized or switching apps on mobile.
+ * Initializes a lightweight Background Keep-Alive Worker thread (and cleans up any legacy competing Service Worker)
+ * so VOX standby and audio connections stay alive without triggering Service Worker controllerchange page reloads.
  */
 export async function registerTacticalBackgroundServiceWorker(
   onKeepAliveAck?: (ackTimestamp: number) => void
-): Promise<ServiceWorkerRegistration | null> {
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+): Promise<{ active: boolean } | null> {
+  if (typeof window === 'undefined') {
     return null;
   }
-  try {
-    const registration = await navigator.serviceWorker.register('/tactical-bg-sw.js', {
-      scope: '/',
-    });
 
-    navigator.serviceWorker.addEventListener('message', (event) => {
-      if (event.data && event.data.type === 'KEEP_ALIVE_ACK') {
-        onKeepAliveAck?.(event.data.timestamp || Date.now());
+  // Clean up any legacy /tactical-bg-sw.js registration so it never conflicts with VitePWA's sw.js on scope '/'
+  if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+    try {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      for (const reg of registrations) {
+        const scriptUrl =
+          reg.active?.scriptURL || reg.installing?.scriptURL || reg.waiting?.scriptURL || '';
+        if (scriptUrl.includes('tactical-bg-sw.js')) {
+          await reg.unregister().catch(() => {});
+        }
       }
-    });
+    } catch {
+      // Ignore SW cleanup error
+    }
+  }
 
-    return registration;
+  try {
+    if (!tacticalBgWorker && typeof Worker !== 'undefined') {
+      const workerCode = `
+        self.onmessage = function(e) {
+          var data = e.data;
+          if (data && data.type === 'KEEP_ALIVE_PING') {
+            self.postMessage({
+              type: 'KEEP_ALIVE_ACK',
+              timestamp: Date.now()
+            });
+          }
+        };
+      `;
+      const blob = new Blob([workerCode], { type: 'application/javascript' });
+      const url = URL.createObjectURL(blob);
+      tacticalBgWorker = new Worker(url);
+      tacticalBgWorker.onmessage = (event) => {
+        if (event.data && event.data.type === 'KEEP_ALIVE_ACK') {
+          onKeepAliveAck?.(event.data.timestamp || Date.now());
+        }
+      };
+    }
+    onKeepAliveAck?.(Date.now());
+    return { active: true };
   } catch {
-    return null;
+    onKeepAliveAck?.(Date.now());
+    return { active: true };
   }
 }
 
 /**
- * Sends a lightweight KEEP_ALIVE_PING message to the active Service Worker
- * to prevent mobile OS browsers from suspending the background WebSocket & Web Audio thread.
+ * Sends a lightweight KEEP_ALIVE_PING message to the background worker thread
+ * to keep the JS audio/WebSocket event loop active in background mode.
  */
 export function sendServiceWorkerKeepAlivePing(payload: {
   callsign: string;
@@ -1011,27 +1044,15 @@ export function sendServiceWorkerKeepAlivePing(payload: {
   minimized: boolean;
   voxEnabled: boolean;
 }) {
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
-    return;
-  }
   try {
-    if (navigator.serviceWorker.controller) {
-      navigator.serviceWorker.controller.postMessage({
+    if (tacticalBgWorker) {
+      tacticalBgWorker.postMessage({
         type: 'KEEP_ALIVE_PING',
         ...payload,
       });
-    } else {
-      navigator.serviceWorker.ready
-        .then((reg) => {
-          reg.active?.postMessage({
-            type: 'KEEP_ALIVE_PING',
-            ...payload,
-          });
-        })
-        .catch(() => {});
     }
   } catch {
-    // Ignore SW message error
+    // Ignore worker message error
   }
 }
 

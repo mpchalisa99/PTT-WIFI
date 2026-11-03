@@ -212,8 +212,9 @@ function extractInviteParamsFromUrl() {
 }
 
 // ============================================================================
-// ISOLATED LIVE AUDIO METER PUB-SUB STORE & REACT.MEMO DYNAMIC AUDIO COMPONENTS
-// Prevents high-frequency VOX/Microphone level updates from re-rendering the root App page!
+// ISOLATED LIVE AUDIO METER REF STORE & DIRECT-DOM AUDIO INDICATOR COMPONENTS
+// Holds rapidly changing microphone/VOX level values in refs and updates DOM elements
+// directly via ref.current.style / ref.current.textContent — 0 React setState calls!
 // ============================================================================
 interface LiveAudioMeterSnapshot {
   voxInputLevel: number;
@@ -223,18 +224,18 @@ interface LiveAudioMeterSnapshot {
 }
 
 class LiveAudioMeterStore {
-  private state: LiveAudioMeterSnapshot = {
+  public current: LiveAudioMeterSnapshot = {
     voxInputLevel: 0,
     micLevel: 0,
     isVocalPatternConfirmed: false,
     ambientNoiseFloor: 4,
   };
-  private listeners = new Set<() => void>();
+  private listeners = new Set<(snap: LiveAudioMeterSnapshot) => void>();
   private lastEmitTs = 0;
 
-  getSnapshot = (): LiveAudioMeterSnapshot => this.state;
+  getSnapshot = (): LiveAudioMeterSnapshot => this.current;
 
-  subscribe = (listener: () => void): (() => void) => {
+  subscribe = (listener: (snap: LiveAudioMeterSnapshot) => void): (() => void) => {
     this.listeners.add(listener);
     return () => {
       this.listeners.delete(listener);
@@ -243,24 +244,24 @@ class LiveAudioMeterStore {
 
   update(partial: Partial<LiveAudioMeterSnapshot>, forceImmediate = false) {
     const nextVox =
-      partial.voxInputLevel !== undefined ? partial.voxInputLevel : this.state.voxInputLevel;
+      partial.voxInputLevel !== undefined ? partial.voxInputLevel : this.current.voxInputLevel;
     const nextMic =
-      partial.micLevel !== undefined ? partial.micLevel : this.state.micLevel;
+      partial.micLevel !== undefined ? partial.micLevel : this.current.micLevel;
     const nextConfirmed =
       partial.isVocalPatternConfirmed !== undefined
         ? partial.isVocalPatternConfirmed
-        : this.state.isVocalPatternConfirmed;
+        : this.current.isVocalPatternConfirmed;
     const nextFloor =
       partial.ambientNoiseFloor !== undefined
         ? partial.ambientNoiseFloor
-        : this.state.ambientNoiseFloor;
+        : this.current.ambientNoiseFloor;
 
-    const voxDiff = Math.abs(nextVox - this.state.voxInputLevel);
-    const micDiff = Math.abs(nextMic - this.state.micLevel);
-    const confirmedChanged = nextConfirmed !== this.state.isVocalPatternConfirmed;
+    const voxDiff = Math.abs(nextVox - this.current.voxInputLevel);
+    const micDiff = Math.abs(nextMic - this.current.micLevel);
+    const confirmedChanged = nextConfirmed !== this.current.isVocalPatternConfirmed;
     const zeroTransition =
-      (nextVox === 0 && this.state.voxInputLevel !== 0) ||
-      (nextMic === 0 && this.state.micLevel !== 0);
+      (nextVox === 0 && this.current.voxInputLevel !== 0) ||
+      (nextMic === 0 && this.current.micLevel !== 0);
 
     // Deadband filter: ignore tiny sub-2% fluctuations unless state transitioned to 0 or confirmed changed
     if (!forceImmediate && !confirmedChanged && !zeroTransition && voxDiff < 2 && micDiff < 3) {
@@ -268,38 +269,26 @@ class LiveAudioMeterStore {
     }
 
     const now = Date.now();
-    // Throttle UI indicator updates to ~95ms max cadence unless forced or confirmed changed
+    // Throttle direct DOM indicator updates to ~95ms max cadence unless forced or confirmed changed
     if (!forceImmediate && !confirmedChanged && !zeroTransition && now - this.lastEmitTs < 95) {
       return;
     }
 
     this.lastEmitTs = now;
-    this.state = {
+    this.current = {
       voxInputLevel: nextVox,
       micLevel: nextMic,
       isVocalPatternConfirmed: nextConfirmed,
       ambientNoiseFloor: nextFloor,
     };
-    this.listeners.forEach((l) => l());
+    this.listeners.forEach((l) => l(this.current));
   }
 }
 
 const liveAudioMeterStore = new LiveAudioMeterStore();
 
-function useLiveAudioMeter(): LiveAudioMeterSnapshot {
-  const [snap, setSnap] = useState<LiveAudioMeterSnapshot>(() =>
-    liveAudioMeterStore.getSnapshot()
-  );
-  useEffect(() => {
-    return liveAudioMeterStore.subscribe(() => {
-      setSnap(liveAudioMeterStore.getSnapshot());
-    });
-  }, []);
-  return snap;
-}
-
-// Komponen Indikator Slider & Bar Level Vokal VOX yang Terisolasi (React.memo)
-// Hanya merender ulang bar indikator kecil ini saat level suara berubah, bukan seluruh halaman utama!
+// Komponen Indikator Slider & Bar Level Vokal VOX (React.memo + Manipulasi DOM Langsung via useRef)
+// Memperbarui lebar bar & teks persentase MIC langsung pada DOM tanpa memanggil setState sama sekali!
 const VoxThresholdSliderRow = React.memo(function VoxThresholdSliderRow({
   voxThreshold,
   onChangeThreshold,
@@ -313,7 +302,49 @@ const VoxThresholdSliderRow = React.memo(function VoxThresholdSliderRow({
   activeLockSpeaker: string | null;
   voxEnabled: boolean;
 }) {
-  const { voxInputLevel, isVocalPatternConfirmed } = useLiveAudioMeter();
+  const barFillRef = useRef<HTMLDivElement | null>(null);
+  const statusTextRef = useRef<HTMLSpanElement | null>(null);
+
+  const propsRef = useRef({
+    voxThreshold,
+    isPttLocked,
+    activeLockSpeaker,
+    voxEnabled,
+  });
+  propsRef.current = {
+    voxThreshold,
+    isPttLocked,
+    activeLockSpeaker,
+    voxEnabled,
+  };
+
+  useEffect(() => {
+    const applyDirectDomUpdate = (snap: LiveAudioMeterSnapshot) => {
+      const { voxThreshold: thr, isPttLocked: locked, activeLockSpeaker: speaker, voxEnabled: voxOn } =
+        propsRef.current;
+
+      if (barFillRef.current) {
+        barFillRef.current.style.width = `${Math.min(100, snap.voxInputLevel)}%`;
+        barFillRef.current.className =
+          snap.voxInputLevel >= thr && snap.isVocalPatternConfirmed
+            ? 'h-full transition-all duration-100 bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
+            : 'h-full transition-all duration-100 bg-cyan-500/55';
+      }
+
+      if (statusTextRef.current) {
+        statusTextRef.current.textContent = locked
+          ? `LOCKED (${speaker})`
+          : voxOn
+          ? `MIC:${snap.voxInputLevel}%•THR:${thr}%`
+          : 'MANUAL PTT';
+      }
+    };
+
+    applyDirectDomUpdate(liveAudioMeterStore.getSnapshot());
+    return liveAudioMeterStore.subscribe(applyDirectDomUpdate);
+  }, [voxThreshold, isPttLocked, activeLockSpeaker, voxEnabled]);
+
+  const initialSnap = liveAudioMeterStore.getSnapshot();
 
   return (
     <div className="flex items-center gap-2">
@@ -325,15 +356,12 @@ const VoxThresholdSliderRow = React.memo(function VoxThresholdSliderRow({
       </span>
 
       <div className="relative flex-1 h-4 flex items-center">
-        {/* Track Background + Live Vocal Level Bar */}
+        {/* Track Background + Live Vocal Level Bar (Direct DOM via barFillRef) */}
         <div className="w-full h-2 rounded-full bg-[#021220] border border-cyan-400/40 overflow-hidden relative">
           <div
-            style={{ width: `${Math.min(100, voxInputLevel)}%` }}
-            className={`h-full transition-all duration-100 ${
-              voxInputLevel >= voxThreshold && isVocalPatternConfirmed
-                ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
-                : 'bg-cyan-500/55'
-            }`}
+            ref={barFillRef}
+            style={{ width: `${Math.min(100, initialSnap.voxInputLevel)}%` }}
+            className="h-full transition-all duration-100 bg-cyan-500/55"
           />
         </div>
 
@@ -358,18 +386,21 @@ const VoxThresholdSliderRow = React.memo(function VoxThresholdSliderRow({
         />
       </div>
 
-      <span className="font-telemetry text-[8.5px] text-cyan-100/95 shrink-0 min-w-[88px] text-right">
+      <span
+        ref={statusTextRef}
+        className="font-telemetry text-[8.5px] text-cyan-100/95 shrink-0 min-w-[88px] text-right"
+      >
         {isPttLocked
           ? `LOCKED (${activeLockSpeaker})`
           : voxEnabled
-          ? `MIC:${voxInputLevel}%•THR:${voxThreshold}%`
+          ? `MIC:${initialSnap.voxInputLevel}%•THR:${voxThreshold}%`
           : 'MANUAL PTT'}
       </span>
     </div>
   );
 });
 
-// Komponen Indikator Gelombang Suara Kiri/Kanan Tombol PTT yang Terisolasi (React.memo)
+// Komponen Indikator Gelombang Suara Kiri/Kanan Tombol PTT (React.memo + Manipulasi DOM Langsung via useRef)
 const LEFT_WAVE_HEIGHTS = [6, 8, 10, 12, 15, 18, 21, 24];
 const RIGHT_WAVE_HEIGHTS = [24, 21, 18, 15, 12, 10, 8, 6];
 
@@ -384,21 +415,50 @@ const PttSoundWaveSideBars = React.memo(function PttSoundWaveSideBars({
   voxEnabled: boolean;
   hasActiveLockSpeaker: boolean;
 }) {
-  const { voxInputLevel, micLevel } = useLiveAudioMeter();
   const heights = side === 'left' ? LEFT_WAVE_HEIGHTS : RIGHT_WAVE_HEIGHTS;
-  const activeLevel = Math.max(micLevel, voxInputLevel);
+  const barSpanRefs = useRef<(HTMLSpanElement | null)[]>([]);
+  const propsRef = useRef({
+    isTransmitting,
+    voxEnabled,
+    heights,
+  });
+  propsRef.current = {
+    isTransmitting,
+    voxEnabled,
+    heights,
+  };
+
+  useEffect(() => {
+    const applyDirectWaveDom = (snap: LiveAudioMeterSnapshot) => {
+      const { isTransmitting: tx, voxEnabled: voxOn, heights: hList } = propsRef.current;
+      const activeLevel = Math.max(snap.micLevel, snap.voxInputLevel);
+
+      for (let i = 0; i < hList.length; i++) {
+        const el = barSpanRefs.current[i];
+        if (!el) continue;
+        const h = hList[i];
+        el.style.height = tx
+          ? `${Math.max(6, ((h * Math.max(25, activeLevel)) / 55) % 34)}px`
+          : voxOn && snap.voxInputLevel > 5
+          ? `${Math.max(5, ((h * snap.voxInputLevel) / 85) % 22)}px`
+          : `${h * 0.65}px`;
+      }
+    };
+
+    applyDirectWaveDom(liveAudioMeterStore.getSnapshot());
+    return liveAudioMeterStore.subscribe(applyDirectWaveDom);
+  }, [isTransmitting, voxEnabled, side]);
 
   return (
     <div className="flex items-center gap-1">
       {heights.map((h, i) => (
         <span
           key={`${side}-${i}`}
+          ref={(el) => {
+            barSpanRefs.current[i] = el;
+          }}
           style={{
-            height: isTransmitting
-              ? `${Math.max(6, ((h * Math.max(25, activeLevel)) / 55) % 34)}px`
-              : voxEnabled && voxInputLevel > 5
-              ? `${Math.max(5, ((h * voxInputLevel) / 85) % 22)}px`
-              : `${h * 0.65}px`,
+            height: `${h * 0.65}px`,
           }}
           className={`w-1.5 rounded-full transition-all duration-100 ${
             isTransmitting || hasActiveLockSpeaker
@@ -411,10 +471,21 @@ const PttSoundWaveSideBars = React.memo(function PttSoundWaveSideBars({
   );
 });
 
-// Komponen Indikator Level Mic pada Floating Mini Widget yang Terisolasi (React.memo)
+// Komponen Indikator Level Mic pada Floating Mini Widget (React.memo + Manipulasi DOM Langsung via useRef)
 const MiniWidgetMicLevelText = React.memo(function MiniWidgetMicLevelText() {
-  const { voxInputLevel } = useLiveAudioMeter();
-  return <span>MIC: {voxInputLevel}%</span>;
+  const spanRef = useRef<HTMLSpanElement | null>(null);
+
+  useEffect(() => {
+    const applyDirectText = (snap: LiveAudioMeterSnapshot) => {
+      if (spanRef.current) {
+        spanRef.current.textContent = `MIC: ${snap.voxInputLevel}%`;
+      }
+    };
+    applyDirectText(liveAudioMeterStore.getSnapshot());
+    return liveAudioMeterStore.subscribe(applyDirectText);
+  }, []);
+
+  return <span ref={spanRef}>MIC: {liveAudioMeterStore.getSnapshot().voxInputLevel}%</span>;
 });
 
 export default function App() {

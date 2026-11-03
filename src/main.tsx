@@ -1,16 +1,23 @@
 import {createRoot} from 'react-dom/client';
-import {registerSW} from 'virtual:pwa-register';
 import App from './App.tsx';
 import './index.css';
 
-// Register Service Worker immediately in production so the app works 100% offline on Wi-Fi / Hotspot without internet
-if ('serviceWorker' in navigator && import.meta.env.PROD) {
-  try {
-    registerSW({immediate: true});
-  } catch {
-    // Ignore SW registration errors in restricted preview environments
-  }
+// Clean up any legacy conflicting Service Worker registrations that could trigger controllerchange reloads
+if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+  navigator.serviceWorker
+    .getRegistrations()
+    .then((registrations) => {
+      for (const reg of registrations) {
+        const scriptUrl =
+          reg.active?.scriptURL || reg.installing?.scriptURL || reg.waiting?.scriptURL || '';
+        if (scriptUrl.includes('tactical-bg-sw.js')) {
+          reg.unregister().catch(() => {});
+        }
+      }
+    })
+    .catch(() => {});
 }
 
 createRoot(document.getElementById('root')!).render(<App />);
+
 

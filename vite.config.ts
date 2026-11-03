@@ -10,7 +10,7 @@ export default defineConfig(() => {
       react(),
       tailwindcss(),
       VitePWA({
-        registerType: 'autoUpdate',
+        registerType: 'prompt',
         includeAssets: ['icon.svg'],
         manifest: {
           id: '/',
@@ -39,7 +39,7 @@ export default defineConfig(() => {
           globIgnores: ['**/assets/aistudio/**'],
         },
         devOptions: {
-          enabled: process.env.DISABLE_HMR !== 'true',
+          enabled: false,
           type: 'module',
         },
       }),
