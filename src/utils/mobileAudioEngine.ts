@@ -367,13 +367,15 @@ export function getSupportedAudioMimeType(): string {
 }
 
 /**
- * Encodes Float32 PCM chunks into a universally compatible 16-bit Mono WAV ArrayBuffer
+ * Encodes Float32 PCM chunks into a universally compatible 16-bit Mono WAV Blob
+ * Used when MediaRecorder is unavailable or fails on older iOS Safari / HarmonyOS WebViews
  */
-export function encodePcmChunksToWavArrayBuffer(
+export function encodePcmChunksToWavBlob(
   chunks: Float32Array[],
-  inputSampleRate: number,
-  targetRate = 16000
-): ArrayBuffer {
+  inputSampleRate: number
+): Blob {
+  // Downsample to 16000 Hz mono so WAV payload stays compact over WebSocket / WebRTC
+  const targetRate = 16000;
   const ratio = Math.max(1, inputSampleRate / targetRate);
   const totalInputSamples = chunks.reduce((acc, c) => acc + c.length, 0);
   const outputLength = Math.max(1, Math.floor(totalInputSamples / ratio));
@@ -414,36 +416,7 @@ export function encodePcmChunksToWavArrayBuffer(
     view.setInt16(44 + i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
   }
 
-  return buffer;
-}
-
-/**
- * Encodes Float32 PCM chunks into a universally compatible 16-bit Mono WAV Blob
- */
-export function encodePcmChunksToWavBlob(
-  chunks: Float32Array[],
-  inputSampleRate: number
-): Blob {
-  const buffer = encodePcmChunksToWavArrayBuffer(chunks, inputSampleRate, 16000);
   return new Blob([buffer], { type: 'audio/wav' });
-}
-
-/**
- * Synchronously encodes a 20ms-50ms PCM micro-chunk directly into a Base64 WAV DataURL
- * in < 0.1ms without Blob or FileReader event-loop delay.
- */
-export function encodePcmChunkToWavDataUrlFast(
-  chunks: Float32Array[],
-  inputSampleRate: number
-): string {
-  const buffer = encodePcmChunksToWavArrayBuffer(chunks, inputSampleRate, 16000);
-  const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  let binary = '';
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return `data:audio/wav;base64,${btoa(binary)}`;
 }
 
 // WeakMap to track HTMLAudioElements already routed into Web Audio API GainNode
@@ -497,148 +470,9 @@ export function ensureHtmlAudioElementGainBooster(
 }
 
 /**
- * Zero-copy synchronous 16-bit PCM WAV parser (< 0.05ms).
- * Bypasses browser asynchronous decodeAudioData queue for instant 20ms-50ms chunk playback.
- */
-function tryDecodeWavBytesToAudioBufferSync(
-  ctx: AudioContext,
-  bytes: Uint8Array
-): AudioBuffer | null {
-  try {
-    if (bytes.byteLength < 44) return null;
-    // Check 'RIFF' and 'WAVE' magic headers
-    if (
-      bytes[0] !== 0x52 ||
-      bytes[1] !== 0x49 ||
-      bytes[2] !== 0x46 ||
-      bytes[3] !== 0x46 ||
-      bytes[8] !== 0x57 ||
-      bytes[9] !== 0x41 ||
-      bytes[10] !== 0x56 ||
-      bytes[11] !== 0x45
-    ) {
-      return null;
-    }
-
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const audioFormat = view.getUint16(20, true);
-    const numChannels = view.getUint16(22, true);
-    const sampleRate = view.getUint32(24, true);
-    const bitsPerSample = view.getUint16(34, true);
-
-    if (audioFormat !== 1 || bitsPerSample !== 16 || numChannels < 1 || sampleRate < 4000) {
-      return null;
-    }
-
-    // Locate 'data' subchunk
-    let dataOffset = 36;
-    let dataByteLength = bytes.byteLength - 44;
-    while (dataOffset + 8 <= bytes.byteLength) {
-      const id0 = bytes[dataOffset];
-      const id1 = bytes[dataOffset + 1];
-      const id2 = bytes[dataOffset + 2];
-      const id3 = bytes[dataOffset + 3];
-      const chunkSize = view.getUint32(dataOffset + 4, true);
-      if (id0 === 0x64 && id1 === 0x61 && id2 === 0x74 && id3 === 0x61) {
-        dataOffset += 8;
-        dataByteLength = Math.min(chunkSize, bytes.byteLength - dataOffset);
-        break;
-      }
-      dataOffset += 8 + chunkSize;
-    }
-
-    const bytesPerFrame = numChannels * 2;
-    const frameCount = Math.floor(dataByteLength / bytesPerFrame);
-    if (frameCount <= 0) return null;
-
-    const audioBuffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-    for (let ch = 0; ch < numChannels; ch++) {
-      const channelData = audioBuffer.getChannelData(ch);
-      let bytePos = dataOffset + ch * 2;
-      for (let i = 0; i < frameCount; i++) {
-        const int16 = view.getInt16(bytePos, true);
-        channelData[i] = int16 < 0 ? int16 / 32768 : int16 / 32767;
-        bytePos += bytesPerFrame;
-      }
-    }
-    return audioBuffer;
-  } catch {
-    return null;
-  }
-}
-
-// Persistent Receiver Audio Pipeline & Zero-Latency Playhead State per AudioContext
-interface SharedRxAudioPipeline {
-  vocalClarityFilter: BiquadFilterNode;
-  gainNode: GainNode;
-  limiter: DynamicsCompressorNode;
-}
-
-const sharedRxPipelineMap = new WeakMap<AudioContext, SharedRxAudioPipeline>();
-const activeRxSourcesSet = new Set<AudioBufferSourceNode>();
-let nextRxScheduledTime = 0;
-
-function getOrCreateSharedRxPipeline(
-  ctx: AudioContext,
-  rxGainValue: number
-): SharedRxAudioPipeline {
-  const existing = sharedRxPipelineMap.get(ctx);
-  if (existing) {
-    existing.gainNode.gain.value = Math.max(0.5, Math.min(5.0, rxGainValue));
-    return existing;
-  }
-
-  // Stage 1: Vocal Presence Clarity Filter (2.1 kHz +3.5 dB boost for crisp walkie-talkie speech)
-  const vocalClarityFilter = ctx.createBiquadFilter();
-  vocalClarityFilter.type = 'peaking';
-  vocalClarityFilter.frequency.value = 2100;
-  vocalClarityFilter.Q.value = 1.0;
-  vocalClarityFilter.gain.value = 3.5;
-
-  // Stage 2: Web Audio API GainNode (gain.value = 2.2+ default receiver boost)
-  const gainNode = ctx.createGain();
-  gainNode.gain.value = Math.max(0.5, Math.min(5.0, rxGainValue));
-
-  // Stage 3: Anti-Clipping DynamicsCompressor Limiter
-  const limiter = ctx.createDynamicsCompressor();
-  limiter.threshold.value = -2.0;
-  limiter.knee.value = 6.0;
-  limiter.ratio.value = 12.0;
-  limiter.attack.value = 0.002;
-  limiter.release.value = 0.12;
-
-  vocalClarityFilter.connect(gainNode);
-  gainNode.connect(limiter);
-  limiter.connect(ctx.destination);
-
-  const pipeline = { vocalClarityFilter, gainNode, limiter };
-  sharedRxPipelineMap.set(ctx, pipeline);
-  return pipeline;
-}
-
-/**
- * Immediately stops all active/scheduled Web Audio RX chunks and resets the zero-latency playhead.
- * Invoked when local PTT opens (strict Half-Duplex) or on EMERGENCY CLEAR.
- */
-export function stopAllQueuedWebAudioRx(): void {
-  nextRxScheduledTime = 0;
-  activeRxSourcesSet.forEach((src) => {
-    try {
-      src.onended = null;
-      src.stop(0);
-      src.disconnect();
-    } catch {
-      // Ignore already stopped source
-    }
-  });
-  activeRxSourcesSet.clear();
-}
-
-/**
- * Zero-Latency Real-Time Audio Decoder & Scheduler with Web Audio API GainNode (gain.value = 2.2+).
- * - Synchronously decodes 16-bit PCM WAV streaming chunks in < 0.05ms (or falls back to decodeAudioData).
- * - Schedules playback immediately without long buffer queues: if the playhead ever drifts > 90ms ahead
- *   of currentTime due to network burst, it snaps back to real-time so all receivers stay synchronized.
+ * Decodes decrypted AES-GCM Base64 Data URL and plays it through Web Audio API AudioBufferSourceNode
+ * with a high-output GainNode (default gain.value = 2.2), automatic quiet-voice normalization,
+ * vocal clarity presence EQ, and anti-clipping DynamicsCompressor limiter.
  */
 export async function playBase64AudioViaWebAudioFallback(
   ctx: AudioContext,
@@ -649,7 +483,7 @@ export async function playBase64AudioViaWebAudioFallback(
   try {
     const st = ctx.state as string;
     if (st === 'suspended' || st === 'interrupted') {
-      ctx.resume().catch(() => {});
+      await ctx.resume().catch(() => {});
     }
 
     const commaIdx = base64DataUrl.indexOf(',');
@@ -661,93 +495,104 @@ export async function playBase64AudioViaWebAudioFallback(
       bytes[i] = binaryString.charCodeAt(i);
     }
 
-    // Fast path: Synchronous zero-copy WAV parser (< 0.05ms) for 20ms-50ms streaming chunks
-    let audioBuffer = tryDecodeWavBytesToAudioBufferSync(ctx, bytes);
-
-    // Fallback path: Browser decodeAudioData for compressed WebM / MP4 / AAC blobs
-    if (!audioBuffer) {
-      audioBuffer = await new Promise<AudioBuffer>((resolve, reject) => {
-        try {
-          const res = ctx.decodeAudioData(
-            bytes.buffer.slice(0),
-            (decoded) => resolve(decoded),
-            (err) => reject(err)
-          );
-          if (res && typeof res.then === 'function') {
-            res.catch(reject);
-          }
-        } catch (err) {
-          reject(err);
+    // Use callback-style decodeAudioData wrapper for Safari iOS & Chrome Android/HarmonyOS compatibility
+    const audioBuffer = await new Promise<AudioBuffer>((resolve, reject) => {
+      try {
+        const res = ctx.decodeAudioData(
+          bytes.buffer.slice(0),
+          (decoded) => resolve(decoded),
+          (err) => reject(err)
+        );
+        if (res && typeof res.then === 'function') {
+          res.catch(reject);
         }
-      });
-    }
+      } catch (err) {
+        reject(err);
+      }
+    });
 
-    // Auto-normalize quiet decoded audio buffers in-place so soft speech is brought up cleanly before GainNode
+    // Auto-normalize quiet decoded audio buffers so soft microphone recordings are brought up to optimal level before GainNode
+    let autoMakeupGain = 1.0;
     try {
       let maxPeak = 0;
       for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
         const channelData = audioBuffer.getChannelData(ch);
-        const step = channelData.length > 1600 ? 4 : 1;
-        for (let i = 0; i < channelData.length; i += step) {
+        for (let i = 0; i < channelData.length; i += 4) {
           const abs = Math.abs(channelData[i]);
           if (abs > maxPeak) maxPeak = abs;
         }
       }
-      if (maxPeak > 0.008 && maxPeak < 0.45) {
-        const makeup = Math.min(2.0, 0.65 / maxPeak);
-        for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-          const channelData = audioBuffer.getChannelData(ch);
-          for (let i = 0; i < channelData.length; i++) {
-            channelData[i] *= makeup;
-          }
-        }
+      if (maxPeak > 0.01 && maxPeak < 0.45) {
+        autoMakeupGain = Math.min(2.0, 0.65 / maxPeak);
       }
     } catch {
-      // Ignore normalization error
+      autoMakeupGain = 1.0;
     }
 
-    const pipeline = getOrCreateSharedRxPipeline(ctx, rxGainValue);
     const source = ctx.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(pipeline.vocalClarityFilter);
 
-    // ZERO-LATENCY PLAYHEAD SCHEDULER:
-    // - Play immediately if playhead is behind currentTime.
-    // - Cap maximum queue lookahead to 90ms (0.09s) so packets never pile up into a delayed queue
-    //   and all receivers play in lockstep synchronization.
-    const now = ctx.currentTime;
-    if (nextRxScheduledTime < now + 0.002 || nextRxScheduledTime - now > 0.09) {
-      nextRxScheduledTime = now + 0.004;
-    }
-    const startTime = nextRxScheduledTime;
-    nextRxScheduledTime = startTime + audioBuffer.duration;
+    // Stage 1: Vocal Presence Clarity Filter (2.1 kHz +3.5 dB boost for crisp walkie-talkie speech)
+    const vocalClarityFilter = ctx.createBiquadFilter();
+    vocalClarityFilter.type = 'peaking';
+    vocalClarityFilter.frequency.value = 2100;
+    vocalClarityFilter.Q.value = 1.0;
+    vocalClarityFilter.gain.value = 3.5;
 
-    activeRxSourcesSet.add(source);
+    // Stage 2: Web Audio API GainNode (gain.value = 2.0+ amplified receiver boost)
+    const gainNode = ctx.createGain();
+    const effectiveGain = Math.max(0.5, Math.min(5.0, rxGainValue * autoMakeupGain));
+    gainNode.gain.value = effectiveGain;
+
+    // Stage 3: Anti-Clipping DynamicsCompressor Limiter (prevents harsh speaker distortion at high gain)
+    const limiter = ctx.createDynamicsCompressor();
+    limiter.threshold.value = -2.0;
+    limiter.knee.value = 6.0;
+    limiter.ratio.value = 12.0;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.12;
+
+    source.connect(vocalClarityFilter);
+    vocalClarityFilter.connect(gainNode);
+    gainNode.connect(limiter);
+    limiter.connect(ctx.destination);
+
     let stopped = false;
-
     source.onended = () => {
-      activeRxSourcesSet.delete(source);
-      try {
-        source.disconnect();
-      } catch {
-        // Ignore disconnect error
-      }
-      if (!stopped && activeRxSourcesSet.size === 0) {
+      if (!stopped) {
         stopped = true;
+        try {
+          source.disconnect();
+          vocalClarityFilter.disconnect();
+          gainNode.disconnect();
+          limiter.disconnect();
+        } catch {
+          // Ignore disconnect error
+        }
         onEnded();
       }
     };
 
-    source.start(startTime);
+    source.start(0);
 
     return {
       stop: () => {
         if (stopped) return;
         stopped = true;
-        stopAllQueuedWebAudioRx();
+        try {
+          gainNode.gain.value = 0;
+          source.stop(0);
+          source.disconnect();
+          vocalClarityFilter.disconnect();
+          gainNode.disconnect();
+          limiter.disconnect();
+        } catch {
+          // Ignore stop error
+        }
       },
       setGain: (val: number) => {
-        pipeline.gainNode.gain.value = Math.max(0.5, Math.min(5.0, val));
+        if (stopped) return;
+        gainNode.gain.value = Math.max(0.5, Math.min(5.0, val * autoMakeupGain));
       },
     };
   } catch {

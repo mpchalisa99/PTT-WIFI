@@ -52,10 +52,8 @@ import {
   requestMicrophoneWithFallbacks,
   getSupportedAudioMimeType,
   encodePcmChunksToWavBlob,
-  encodePcmChunkToWavDataUrlFast,
   ensureHtmlAudioElementGainBooster,
   playBase64AudioViaWebAudioFallback,
-  stopAllQueuedWebAudioRx,
   createSilentKeepAliveController,
   SilentKeepAliveSession,
 } from './utils/mobileAudioEngine';
@@ -147,8 +145,6 @@ interface MeshPacket {
   lockOwnerId?: string;
   lockOwnerCallsign?: string;
   lockStartedAt?: number;
-  isStreamChunk?: boolean;
-  streamSeq?: number;
 }
 
 const MASTER_PEER_ID = 'PTT-MASTER-01';
@@ -367,7 +363,9 @@ export default function App() {
   });
   const [voxThreshold, setVoxThreshold] = useState<number>(() => {
     const saved = Number(localStorage.getItem('diskomlekau_vox_threshold'));
-    return saved >= 5 && saved <= 85 ? saved : 25;
+    // Migrasi nilai default lama (18% / 25%) ke standar preset TENANG 24% (THR 24%)
+    if (saved === 18 || saved === 25) return 24;
+    return saved >= 5 && saved <= 85 ? saved : 24;
   });
   const [voxHoldMs, setVoxHoldMs] = useState<number>(() => {
     const saved = Number(localStorage.getItem('diskomlekau_vox_hold_ms'));
@@ -379,10 +377,14 @@ export default function App() {
     return saved >= 1.0 && saved <= 4.0 ? saved : 2.2;
   });
   const [voxInputLevel, setVoxInputLevel] = useState<number>(0);
+  // Adaptive Noise Floor (Kalibrasi Otomatis Kebisingan Latar Belakang) & Effective Dynamic Threshold
+  const [ambientNoiseFloor, setAmbientNoiseFloor] = useState<number>(6);
+  const [effectiveVoxThreshold, setEffectiveVoxThreshold] = useState<number>(24);
+  const [isVocalPatternConfirmed, setIsVocalPatternConfirmed] = useState<boolean>(false);
 
   const getVoxNoiseGateLabel = (thr: number) => {
-    if (thr <= 24) return 'TENANG';
-    if (thr <= 46) return 'KERAMAIAN';
+    if (thr <= 28) return 'TENANG';
+    if (thr <= 48) return 'KERAMAIAN';
     return 'ANGIN/MOTOR';
   };
 
@@ -431,13 +433,19 @@ export default function App() {
   const reusableRxAudioRef = useRef<HTMLAudioElement | null>(null);
   const activeWebAudioRxStopRef = useRef<(() => void) | null>(null);
   const animFrameRef = useRef<number | null>(null);
-  // VOX (Voice Activity Detection) & Channel Lockout / Anti-Collision refs
+  // VOX (Voice Activity Detection), Adaptive Noise Gate & Channel Lockout / Anti-Collision refs
   const voxEnabledRef = useRef<boolean>(voxEnabled);
   const voxThresholdRef = useRef<number>(voxThreshold);
   const voxHoldMsRef = useRef<number>(voxHoldMs);
   const rxGainBoostRef = useRef<number>(rxGainBoost);
   const lastVoiceActiveTimeRef = useRef<number>(0);
   const voxVoiceFramesRef = useRef<number>(0);
+  // Refs untuk Adaptive Noise Floor Calibration & Voice Pattern Verification (Hysteresis 175-200ms)
+  const ambientNoiseFloorRef = useRef<number>(6);
+  const noiseCalibrationSamplesRef = useRef<number[]>([]);
+  const isInitialNoiseCalibratingRef = useRef<boolean>(true);
+  const voiceOnsetStartTimeRef = useRef<number>(0);
+  const lastVocalDipTimeRef = useRef<number>(0);
   const isVoxTriggeredTxRef = useRef<boolean>(false);
   const rxCooldownUntilRef = useRef<number>(0);
   const [channelLockOwner, setChannelLockOwner] = useState<ChannelLockInfo | null>(null);
@@ -583,10 +591,6 @@ export default function App() {
 
   const activeAudioElementRef = useRef<HTMLAudioElement | null>(null);
   const remoteActiveTxRef = useRef<string | null>(null);
-  const incomingSpeakerRef = useRef<string | null>(null);
-  const rxStreamWatchdogRef = useRef<number | null>(null);
-  const liveStreamedChunkCountRef = useRef<number>(0);
-  const streamSeqCounterRef = useRef<number>(0);
   const pttSegmentIntervalRef = useRef<number | null>(null);
   const isTransmittingRef = useRef<boolean>(false);
   // Strict Half-Duplex: Receiver (RX) is forced OFF while PTT is open (from 1st click until 2nd click)
@@ -599,11 +603,6 @@ export default function App() {
   // Helper to immediately mute & shut off Receiver (both HTMLAudioElement & Web Audio BufferSource) during PTT/VOX Open
   const muteAndDisableReceiver = useCallback(() => {
     isReceiverOffRef.current = true;
-    if (rxStreamWatchdogRef.current) {
-      window.clearTimeout(rxStreamWatchdogRef.current);
-      rxStreamWatchdogRef.current = null;
-    }
-    stopAllQueuedWebAudioRx();
     if (activeWebAudioRxStopRef.current) {
       try {
         activeWebAudioRxStopRef.current();
@@ -675,21 +674,16 @@ export default function App() {
     rxCooldownUntilRef.current = Date.now() + 650;
   }, []);
 
-  // Play incoming Base64 voice chunk/clip with ZERO-LATENCY real-time scheduling & Web Audio API GainNode (gain.value = 2.2+)
+  // Play incoming Base64 voice clip received from another device (Compatible with Safari iOS, Chrome Android/HarmonyOS & Background Pocket Mode)
   const playIncomingAudioBase64 = useCallback(
-    (
-      base64Data: string,
-      senderCallsign: string,
-      senderDeviceId?: string,
-      isStreamChunk = false
-    ) => {
+    (base64Data: string, senderCallsign: string, senderDeviceId?: string) => {
       if (!soundEnabled) return;
       // STRICT ANTI-ECHO: While PTT/VOX is open (TX active / Receiver OFF), NEVER play any speaker audio!
       if (isTransmittingRef.current || isReceiverOffRef.current) return;
 
       // Temporarily lock channel & gate VOX while speaker is playing incoming audio so RX speaker never triggers nearby VOX
       const now = Date.now();
-      rxCooldownUntilRef.current = now + 900;
+      rxCooldownUntilRef.current = now + 3000;
       voxVoiceFramesRef.current = 0;
       setVoxInputLevel(0);
       if (senderDeviceId) {
@@ -704,64 +698,73 @@ export default function App() {
       }
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getAudioTracks().forEach((track) => {
-          if (track.enabled) track.enabled = false;
+          track.enabled = false;
         });
       }
 
-      // Only play RX start beep on the very first chunk of a speaker's transmission (never interrupt streaming chunks!)
-      if (incomingSpeakerRef.current !== senderCallsign) {
-        incomingSpeakerRef.current = senderCallsign;
-        setIncomingSpeaker(senderCallsign);
-        playTacticalTone('rx');
+      playTacticalTone('rx');
+      setIncomingSpeaker(senderCallsign);
+
+      // Stop any previous RX playback first
+      if (activeWebAudioRxStopRef.current) {
+        try {
+          activeWebAudioRxStopRef.current();
+        } catch {
+          // Ignore
+        }
+        activeWebAudioRxStopRef.current = null;
+      }
+      if (activeAudioElementRef.current) {
+        try {
+          activeAudioElementRef.current.pause();
+        } catch {
+          // Ignore
+        }
+        activeAudioElementRef.current = null;
       }
 
-      const scheduleChannelRelease = (delayMs: number) => {
-        if (rxStreamWatchdogRef.current) {
-          window.clearTimeout(rxStreamWatchdogRef.current);
+      let hasReleased = false;
+      const releaseChannelLockAndRestoreVox = () => {
+        if (hasReleased) return;
+        hasReleased = true;
+        activeWebAudioRxStopRef.current = null;
+        // 650ms Anti-Feedback Acoustic Decay Guard after speaker finishes playing
+        rxCooldownUntilRef.current = Date.now() + 650;
+        if (
+          !remoteActiveTxRef.current ||
+          remoteActiveTxRef.current === senderCallsign
+        ) {
+          remoteActiveTxRef.current = null;
+          channelLockOwnerRef.current = null;
+          setChannelLockOwner(null);
+          setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
         }
-        rxStreamWatchdogRef.current = window.setTimeout(() => {
-          rxStreamWatchdogRef.current = null;
-          activeWebAudioRxStopRef.current = null;
-          rxCooldownUntilRef.current = Date.now() + 550;
+        window.setTimeout(() => {
           if (
-            !remoteActiveTxRef.current ||
-            remoteActiveTxRef.current === senderCallsign
+            voxEnabledRef.current &&
+            !isTransmittingRef.current &&
+            !remoteActiveTxRef.current &&
+            !channelLockOwnerRef.current &&
+            mediaStreamRef.current
           ) {
-            remoteActiveTxRef.current = null;
-            channelLockOwnerRef.current = null;
-            setChannelLockOwner(null);
-            incomingSpeakerRef.current = null;
-            setIncomingSpeaker((curr) => (curr === senderCallsign ? null : curr));
-            if (!isTransmittingRef.current && !isReceiverOffRef.current) {
-              playTacticalTone('end');
-            }
+            mediaStreamRef.current.getAudioTracks().forEach((track) => {
+              track.enabled = true;
+            });
           }
-          window.setTimeout(() => {
-            if (
-              voxEnabledRef.current &&
-              !isTransmittingRef.current &&
-              !remoteActiveTxRef.current &&
-              !channelLockOwnerRef.current &&
-              mediaStreamRef.current
-            ) {
-              mediaStreamRef.current.getAudioTracks().forEach((track) => {
-                track.enabled = true;
-              });
-            }
-          }, 520);
-        }, delayMs);
+        }, 620);
       };
 
-      // Reset watchdog on every incoming 40ms chunk so the channel stays locked while chunks stream in
-      scheduleChannelRelease(isStreamChunk ? 380 : 650);
-
       const handlePlaybackFinished = () => {
-        scheduleChannelRelease(isStreamChunk ? 160 : 80);
+        releaseChannelLockAndRestoreVox();
+        if (!isTransmittingRef.current && !isReceiverOffRef.current) {
+          playTacticalTone('end');
+        }
       };
 
       // Fallback helper using HTMLAudioElement routed through Web Audio API GainNode (gain.value = 2.2+)
       const playViaHtmlAudioWithGainFallback = () => {
         if (isTransmittingRef.current || isReceiverOffRef.current) {
+          releaseChannelLockAndRestoreVox();
           return;
         }
         try {
@@ -790,24 +793,25 @@ export default function App() {
           activeAudioElementRef.current = audio;
           audio.onended = handlePlaybackFinished;
           audio.onerror = () => {
-            handlePlaybackFinished();
+            releaseChannelLockAndRestoreVox();
           };
 
           const playPromise = audio.play();
           if (playPromise !== undefined) {
             playPromise.catch(() => {
-              handlePlaybackFinished();
+              releaseChannelLockAndRestoreVox();
             });
           }
         } catch {
-          handlePlaybackFinished();
+          releaseChannelLockAndRestoreVox();
         }
       };
 
-      // Primary Zero-Latency Receiver Decoder:
-      // Synchronous WAV AudioBuffer parser (< 0.05ms) -> Vocal Clarity EQ -> GainNode (gain.value = 2.2+) -> Limiter -> Destination
+      // Primary Receiver Decoder: Web Audio API decodeAudioData -> Vocal Clarity EQ -> GainNode (gain.value = 2.2+) -> Limiter -> Destination
+      // Memastikan suara setelah dekripsi AES-GCM terdengar nyaring, jernih, dan penuh di semua perangkat!
       (async () => {
         if (isTransmittingRef.current || isReceiverOffRef.current) {
+          releaseChannelLockAndRestoreVox();
           return;
         }
         const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
@@ -824,7 +828,8 @@ export default function App() {
         );
         if (handle) {
           activeWebAudioRxStopRef.current = handle.stop;
-        } else if (!isStreamChunk) {
+        } else {
+          // Jika format kontainer membutuhkan dekoder HTMLAudioElement, putar via HTMLAudioElement + Web Audio GainNode
           playViaHtmlAudioWithGainFallback();
         }
       })();
@@ -1534,7 +1539,7 @@ export default function App() {
           return;
         }
 
-        // 3. INSTANT ASYNC END-TO-END AES-256-GCM DECRYPTION (< 0.2ms via cached CryptoKey)
+        // 3. REAL-TIME END-TO-END AES-256-GCM DECRYPTION (Web Crypto API crypto.subtle.decrypt)
         if (pkt.encryptedAudio && pkt.audioCiphertext && pkt.aesIv) {
           decryptAudioPayloadAesGcm(
             pkt.audioCiphertext,
@@ -1545,20 +1550,10 @@ export default function App() {
             if (isTransmittingRef.current || isReceiverOffRef.current) return;
             setE2eDecryptedRxCount((c) => c + 1);
             setLastAesIvPreview(`RX-GCM IV:${pkt.aesIv?.slice(0, 8)}…`);
-            playIncomingAudioBase64(
-              decryptedBase64,
-              pkt.callsign,
-              pkt.senderId,
-              Boolean(pkt.isStreamChunk)
-            );
+            playIncomingAudioBase64(decryptedBase64, pkt.callsign, pkt.senderId);
           });
         } else if (pkt.audioBase64) {
-          playIncomingAudioBase64(
-            pkt.audioBase64,
-            pkt.callsign,
-            pkt.senderId,
-            Boolean(pkt.isStreamChunk)
-          );
+          playIncomingAudioBase64(pkt.audioBase64, pkt.callsign, pkt.senderId);
         }
       } else if (pkt.type === 'CHAT_MSG' && pkt.chatText) {
         const newMsg: TacticalChatMessage = {
@@ -2064,28 +2059,40 @@ export default function App() {
 
         if (!micSourceRef.current || !micAnalyserRef.current) {
           const source = ctx.createMediaStreamSource(stream);
-          // Stage 1: High-pass filter (320Hz) to cut wind buffeting, breath pops, and motorcycle/vehicle engine rumble
-          const windCutHighpass = ctx.createBiquadFilter();
-          windCutHighpass.type = 'highpass';
-          windCutHighpass.frequency.value = 320;
-          windCutHighpass.Q.value = 0.7;
 
-          // Stage 2: Bandpass filter (320Hz - 3400Hz human speech presence band) to isolate human voice from background noise
-          const bandpass = ctx.createBiquadFilter();
-          bandpass.type = 'bandpass';
-          bandpass.frequency.value = 1150;
-          bandpass.Q.value = 0.85;
+          // FILTER FREKUENSI VOKAL MANUSIA BERTINGKAT (300 Hz - 3.400 Hz) VIA WEB AUDIO API BiquadFilterNode:
+          // Stage 1: High-Pass Filter (300 Hz, Butterworth Q = 0.707)
+          // Memotong tuntas frekuensi di bawah 300 Hz (deru angin, gemuruh mesin motor/mobil, AC, dan getaran mekanis)
+          const highpass300 = ctx.createBiquadFilter();
+          highpass300.type = 'highpass';
+          highpass300.frequency.value = 300;
+          highpass300.Q.value = 0.707;
+
+          // Stage 2: Low-Pass Filter (3.400 Hz, Butterworth Q = 0.707)
+          // Memotong tuntas frekuensi di atas 3,4 kHz (desis frekuensi tinggi, gesekan saku/jaket, bunyi klik tajam)
+          const lowpass3400 = ctx.createBiquadFilter();
+          lowpass3400.type = 'lowpass';
+          lowpass3400.frequency.value = 3400;
+          lowpass3400.Q.value = 0.707;
+
+          // Stage 3: Vocal Formant Bandpass Filter (terpusat pada 1.010 Hz — pusat geometrik 300Hz-3400Hz, Q = 0.65)
+          // Mengisolasi pita energi fundamental & formant suara manusia sebelum masuk ke sensor VOX
+          const vocalBandpass = ctx.createBiquadFilter();
+          vocalBandpass.type = 'bandpass';
+          vocalBandpass.frequency.value = 1010;
+          vocalBandpass.Q.value = 0.65;
 
           const analyser = ctx.createAnalyser();
-          analyser.fftSize = 256;
-          analyser.smoothingTimeConstant = 0.35;
+          analyser.fftSize = 512;
+          analyser.smoothingTimeConstant = 0.3;
 
-          source.connect(windCutHighpass);
-          windCutHighpass.connect(bandpass);
-          bandpass.connect(analyser);
+          source.connect(highpass300);
+          highpass300.connect(lowpass3400);
+          lowpass3400.connect(vocalBandpass);
+          vocalBandpass.connect(analyser);
 
           micSourceRef.current = source;
-          micFilterRef.current = bandpass;
+          micFilterRef.current = vocalBandpass;
           micAnalyserRef.current = analyser;
         }
 
@@ -2316,54 +2323,9 @@ export default function App() {
     ensureWebAudioVoxGraph,
   ]);
 
-  // Helper instan untuk mengenkripsi potongan audio 20ms-50ms (AES-256-GCM async < 0.2ms) & langsung mengirimkannya secara streaming
-  const dispatchEncryptedAudioDataUrl = useCallback(
-    async (base64Audio: string, mimeType: string, isStreamChunk = false) => {
-      if (!base64Audio || abortDiscardRecordingRef.current) return;
-      const seq = ++streamSeqCounterRef.current;
-
-      const encrypted = await encryptAudioPayloadAesGcm(
-        base64Audio,
-        PASSCODE_HARIAN
-      );
-
-      if (abortDiscardRecordingRef.current) return;
-
-      if (encrypted) {
-        setE2eEncryptedTxCount((c) => c + 1);
-        setLastAesIvPreview(encrypted.ivBase64.slice(0, 8));
-        broadcastMeshPacket({
-          type: 'VOICE_CLIP',
-          encryptedAudio: true,
-          audioCiphertext: encrypted.ciphertextBase64,
-          aesIv: encrypted.ivBase64,
-          cipherAlgo: 'AES-256-GCM',
-          mimeType,
-          isStreamChunk,
-          streamSeq: seq,
-          lockOwnerId: myDeviceId,
-          lockOwnerCallsign: myCallsign,
-          lockStartedAt: localTxStartedAtRef.current,
-        });
-      } else {
-        broadcastMeshPacket({
-          type: 'VOICE_CLIP',
-          audioBase64: base64Audio,
-          mimeType,
-          isStreamChunk,
-          streamSeq: seq,
-          lockOwnerId: myDeviceId,
-          lockOwnerCallsign: myCallsign,
-          lockStartedAt: localTxStartedAtRef.current,
-        });
-      }
-    },
-    [broadcastMeshPacket, myDeviceId, myCallsign]
-  );
-
   // Helper untuk mengenkripsi (AES-256-GCM via Web Crypto API) & mengirim Blob rekaman suara ke jaringan
   const dispatchRecordedVoiceBlob = useCallback(
-    (blob: Blob, onlyForEchoTest = false) => {
+    (blob: Blob) => {
       // Keep mic enabled ONLY if VOX is active and no incoming speaker is playing; otherwise disable track
       if (mediaStreamRef.current) {
         const keepOpenForVox =
@@ -2381,36 +2343,60 @@ export default function App() {
         return;
       }
 
-      if (blob.size > 80) {
+      if (blob.size > 200) {
         const reader = new FileReader();
         reader.onloadend = async () => {
           const base64Audio = reader.result as string;
-          if (!base64Audio) return;
-
-          if (!onlyForEchoTest) {
-            await dispatchEncryptedAudioDataUrl(
+          if (base64Audio) {
+            // ENKRIPSI AUDIO END-TO-END (AES-256-GCM via window.crypto.subtle) SEBELUM DIKIRIM MELALUI WEBSOCKET/WEBRTC
+            const encrypted = await encryptAudioPayloadAesGcm(
               base64Audio,
-              blob.type || 'audio/wav',
-              false
+              PASSCODE_HARIAN
             );
-          }
 
-          // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
-          if (
-            !isTransmittingRef.current &&
-            !isReceiverOffRef.current &&
-            echoTestMode &&
-            membersRef.current.length === 0
-          ) {
-            window.setTimeout(() => {
-              playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
-            }, 300);
+            if (encrypted) {
+              setE2eEncryptedTxCount((c) => c + 1);
+              setLastAesIvPreview(encrypted.ivBase64.slice(0, 8));
+              broadcastMeshPacket({
+                type: 'VOICE_CLIP',
+                encryptedAudio: true,
+                audioCiphertext: encrypted.ciphertextBase64,
+                aesIv: encrypted.ivBase64,
+                cipherAlgo: 'AES-256-GCM',
+                mimeType: blob.type || 'audio/wav',
+                lockOwnerId: myDeviceId,
+                lockOwnerCallsign: myCallsign,
+                lockStartedAt: localTxStartedAtRef.current,
+              });
+            } else {
+              // Fallback hanya jika environment tidak mendukung SubtleCrypto
+              broadcastMeshPacket({
+                type: 'VOICE_CLIP',
+                audioBase64: base64Audio,
+                mimeType: blob.type || 'audio/wav',
+                lockOwnerId: myDeviceId,
+                lockOwnerCallsign: myCallsign,
+                lockStartedAt: localTxStartedAtRef.current,
+              });
+            }
+
+            // Only if user explicitly enabled Echo Test Mode in Settings (and PTT is already closed / RX ON)
+            if (
+              !isTransmittingRef.current &&
+              !isReceiverOffRef.current &&
+              echoTestMode &&
+              membersRef.current.length === 0
+            ) {
+              window.setTimeout(() => {
+                playIncomingAudioBase64(base64Audio, `${myCallsign} (ECHO)`);
+              }, 350);
+            }
           }
         };
         reader.readAsDataURL(blob);
       }
     },
-    [dispatchEncryptedAudioDataUrl, myCallsign, echoTestMode, playIncomingAudioBase64]
+    [broadcastMeshPacket, myDeviceId, myCallsign, echoTestMode, playIncomingAudioBase64]
   );
 
   // onStartTransmit (Dipanggil otomatis oleh VOX saat suara melewati threshold, atau saat Klik Pertama tombol PTT)
@@ -2457,9 +2443,7 @@ export default function App() {
       const txStartTs = Date.now();
       localTxStartedAtRef.current = txStartTs;
       abortDiscardRecordingRef.current = false;
-      liveStreamedChunkCountRef.current = 0;
       remoteActiveTxRef.current = null;
-      incomingSpeakerRef.current = null;
       setIncomingSpeaker(null);
       setIsTransmitting(true);
       isTransmittingRef.current = true;
@@ -2513,54 +2497,10 @@ export default function App() {
           };
           updateMeter();
 
-          // A. ULTRA-LOW-LATENCY 40ms LIVE AUDIO STREAMER (20ms-50ms window):
-          // Captures 1024-sample (~21ms) Web Audio buffers and immediately dispatches self-contained
-          // 16kHz WAV frames every ~42ms so all receivers play audio in real-time while speaking!
-          if (micSourceRef.current) {
-            pcmChunksRef.current = [];
-            isPcmRecordingRef.current = true;
-            const processor = ctx.createScriptProcessor(1024, 1, 1);
-            const zeroGain = ctx.createGain();
-            zeroGain.gain.value = 0; // Mute local output so mic never feeds back into local speaker!
-
-            const sampleRate = ctx.sampleRate || 48000;
-            // Target ~40ms per streamed slice (e.g. 2 x 1024 samples at 48kHz = 42.6ms)
-            const samplesPer40msSlice = Math.max(
-              1024,
-              Math.round(sampleRate * 0.04)
-            );
-            let accumulatedSamples = 0;
-
-            processor.onaudioprocess = (ev) => {
-              if (!isPcmRecordingRef.current || !isTransmittingRef.current) return;
-              const inputData = ev.inputBuffer.getChannelData(0);
-              const copy = new Float32Array(inputData.length);
-              copy.set(inputData);
-              pcmChunksRef.current.push(copy);
-              accumulatedSamples += copy.length;
-
-              if (accumulatedSamples >= samplesPer40msSlice) {
-                const sliceChunks = pcmChunksRef.current;
-                pcmChunksRef.current = [];
-                accumulatedSamples = 0;
-                liveStreamedChunkCountRef.current += 1;
-                const wavDataUrl = encodePcmChunkToWavDataUrlFast(
-                  sliceChunks,
-                  sampleRate
-                );
-                void dispatchEncryptedAudioDataUrl(wavDataUrl, 'audio/wav', true);
-              }
-            };
-
-            micSourceRef.current.connect(processor);
-            processor.connect(zeroGain);
-            zeroGain.connect(ctx.destination);
-            pcmProcessorRef.current = processor;
-            pcmZeroGainRef.current = zeroGain;
-          }
-
-          // B. MediaRecorder configured with 40ms timeslice (20ms-50ms specification)
+          // Negotiate best supported audio MIME type for Chrome (Android/HarmonyOS) or Safari (iOS)
           const negotiatedMime = getSupportedAudioMimeType();
+          let startedMediaRecorder = false;
+
           if (typeof MediaRecorder !== 'undefined') {
             try {
               const segmentChunks: Blob[] = [];
@@ -2592,17 +2532,36 @@ export default function App() {
                 const effectiveMime =
                   recorder.mimeType || negotiatedMime || 'audio/mp4';
                 const blob = new Blob(segmentChunks, { type: effectiveMime });
-                // If live 40ms PCM streaming already delivered the voice in real-time, only use full blob for Echo Test
-                const alreadyStreamedLive = liveStreamedChunkCountRef.current > 0;
-                dispatchRecordedVoiceBlob(blob, alreadyStreamedLive);
+                dispatchRecordedVoiceBlob(blob);
               };
 
               mediaRecorderRef.current = recorder;
-              // Start MediaRecorder with 40ms timeslice (within 20ms-50ms range)
-              recorder.start(40);
+              recorder.start();
+              startedMediaRecorder = true;
             } catch {
-              // Ignore MediaRecorder fallback if ScriptProcessor is already streaming
+              startedMediaRecorder = false;
             }
+          }
+
+          // Fallback: Web Audio API ScriptProcessor PCM-to-WAV Recorder (for older iOS Safari / HarmonyOS WebViews)
+          if (!startedMediaRecorder && micSourceRef.current) {
+            pcmChunksRef.current = [];
+            isPcmRecordingRef.current = true;
+            const processor = ctx.createScriptProcessor(4096, 1, 1);
+            const zeroGain = ctx.createGain();
+            zeroGain.gain.value = 0; // Mute output so mic never feeds back into local speaker!
+
+            processor.onaudioprocess = (ev) => {
+              if (!isPcmRecordingRef.current) return;
+              const inputData = ev.inputBuffer.getChannelData(0);
+              pcmChunksRef.current.push(new Float32Array(inputData));
+            };
+
+            micSourceRef.current.connect(processor);
+            processor.connect(zeroGain);
+            zeroGain.connect(ctx.destination);
+            pcmProcessorRef.current = processor;
+            pcmZeroGainRef.current = zeroGain;
           }
         } else {
           // If microphone permission is not yet granted, fallback visual meter so UI remains responsive
@@ -2629,7 +2588,6 @@ export default function App() {
       muteAndDisableReceiver,
       broadcastMeshPacket,
       ensureWebAudioVoxGraph,
-      dispatchEncryptedAudioDataUrl,
       dispatchRecordedVoiceBlob,
       myCallsign,
     ]
@@ -2666,10 +2624,19 @@ export default function App() {
       });
     }
 
-    // Flush sisa potongan audio <40ms terakhir secara instan sebelum menutup stream
+    // Hentikan perekam MediaRecorder & kirim paket VOICE_CLIP
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch {
+        // Ignore stop error
+      }
+    }
+
+    // Hentikan perekam fallback PCM-to-WAV jika aktif (Safari iOS / HarmonyOS fallback)
     if (isPcmRecordingRef.current) {
       isPcmRecordingRef.current = false;
-      const remainingChunks = pcmChunksRef.current;
+      const recordedChunks = pcmChunksRef.current;
       pcmChunksRef.current = [];
       try {
         pcmProcessorRef.current?.disconnect();
@@ -2680,23 +2647,10 @@ export default function App() {
       pcmProcessorRef.current = null;
       pcmZeroGainRef.current = null;
 
-      if (remainingChunks.length > 0 && !abortDiscardRecordingRef.current) {
-        const sampleRate = audioCtxRef.current?.sampleRate || 48000;
-        liveStreamedChunkCountRef.current += 1;
-        const wavDataUrl = encodePcmChunkToWavDataUrlFast(
-          remainingChunks,
-          sampleRate
-        );
-        void dispatchEncryptedAudioDataUrl(wavDataUrl, 'audio/wav', true);
-      }
-    }
-
-    // Hentikan perekam MediaRecorder
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch {
-        // Ignore stop error
+      if (recordedChunks.length > 0) {
+        const sampleRate = audioCtxRef.current?.sampleRate || 44100;
+        const wavBlob = encodePcmChunksToWavBlob(recordedChunks, sampleRate);
+        dispatchRecordedVoiceBlob(wavBlob);
       }
     }
 
@@ -2719,7 +2673,7 @@ export default function App() {
     myCallsign,
     playTacticalTone,
     broadcastMeshPacket,
-    dispatchEncryptedAudioDataUrl,
+    dispatchRecordedVoiceBlob,
   ]);
 
   const handlePttStart = () => onStartTransmit('MANUAL');
@@ -2732,6 +2686,8 @@ export default function App() {
       voxEnabledRef.current = next;
       if (!next) {
         voxVoiceFramesRef.current = 0;
+        voiceOnsetStartTimeRef.current = 0;
+        setIsVocalPatternConfirmed(false);
         setVoxInputLevel(0);
         if (isTransmittingRef.current && isVoxTriggeredTxRef.current) {
           onStopTransmit();
@@ -2740,10 +2696,22 @@ export default function App() {
             t.enabled = false;
           });
         }
+      } else {
+        // Picu kalibrasi cepat ambient noise floor saat VOX diaktifkan
+        isInitialNoiseCalibratingRef.current = true;
+        noiseCalibrationSamplesRef.current = [];
       }
       return next;
     });
   }, [onStopTransmit]);
+
+  // Fungsi Kalibrasi Ulang Ambient Noise Floor Secara Instan
+  const handleRecalibrateVoxNoiseFloor = useCallback(() => {
+    isInitialNoiseCalibratingRef.current = true;
+    noiseCalibrationSamplesRef.current = [];
+    voiceOnsetStartTimeRef.current = 0;
+    voxVoiceFramesRef.current = 0;
+  }, []);
 
   // Toggle PTT Manual (Klik Pertama = Buka PTT & Receiver OFF, Klik Kedua = Tutup PTT & Receiver ON)
   const handlePttToggle = () => {
@@ -2755,16 +2723,25 @@ export default function App() {
     }
   };
 
-  // MESIN UTAMA VOX (VOICE ACTIVITY DETECTION) BERBASIS WEB AUDIO API (OTOMATIS TANPA TOMBOL / TWS)
+  // MESIN UTAMA VOX CERDAS BERBASIS WEB AUDIO API:
+  // 1. Adaptive Threshold / Noise Gate (Kalibrasi Otomatis Ambient Noise Floor)
+  // 2. Bandpass Filter Vokal (300 Hz - 3.400 Hz)
+  // 3. Voice Pattern Verification & Hysteresis Debounce (175-200 ms)
   useEffect(() => {
     if (!isPasscodeAuthenticated || !isSetupCompleted || !myCallsign) return;
 
     let isCancelled = false;
     let voxTimer: number | null = null;
 
+    // Reset kalibrasi awal kebisingan latar belakang saat pertama kali terhubung
+    isInitialNoiseCalibratingRef.current = true;
+    noiseCalibrationSamplesRef.current = [];
+    voiceOnsetStartTimeRef.current = 0;
+
     const startContinuousVoxMonitor = async () => {
       if (!voxEnabled && !isTransmittingRef.current) {
         setVoxInputLevel(0);
+        setIsVocalPatternConfirmed(false);
         if (mediaStreamRef.current && !isTransmittingRef.current) {
           mediaStreamRef.current.getAudioTracks().forEach((t) => {
             t.enabled = false;
@@ -2821,6 +2798,8 @@ export default function App() {
 
         if (isChannelLockedOrReceiving && !isTransmittingRef.current) {
           voxVoiceFramesRef.current = 0;
+          voiceOnsetStartTimeRef.current = 0;
+          setIsVocalPatternConfirmed(false);
           setVoxInputLevel(0);
           if (mediaStreamRef.current) {
             mediaStreamRef.current.getAudioTracks().forEach((t) => {
@@ -2844,47 +2823,166 @@ export default function App() {
         analyser.getByteTimeDomainData(timeDomainBuf);
         analyser.getByteFrequencyData(freqDomainBuf);
 
-        // Compute RMS amplitude from Web Audio time-domain waveform (post anti-wind & vocal bandpass filter)
+        // 1. Hitung RMS Amplitude & Zero-Crossing Rate (ZCR) dari sinyal pasca-filter (300Hz - 3.4kHz)
         let sumSquares = 0;
+        let zcrCount = 0;
+        let prevSign = timeDomainBuf[0] >= 128 ? 1 : -1;
         for (let i = 0; i < timeDomainBuf.length; i++) {
-          const normalized = (timeDomainBuf[i] - 128) / 128;
+          const sample = timeDomainBuf[i] - 128;
+          const normalized = sample / 128;
           sumSquares += normalized * normalized;
+          const currSign = sample >= 0 ? 1 : -1;
+          if (currSign !== prevSign && Math.abs(sample) >= 2) {
+            zcrCount += 1;
+          }
+          prevSign = currSign;
         }
         const rms = Math.sqrt(sumSquares / timeDomainBuf.length);
 
-        // Compute average speech-band frequency energy
-        let freqSum = 0;
-        for (let i = 0; i < freqDomainBuf.length; i++) {
-          freqSum += freqDomainBuf[i];
-        }
-        const freqAvg = freqSum / freqDomainBuf.length;
+        // 2. Analisis Spektral Pita Vokal Manusia (300 Hz - 3.400 Hz) vs Pita Bising Luar (<300 Hz & >3.400 Hz)
+        const sampleRate = audioCtxRef.current?.sampleRate || 48000;
+        const binHz = sampleRate / analyser.fftSize; // ~93.75 Hz per bin (fftSize=512)
+        const minVocalBin = Math.max(1, Math.floor(300 / binHz));
+        const maxVocalBin = Math.min(
+          freqDomainBuf.length - 1,
+          Math.ceil(3400 / binHz)
+        );
 
-        // Combined human voice energy score (0 - 100)
+        let vocalBandSum = 0;
+        let vocalBinCount = 0;
+        let outBandSum = 0;
+        let outBinCount = 0;
+
+        for (let i = 0; i < freqDomainBuf.length; i++) {
+          if (i >= minVocalBin && i <= maxVocalBin) {
+            vocalBandSum += freqDomainBuf[i];
+            vocalBinCount += 1;
+          } else if (i < minVocalBin || i <= Math.min(freqDomainBuf.length - 1, maxVocalBin + 36)) {
+            outBandSum += freqDomainBuf[i];
+            outBinCount += 1;
+          }
+        }
+
+        const vocalBandAvg = vocalBinCount > 0 ? vocalBandSum / vocalBinCount : 0;
+        const outBandAvg = outBinCount > 0 ? outBandSum / outBinCount : 1;
+
+        // Skor Energi Vokal Terfokus (0 - 100)
         const voiceEnergy = Math.min(
           100,
-          Math.round(Math.max(rms * 255, freqAvg * 0.85))
+          Math.round(Math.max(rms * 245, vocalBandAvg * 0.88))
         );
         setVoxInputLevel(voiceEnergy);
 
-        const threshold = voxThresholdRef.current;
-        // In noisy/windy environments (threshold >= 38%), require 3 consecutive vocal frames (~165ms) to reject gusts/impulses
-        const requiredFrames = threshold >= 38 ? 3 : 2;
+        // 3. VERIFIKASI POLA VOKAL MANUSIA (Voice Pattern Verification):
+        // Memastikan energi dominan berada di rentang vokal (300Hz-3.4kHz) dan frekuensi gelombang sesuai artikulasi suara manusia,
+        // sehingga ketukan meja, batuk singkat, deru angin, atau suara bising jauh diabaikan.
+        const spectralVocalRatio = vocalBandAvg / Math.max(1, outBandAvg);
+        const isHumanZcrValid = zcrCount >= 4 && zcrCount <= 155;
+        const isVocalPatternValid =
+          spectralVocalRatio >= 1.15 &&
+          isHumanZcrValid &&
+          voiceEnergy >= Math.round(ambientNoiseFloorRef.current + 8);
+        setIsVocalPatternConfirmed(isVocalPatternValid);
+
+        // 4. ADAPTIVE THRESHOLD / NOISE GATE (Kalibrasi Otomatis Ambient Noise Floor):
+        const baseThreshold = voxThresholdRef.current;
 
         if (!isTransmittingRef.current) {
-          // Standby Listening -> Check if voice exceeds VOX threshold (only when channel is NOT locked)
-          if (voxEnabledRef.current && !isPttLocked && voiceEnergy >= threshold) {
+          // Fase Kalibrasi Awal (~450ms pertama saat baru terhubung / belum bicara)
+          if (isInitialNoiseCalibratingRef.current) {
+            noiseCalibrationSamplesRef.current.push(voiceEnergy);
+            if (noiseCalibrationSamplesRef.current.length >= 10) {
+              const sorted = [...noiseCalibrationSamplesRef.current].sort(
+                (a, b) => a - b
+              );
+              // Ambil persentil bawah-tengah (ke-4 dari 10 sampel) sebagai tingkat kebisingan dasar ruangan
+              const calibratedFloor = Math.max(
+                2,
+                Math.min(48, sorted[3] ?? sorted[0] ?? 6)
+              );
+              ambientNoiseFloorRef.current = calibratedFloor;
+              setAmbientNoiseFloor(Math.round(calibratedFloor));
+              isInitialNoiseCalibratingRef.current = false;
+            }
+          } else if (voiceOnsetStartTimeRef.current === 0 || !isVocalPatternValid) {
+            // Pembaruan Adaptif Kontinu saat tidak ada orang bicara (Asymmetric EMA):
+            // Cepat turun jika lingkungan menjadi lebih hening, lambat naik jika bising latar konstan meningkat
+            const currentFloor = ambientNoiseFloorRef.current;
+            if (voiceEnergy <= currentFloor) {
+              ambientNoiseFloorRef.current = Math.max(
+                2,
+                currentFloor * 0.85 + voiceEnergy * 0.15
+              );
+            } else if (voiceEnergy < baseThreshold + 10) {
+              ambientNoiseFloorRef.current = Math.min(
+                52,
+                currentFloor * 0.965 + voiceEnergy * 0.035
+              );
+            }
+            setAmbientNoiseFloor(Math.round(ambientNoiseFloorRef.current));
+          }
+        }
+
+        // Hitung Batas Ambang Dinamis (Effective Adaptive Threshold):
+        // Menyesuaikan otomatis di atas ambient noise floor, namun tidak pernah lebih rendah dari slider pilihan pengguna (mis. 24%)
+        const adaptiveHeadroom =
+          baseThreshold <= 28 ? 11 : baseThreshold <= 48 ? 14 : 17;
+        const dynamicNoiseGate = Math.round(
+          ambientNoiseFloorRef.current + adaptiveHeadroom
+        );
+        const effectiveThreshold = Math.min(
+          85,
+          Math.max(baseThreshold, dynamicNoiseGate)
+        );
+        setEffectiveVoxThreshold(effectiveThreshold);
+
+        // 5. LOGIKA KONFIRMASI DURASI VOKAL (Hysteresis / Debounce 175ms - 200ms):
+        // Mencegah suara singkat (<175ms) seperti batuk, benturan, atau suara orang lewat membuka jalur PTT
+        const requiredConfirmMs = baseThreshold >= 40 ? 200 : 175;
+
+        if (!isTransmittingRef.current) {
+          if (
+            voxEnabledRef.current &&
+            !isPttLocked &&
+            voiceEnergy >= effectiveThreshold &&
+            isVocalPatternValid
+          ) {
+            if (voiceOnsetStartTimeRef.current === 0) {
+              voiceOnsetStartTimeRef.current = now;
+            }
+            lastVocalDipTimeRef.current = 0;
             voxVoiceFramesRef.current += 1;
-            if (voxVoiceFramesRef.current >= requiredFrames) {
+
+            const confirmedDurationMs = now - voiceOnsetStartTimeRef.current;
+            if (confirmedDurationMs >= requiredConfirmMs) {
+              voiceOnsetStartTimeRef.current = 0;
               voxVoiceFramesRef.current = 0;
               lastVoiceActiveTimeRef.current = now;
               onStartTransmit('VOX');
             }
           } else {
-            voxVoiceFramesRef.current = Math.max(0, voxVoiceFramesRef.current - 1);
+            // Toleransi micro-dip 1 frame (<=50ms) antar suku kata jika sudah lewat 90ms bicara;
+            // jika hening/bukan vokal lebih dari 50ms, segera batalkan pemicu VOX!
+            if (
+              voiceOnsetStartTimeRef.current > 0 &&
+              now - voiceOnsetStartTimeRef.current >= 90 &&
+              voiceEnergy >= effectiveThreshold - 4 &&
+              lastVocalDipTimeRef.current === 0
+            ) {
+              lastVocalDipTimeRef.current = now;
+            } else {
+              voiceOnsetStartTimeRef.current = 0;
+              lastVocalDipTimeRef.current = 0;
+              voxVoiceFramesRef.current = 0;
+            }
           }
         } else {
-          // Currently Transmitting -> Check if voice is still active or silent
-          const sustainThreshold = Math.max(6, Math.round(threshold * 0.78));
+          // Saat sedang Transmisi (TX Aktif) -> Gunakan ambang histeresis bawah (sustain threshold)
+          // agar kalimat tidak terputus di tengah pengucapan, lalu tutup otomatis setelah hening selama voxHoldMs
+          const sustainThreshold = Math.max(
+            Math.round(ambientNoiseFloorRef.current + 6),
+            Math.round(effectiveThreshold * 0.76)
+          );
           if (voiceEnergy >= sustainThreshold) {
             lastVoiceActiveTimeRef.current = now;
           } else if (voxEnabledRef.current) {
@@ -2894,7 +2992,7 @@ export default function App() {
             }
           }
         }
-      }, 55);
+      }, 45);
     };
 
     startContinuousVoxMonitor();
@@ -4331,20 +4429,26 @@ export default function App() {
                   </span>
                 </button>
 
-                {/* Tombol Preset Cepat Anti-Bising / Keramaian / Berkendara Angin */}
+                {/* Tombol Preset Cepat Anti-Bising: TENANG (24%), RAMAI (42%), ANGIN (65%) */}
                 <div className="flex items-center gap-1 min-w-0">
                   {[
-                    { label: 'TENANG', val: 18 },
+                    { label: 'TENANG', val: 24 },
                     { label: 'RAMAI', val: 42 },
                     { label: 'ANGIN', val: 65 },
                   ].map((preset) => {
-                    const isActivePreset = Math.abs(voxThreshold - preset.val) <= 6;
+                    const isActivePreset =
+                      preset.val === 24
+                        ? voxThreshold === 24 || Math.abs(voxThreshold - 24) <= 3
+                        : Math.abs(voxThreshold - preset.val) <= 5;
                     return (
                       <button
                         key={preset.label}
                         type="button"
-                        onClick={() => setVoxThreshold(preset.val)}
-                        title={`Set Sensitivitas VOX ke Mode ${preset.label} (${preset.val}%)`}
+                        onClick={() => {
+                          setVoxThreshold(preset.val);
+                          handleRecalibrateVoxNoiseFloor();
+                        }}
+                        title={`Set Sensitivitas VOX ke Mode ${preset.label} (THR ${preset.val}%)`}
                         className={`px-1.5 py-0.5 rounded font-telemetry text-[8px] font-bold transition-colors cursor-pointer ${
                           isActivePreset
                             ? 'bg-[#23dcff] text-[#02182b] font-extrabold'
@@ -4413,32 +4517,54 @@ export default function App() {
                 )}
               </div>
 
-              {/* Baris 2: Pengatur Sensitivitas VOX (Threshold Slider) + Indikator Level Suara vs Ambang Bising */}
+              {/* Baris 2: Pengatur Sensitivitas VOX (Threshold Slider) + Indikator Adaptive Noise Gate */}
               <div className="flex items-center gap-2">
-                <span className="font-telemetry text-[9px] font-bold text-cyan-100 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleRecalibrateVoxNoiseFloor}
+                  title="Ketuk untuk Kalibrasi Ulang Tingkat Kebisingan Latar (Adaptive Noise Floor)"
+                  className="font-telemetry text-[9px] font-bold text-cyan-100 shrink-0 cursor-pointer hover:text-[#23dcff]"
+                >
                   THR <strong className="text-[#23dcff]">{voxThreshold}%</strong>
-                </span>
+                </button>
 
                 <div className="relative flex-1 h-4 flex items-center">
-                  {/* Track Background + Live Voice Level Bar */}
+                  {/* Track Background + Ambient Noise Floor Zone + Live Vocal Level Bar */}
                   <div className="w-full h-2 rounded-full bg-[#021220] border border-cyan-400/40 overflow-hidden relative">
+                    {/* Zona Bising Latar Belakang (Ambient Noise Floor) */}
+                    <div
+                      style={{ width: `${Math.min(100, ambientNoiseFloor)}%` }}
+                      className="position-absolute inset-y-0 left-0 h-full bg-cyan-900/50 pointer-events-none"
+                    />
+                    {/* Level Suara Vokal Saat Ini */}
                     <div
                       style={{ width: `${Math.min(100, voxInputLevel)}%` }}
                       className={`h-full transition-all duration-75 ${
-                        voxInputLevel >= voxThreshold
+                        voxInputLevel >= effectiveVoxThreshold && isVocalPatternConfirmed
                           ? 'bg-[#23dcff] shadow-[0_0_8px_#23dcff]'
                           : 'bg-cyan-500/55'
                       }`}
                     />
                   </div>
 
-                  {/* Garis Batas Ambang (Threshold Gate Marker) */}
+                  {/* Garis Batas Ambang Manual (Threshold Gate Marker) */}
                   <div
                     style={{
                       left: `${((voxThreshold - 5) / (85 - 5)) * 100}%`,
                     }}
                     className="absolute top-0 bottom-0 w-1 -ml-0.5 rounded-full bg-white shadow-[0_0_6px_#23dcff] pointer-events-none"
                   />
+
+                  {/* Garis Ambang Adaptif Otomatis (Adaptive Noise Gate Marker jika bising latar tinggi) */}
+                  {effectiveVoxThreshold > voxThreshold && (
+                    <div
+                      style={{
+                        left: `${((effectiveVoxThreshold - 5) / (85 - 5)) * 100}%`,
+                      }}
+                      title={`Ambang Adaptif Otomatis: ${effectiveVoxThreshold}% (Noise Floor: ${ambientNoiseFloor}%)`}
+                      className="absolute top-0.5 bottom-0.5 w-1 -ml-0.5 rounded-full bg-amber-300 shadow-[0_0_6px_#fcd34d] pointer-events-none"
+                    />
+                  )}
 
                   {/* Input Range Slider Interaktif (Pengatur Sensitivitas VOX) */}
                   <input
@@ -4453,11 +4579,13 @@ export default function App() {
                   />
                 </div>
 
-                <span className="font-telemetry text-[9px] text-cyan-100/95 shrink-0 min-w-[82px] text-right">
+                <span className="font-telemetry text-[8.5px] text-cyan-100/95 shrink-0 min-w-[92px] text-right">
                   {isPttLocked
                     ? `LOCKED (${activeLockSpeaker})`
                     : voxEnabled
-                    ? `MIC:${voxInputLevel}% (${getVoxNoiseGateLabel(voxThreshold)})`
+                    ? effectiveVoxThreshold > voxThreshold
+                      ? `MIC:${voxInputLevel}%•ADAPT:${effectiveVoxThreshold}%`
+                      : `MIC:${voxInputLevel}%•NF:${ambientNoiseFloor}%`
                     : 'MANUAL PTT'}
                 </span>
               </div>
@@ -5471,7 +5599,7 @@ export default function App() {
                               Sensitivitas VOX (Threshold Slider)
                             </span>
                             <span className="text-[#23dcff] font-bold">
-                              {voxThreshold}% ({getVoxNoiseGateLabel(voxThreshold)}) • Mic: {voxInputLevel}%
+                              THR {voxThreshold}% ({getVoxNoiseGateLabel(voxThreshold)}) • Adaptif: {effectiveVoxThreshold}%
                             </span>
                           </div>
                           <input
@@ -5485,16 +5613,21 @@ export default function App() {
                           />
                           <div className="grid grid-cols-3 gap-1.5 pt-1">
                             {[
-                              { label: 'Tenang (18%)', val: 18 },
+                              { label: 'Tenang (24%)', val: 24 },
                               { label: 'Keramaian (42%)', val: 42 },
                               { label: 'Angin/Motor (65%)', val: 65 },
                             ].map((p) => (
                               <button
                                 key={p.label}
                                 type="button"
-                                onClick={() => setVoxThreshold(p.val)}
+                                onClick={() => {
+                                  setVoxThreshold(p.val);
+                                  handleRecalibrateVoxNoiseFloor();
+                                }}
                                 className={`py-1 px-2 rounded-lg text-[10px] font-bold border cursor-pointer ${
-                                  Math.abs(voxThreshold - p.val) <= 6
+                                  (p.val === 24
+                                    ? voxThreshold === 24 || Math.abs(voxThreshold - 24) <= 3
+                                    : Math.abs(voxThreshold - p.val) <= 5)
                                     ? 'bg-[#23dcff] text-[#02182b] border-white'
                                     : 'bg-[#042440] text-cyan-100 border-cyan-500/35'
                                 }`}
@@ -5502,6 +5635,18 @@ export default function App() {
                                 {p.label}
                               </button>
                             ))}
+                          </div>
+                          <div className="flex items-center justify-between pt-1.5 text-[10.5px] text-cyan-200/90">
+                            <span>
+                              Noise Floor: <strong className="text-white">{ambientNoiseFloor}%</strong> • Filter Vokal: <strong className="text-[#23dcff]">300Hz–3,4kHz</strong>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={handleRecalibrateVoxNoiseFloor}
+                              className="px-2 py-0.5 rounded bg-[#063256] hover:bg-[#094778] border border-[#23dcff]/60 text-[#23dcff] font-bold cursor-pointer"
+                            >
+                              Kalibrasi Bising
+                            </button>
                           </div>
                         </div>
 
