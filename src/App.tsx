@@ -56,6 +56,7 @@ import {
   OPTIMAL_MEDIA_RECORDER_TIMESLICE_MS,
   createOpusLowBitrateRecorderOptions,
   optimizeWebRtcSdpForOpusLowLatency,
+  installGlobalWebRtcOpusSdpPatch,
   encodePcmChunksToWavBlob,
   ensureHtmlAudioElementGainBooster,
   preDecodeBase64AudioToBuffer,
@@ -682,11 +683,12 @@ export default function App() {
     const saved = Number(localStorage.getItem('diskomlekau_rx_gain'));
     return saved >= 1.0 && saved <= 4.0 ? saved : 2.2;
   });
-  // Pengaturan Bitrate Rendah Opus Codec (16 kbps - 24 kbps, default 20 kbps) untuk hemat bandwidth & latensi < 50ms
-  const [opusBitrateKbps, setOpusBitrateKbps] = useState<16 | 20 | 24>(() => {
-    const saved = Number(localStorage.getItem('diskomlekau_opus_bitrate_kbps'));
-    if (saved === 16 || saved === 20 || saved === 24) return saved;
-    return 20;
+  // Pengaturan Bitrate Ekstrem Opus Codec (8 kbps - 12 kbps, max 12 kbps Narrowband/Wideband speech)
+  // Dilengkapi Inband FEC (useinbandfec=1) & DTX (usedtx=1) agar tahan sinyal buruk & packet loss tinggi
+  const [opusBitrateKbps, setOpusBitrateKbps] = useState<8 | 10 | 12>(() => {
+    const saved = Number(localStorage.getItem('diskomlekau_opus_bitrate_ultra_kbps'));
+    if (saved === 8 || saved === 10 || saved === 12) return saved;
+    return 12;
   });
   // Status Tombol Kontrol Prioritas Override (Menghentikan transmisi klien lain seketika)
   const [isPriorityOverride, setIsPriorityOverride] = useState<boolean>(false);
@@ -764,7 +766,7 @@ export default function App() {
   const voxThresholdRef = useRef<number>(voxThreshold);
   const voxHoldMsRef = useRef<number>(voxHoldMs);
   const rxGainBoostRef = useRef<number>(rxGainBoost);
-  const opusBitrateKbpsRef = useRef<16 | 20 | 24>(opusBitrateKbps);
+  const opusBitrateKbpsRef = useRef<8 | 10 | 12>(opusBitrateKbps);
   const lastVoiceActiveTimeRef = useRef<number>(0);
   const voxVoiceFramesRef = useRef<number>(0);
   // Refs untuk Adaptive Noise Floor Calibration & Voice Pattern Verification (Hysteresis 175-200ms)
@@ -776,7 +778,7 @@ export default function App() {
   const isVoxTriggeredTxRef = useRef<boolean>(false);
   const isPriorityOverrideRef = useRef<boolean>(false);
   const rxCooldownUntilRef = useRef<number>(0);
-  // Antrean Pemutaran Audio Penerima Tanpa Putus (Clean Pre-Decoded Gapless RX Buffer Queue)
+  // Antrean Pemutaran Audio Penerima Tanpa Putus + Adaptive Jitter Buffer (100ms - 200ms)
   const rxAudioQueueRef = useRef<
     Array<{
       base64Data: string;
@@ -787,6 +789,17 @@ export default function App() {
     }>
   >([]);
   const isRxQueuePlayingRef = useRef<boolean>(false);
+  // Adaptive Jitter Buffer (100ms - 200ms) refs untuk menampung paket terlambat di kondisi internet buruk
+  const isJitterBufferingRef = useRef<boolean>(false);
+  const jitterBufferTimerRef = useRef<number | null>(null);
+  const latePacketGraceTimerRef = useRef<number | null>(null);
+  const lastRxPacketArrivalTsRef = useRef<number>(0);
+  const estimatedRxJitterMsRef = useRef<number>(35);
+  const currentAdaptiveJitterDelayMsRef = useRef<number>(140);
+  // Graceful Degradation Store-and-Forward Outbox Queue saat sinyal hilang sesaat
+  const pendingOutboxQueueRef = useRef<
+    Array<{ serialized: string; packet: MeshPacket; queuedAt: number }>
+  >([]);
   const [channelLockOwner, setChannelLockOwner] = useState<ChannelLockInfo | null>(null);
   const channelLockOwnerRef = useRef<ChannelLockInfo | null>(null);
   const localTxStartedAtRef = useRef<number>(0);
@@ -834,6 +847,8 @@ export default function App() {
     keepAliveEnabledRef.current = keepAliveEnabled;
     rxGainBoostRef.current = rxGainBoost;
     opusBitrateKbpsRef.current = opusBitrateKbps;
+    // Aktifkan interseptor SDP WebRTC global untuk memaksa useinbandfec=1, usedtx=1, & max 12 kbps
+    installGlobalWebRtcOpusSdpPatch(opusBitrateKbps * 1000);
     try {
       localStorage.setItem('diskomlekau_vox_enabled', String(voxEnabled));
       localStorage.setItem('diskomlekau_vox_threshold_balanced_v5', String(voxThreshold));
@@ -841,7 +856,7 @@ export default function App() {
       localStorage.setItem('diskomlekau_vox_hold_ms', String(voxHoldMs));
       localStorage.setItem('diskomlekau_keepalive_enabled', String(keepAliveEnabled));
       localStorage.setItem('diskomlekau_rx_gain', String(rxGainBoost));
-      localStorage.setItem('diskomlekau_opus_bitrate_kbps', String(opusBitrateKbps));
+      localStorage.setItem('diskomlekau_opus_bitrate_ultra_kbps', String(opusBitrateKbps));
     } catch {
       // Ignore storage error
     }
@@ -1028,11 +1043,20 @@ export default function App() {
     isReceiverOffRef.current = isTransmitting;
   }, [isTransmitting]);
 
-  // Helper to immediately mute & shut off Receiver (both HTMLAudioElement, Web Audio BufferSource & RX Queue) during PTT/VOX Open
+  // Helper to immediately mute & shut off Receiver (both HTMLAudioElement, Web Audio BufferSource, Jitter Buffer & RX Queue) during PTT/VOX Open
   const muteAndDisableReceiver = useCallback(() => {
     isReceiverOffRef.current = true;
     rxAudioQueueRef.current = [];
     isRxQueuePlayingRef.current = false;
+    isJitterBufferingRef.current = false;
+    if (jitterBufferTimerRef.current) {
+      window.clearTimeout(jitterBufferTimerRef.current);
+      jitterBufferTimerRef.current = null;
+    }
+    if (latePacketGraceTimerRef.current) {
+      window.clearTimeout(latePacketGraceTimerRef.current);
+      latePacketGraceTimerRef.current = null;
+    }
     if (activeWebAudioRxStopRef.current) {
       try {
         activeWebAudioRxStopRef.current();
@@ -1105,7 +1129,8 @@ export default function App() {
     rxCooldownUntilRef.current = Date.now() + 650;
   }, []);
 
-  // Play incoming Base64 voice clip using a Seamless Gapless RX Queue so consecutive segments NEVER cut each other off!
+  // Play incoming Base64 voice clip using an Adaptive Jitter Buffer (100ms - 200ms) + Seamless Gapless RX Queue
+  // so consecutive segments NEVER stutter or cut off even under high packet loss & poor internet!
   const playIncomingAudioBase64 = useCallback(
     (
       base64Data: string,
@@ -1120,10 +1145,28 @@ export default function App() {
       if (senderDeviceId && senderDeviceId === myDeviceId) return;
 
       const now = Date.now();
-      rxCooldownUntilRef.current = now + 3200;
+      rxCooldownUntilRef.current = now + 3400;
       voxVoiceFramesRef.current = 0;
       voiceOnsetStartTimeRef.current = 0;
       setVoxInputLevel(0);
+
+      // Hitung estimasi Jitter Jaringan (EWMA RFC 3550) & tentukan Adaptive Jitter Buffer (100ms - 200ms)
+      if (lastRxPacketArrivalTsRef.current > 0) {
+        const interArrivalMs = now - lastRxPacketArrivalTsRef.current;
+        if (interArrivalMs > 15 && interArrivalMs < 2800) {
+          const expectedInterval = 950;
+          const deviation = Math.min(250, Math.abs(interArrivalMs - expectedInterval));
+          estimatedRxJitterMsRef.current =
+            estimatedRxJitterMsRef.current * 0.75 + deviation * 0.25;
+        }
+      }
+      lastRxPacketArrivalTsRef.current = now;
+      // Kunci rentang Adaptive Jitter Buffer secara presisi di antara 100ms hingga 200ms
+      const adaptiveJitterBufferMs = Math.max(
+        100,
+        Math.min(200, Math.round(115 + estimatedRxJitterMsRef.current * 0.45))
+      );
+      currentAdaptiveJitterDelayMsRef.current = adaptiveJitterBufferMs;
 
       if (senderDeviceId) {
         const lockObj: ChannelLockInfo = {
@@ -1157,6 +1200,15 @@ export default function App() {
       // If Priority Override preempts a different speaker, clear old queue and stop previous speaker immediately
       if (isPriorityPreempt) {
         rxAudioQueueRef.current = [];
+        isJitterBufferingRef.current = false;
+        if (jitterBufferTimerRef.current) {
+          window.clearTimeout(jitterBufferTimerRef.current);
+          jitterBufferTimerRef.current = null;
+        }
+        if (latePacketGraceTimerRef.current) {
+          window.clearTimeout(latePacketGraceTimerRef.current);
+          latePacketGraceTimerRef.current = null;
+        }
         if (activeWebAudioRxStopRef.current) {
           try {
             activeWebAudioRxStopRef.current();
@@ -1177,7 +1229,7 @@ export default function App() {
       }
 
       // Pre-decode the incoming Opus/WAV segment into a Web Audio API AudioBuffer immediately upon arrival
-      // so the Receiver Buffer Queue transitions between segments with 0ms decoding pause!
+      // while the segment rests inside the 100ms-200ms Adaptive Jitter Buffer so playback transitions with 0ms gap!
       const preDecodeCtx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
       if (preDecodeCtx) {
         audioCtxRef.current = preDecodeCtx;
@@ -1186,9 +1238,9 @@ export default function App() {
         ? preDecodeBase64AudioToBuffer(preDecodeCtx, base64Data)
         : undefined;
 
-      // Anti-backlog protection: prevent stale audio segments from piling up if network bursts occur
-      if (rxAudioQueueRef.current.length >= 8) {
-        rxAudioQueueRef.current.splice(0, rxAudioQueueRef.current.length - 5);
+      // Anti-backlog protection: prevent stale audio segments from piling up if extreme network bursts occur
+      if (rxAudioQueueRef.current.length >= 10) {
+        rxAudioQueueRef.current.splice(0, rxAudioQueueRef.current.length - 6);
       }
 
       // Enqueue the decrypted & pre-decoding audio segment so ongoing speech flows seamlessly without gaps!
@@ -1200,16 +1252,9 @@ export default function App() {
         decodedBufferPromise,
       });
 
-      // If the gapless player is already draining the queue, let it continue smoothly without interruption
-      if (isRxQueuePlayingRef.current) {
-        return;
-      }
-
-      isRxQueuePlayingRef.current = true;
-      playTacticalTone('rx');
-
       const finalizeQueueAndRestoreVox = (lastSpeaker: string) => {
         isRxQueuePlayingRef.current = false;
+        isJitterBufferingRef.current = false;
         activeWebAudioRxStopRef.current = null;
         // 800ms Acoustic Tail Guard so speaker room reflection completely decays before mic re-opens
         rxCooldownUntilRef.current = Date.now() + 800;
@@ -1258,6 +1303,7 @@ export default function App() {
         if (isTransmittingRef.current || isReceiverOffRef.current) {
           rxAudioQueueRef.current = [];
           isRxQueuePlayingRef.current = false;
+          isJitterBufferingRef.current = false;
           return;
         }
 
@@ -1281,7 +1327,7 @@ export default function App() {
         }
 
         setIncomingSpeaker(nextItem.senderCallsign);
-        rxCooldownUntilRef.current = Date.now() + 2600;
+        rxCooldownUntilRef.current = Date.now() + 2800;
 
         // Smooth adaptive catch-up rate if multiple segments arrived in a burst so latency never accumulates
         const remainingQueueDepth = rxAudioQueueRef.current.length;
@@ -1294,7 +1340,20 @@ export default function App() {
             // Immediately play next pre-decoded queued segment with zero gap and no extra beep!
             playNextSegmentInQueue();
           } else {
-            finalizeQueueAndRestoreVox(nextItem.senderCallsign);
+            // BANTALAN PENAMPUNG PAKET TERLAMBAT (LATE-PACKET JITTER CUSHION 165ms):
+            // Jika paket berikutnya sedang dalam perjalanan akibat sinyal buruk / jitter tinggi,
+            // tahan sesi RX selama 165ms agar aliran suara tidak terputus sebelum paket tiba!
+            if (latePacketGraceTimerRef.current) {
+              window.clearTimeout(latePacketGraceTimerRef.current);
+            }
+            latePacketGraceTimerRef.current = window.setTimeout(() => {
+              latePacketGraceTimerRef.current = null;
+              if (rxAudioQueueRef.current.length > 0) {
+                playNextSegmentInQueue();
+              } else {
+                finalizeQueueAndRestoreVox(nextItem.senderCallsign);
+              }
+            }, 165);
           }
         };
 
@@ -1302,6 +1361,7 @@ export default function App() {
           if (isTransmittingRef.current || isReceiverOffRef.current) {
             rxAudioQueueRef.current = [];
             isRxQueuePlayingRef.current = false;
+            isJitterBufferingRef.current = false;
             return;
           }
           try {
@@ -1345,6 +1405,7 @@ export default function App() {
           if (isTransmittingRef.current || isReceiverOffRef.current) {
             rxAudioQueueRef.current = [];
             isRxQueuePlayingRef.current = false;
+            isJitterBufferingRef.current = false;
             return;
           }
           const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
@@ -1372,9 +1433,37 @@ export default function App() {
         })();
       };
 
-      playNextSegmentInQueue();
+      // Jika sedang dalam masa tunggu paket terlambat (latePacketGraceTimerRef), segera lanjutkan pemutaran!
+      if (latePacketGraceTimerRef.current) {
+        window.clearTimeout(latePacketGraceTimerRef.current);
+        latePacketGraceTimerRef.current = null;
+        playNextSegmentInQueue();
+        return;
+      }
+
+      // Jika antrean pemutar atau Adaptive Jitter Buffer sudah berjalan, biarkan mengalir mulus tanpa interupsi
+      if (isRxQueuePlayingRef.current || isJitterBufferingRef.current) {
+        return;
+      }
+
+      // ADAPTIVE JITTER BUFFER (100ms - 200ms) SEBELUM PEMUTARAN SUARA DIMULAI:
+      // Menahan paket pertama selama 100ms-200ms sebagai bantalan penampung (cushion)
+      // sambil mendekode AudioBuffer di latar belakang agar aliran suara mulus tanpa putus-putus!
+      isRxQueuePlayingRef.current = true;
+      isJitterBufferingRef.current = true;
+      setIncomingSpeaker(senderCallsign);
+      playTacticalTone('rx');
+
+      if (jitterBufferTimerRef.current) {
+        window.clearTimeout(jitterBufferTimerRef.current);
+      }
+      jitterBufferTimerRef.current = window.setTimeout(() => {
+        jitterBufferTimerRef.current = null;
+        isJitterBufferingRef.current = false;
+        playNextSegmentInQueue();
+      }, adaptiveJitterBufferMs);
     },
-    [soundEnabled, playTacticalTone]
+    [soundEnabled, playTacticalTone, myDeviceId, setVoxInputLevel]
   );
 
   // Helper to check if an incoming transmission packet collides with an already-active channel lock holder
@@ -1436,6 +1525,65 @@ export default function App() {
     [channel, myDeviceId]
   );
 
+  // Helper untuk memancarkan ulang paket yang tertahan di Store-and-Forward Outbox saat sinyal pulih (Graceful Degradation)
+  const flushPendingOutboxPackets = useCallback(() => {
+    if (pendingOutboxQueueRef.current.length === 0) return;
+    const now = Date.now();
+    // Hanya kirim paket yang masih segar (< 15 detik) agar tidak memutar suara usang
+    const validQueue = pendingOutboxQueueRef.current.filter(
+      (item) => now - item.queuedAt <= 15000
+    );
+    pendingOutboxQueueRef.current = [];
+
+    for (const item of validQueue) {
+      let delivered = false;
+      peerConnectionsRef.current.forEach((conn) => {
+        if (conn && conn.open) {
+          try {
+            conn.send(item.packet);
+            delivered = true;
+          } catch {
+            // Ignore
+          }
+        }
+      });
+      offlineRtcChannelsRef.current.forEach((dc) => {
+        if (dc && dc.readyState === 'open') {
+          try {
+            dc.send(item.serialized);
+            delivered = true;
+          } catch {
+            // Ignore
+          }
+        }
+      });
+      if (
+        localHotspotWsRef.current &&
+        localHotspotWsRef.current.readyState === WebSocket.OPEN
+      ) {
+        try {
+          localHotspotWsRef.current.send(item.serialized);
+          delivered = true;
+        } catch {
+          // Ignore
+        }
+      }
+      mqttClientsRef.current.forEach((client) => {
+        if (client && client.connected) {
+          try {
+            client.publish(CLOUD_MESH_TOPIC, item.serialized, { qos: 0 });
+            delivered = true;
+          } catch {
+            // Ignore
+          }
+        }
+      });
+      if (!delivered && now - item.queuedAt <= 12000) {
+        pendingOutboxQueueRef.current.push(item);
+      }
+    }
+  }, []);
+
   // Send packet to all connected WebRTC peers + Offline Hotspot LAN DataChannels + Local Hotspot WS Hub + WSS Cloud Mesh + BroadcastChannel
   const broadcastMeshPacket = useCallback(
     (partial: Omit<MeshPacket, 'senderId' | 'callsign' | 'ip' | 'role' | 'channel' | 'timestamp'>) => {
@@ -1463,6 +1611,7 @@ export default function App() {
       };
 
       const serialized = JSON.stringify(fullPacket);
+      let anyNetworkDelivered = false;
 
       // 1. Local BroadcastChannel (instant same-device multi-tab sync)
       try {
@@ -1476,6 +1625,7 @@ export default function App() {
         if (conn && conn.open) {
           try {
             conn.send(fullPacket);
+            anyNetworkDelivered = true;
           } catch {
             // Ignore closed peer connection
           }
@@ -1487,6 +1637,7 @@ export default function App() {
         if (dc && dc.readyState === 'open') {
           try {
             dc.send(serialized);
+            anyNetworkDelivered = true;
           } catch {
             // Ignore closed offline DataChannel
           }
@@ -1500,6 +1651,7 @@ export default function App() {
       ) {
         try {
           localHotspotWsRef.current.send(serialized);
+          anyNetworkDelivered = true;
         } catch {
           // Ignore local WS send error
         }
@@ -1510,11 +1662,32 @@ export default function App() {
         if (client && client.connected) {
           try {
             client.publish(CLOUD_MESH_TOPIC, serialized, { qos: 0 });
+            anyNetworkDelivered = true;
           } catch {
             // Ignore publish error
           }
         }
       });
+
+      // GRACEFUL DEGRADATION STORE-AND-FORWARD:
+      // Jika sinyal internet / jaringan hilang sesaat saat mengirim paket penting (VOICE_CLIP / CHAT_MSG / LOCK),
+      // tampung di pendingOutboxQueueRef agar otomatis terkirim begitu koneksi tersambung kembali!
+      if (
+        !anyNetworkDelivered &&
+        (fullPacket.type === 'VOICE_CLIP' ||
+          fullPacket.type === 'CHAT_MSG' ||
+          fullPacket.type === 'CHANNEL_LOCK' ||
+          fullPacket.type === 'PRIORITY_OVERRIDE')
+      ) {
+        if (pendingOutboxQueueRef.current.length >= 16) {
+          pendingOutboxQueueRef.current.shift();
+        }
+        pendingOutboxQueueRef.current.push({
+          serialized,
+          packet: fullPacket,
+          queuedAt: Date.now(),
+        });
+      }
     },
     [myDeviceId, myCallsign, localIp, role, channel]
   );
@@ -1576,6 +1749,7 @@ export default function App() {
             // Ignore send error
           }
         }
+        flushPendingOutboxPackets();
       });
 
       conn.on('data', (data) => {
@@ -2396,6 +2570,7 @@ export default function App() {
                 // Ignore
               }
             }
+            flushPendingOutboxPackets();
           };
           ws.onmessage = (ev) => {
             if (isCancelled) return;
@@ -2436,7 +2611,7 @@ export default function App() {
       broadcastChannelRef.current = bc;
     }
 
-    // 2. Dual-Broker WSS Cloud Mesh (100% reliable on Vercel across all Android/iOS mobile carriers)
+    // 2. Dual-Broker WSS Cloud Mesh dengan Graceful Degradation (Auto-Reconnect cepat 1.5s & anti-timeout)
     const activeMqttClients: MqttClient[] = [];
     WSS_CLOUD_BROKERS.forEach((brokerUrl, idx) => {
       try {
@@ -2445,9 +2620,10 @@ export default function App() {
             .toString(36)
             .substring(2, 6)}`,
           clean: true,
-          keepalive: 30,
-          reconnectPeriod: 3500,
-          connectTimeout: 8000,
+          keepalive: 25,
+          reconnectPeriod: 1500,
+          connectTimeout: 12000,
+          resubscribe: true,
         });
 
         client.on('connect', () => {
@@ -2461,6 +2637,7 @@ export default function App() {
                 // Ignore publish error
               }
             }
+            flushPendingOutboxPackets();
           });
         });
 
@@ -2538,6 +2715,7 @@ export default function App() {
         activeBoundPeerIdRef.current = openedId;
         setActiveBoundPeerId((prev) => (prev === openedId ? prev : openedId));
         connectToMasterAndPeers(peer, openedId);
+        flushPendingOutboxPackets();
       });
 
       peer.on('connection', (conn) => {
@@ -2549,7 +2727,7 @@ export default function App() {
           try {
             peer.reconnect();
           } catch {
-            // 2.5s watchdog will retry
+            // Watchdog will retry automatically
           }
         }
       });
@@ -2571,7 +2749,7 @@ export default function App() {
           try {
             peer.reconnect();
           } catch {
-            // 2.5s watchdog will retry
+            // Watchdog will retry automatically
           }
         }
       });
@@ -2579,10 +2757,63 @@ export default function App() {
 
     initializePeerNode(boundId, isMasterRole);
 
-    // 4. 2.5-second Watchdog Interval + Stale Peer Pruner
+    // GRACEFUL DEGRADATION: Instant Zero-Delay Auto-Reconnect saat sinyal seluler / Wi-Fi kembali ("online" / network change)
+    const handleNetworkSignalRestored = () => {
+      if (isCancelled) return;
+      tryConnectLocalHotspotWsHub();
+      activeMqttClients.forEach((client) => {
+        if (client && !client.connected) {
+          try {
+            client.reconnect();
+          } catch {
+            // Ignore
+          }
+        }
+      });
+      if (currentPeer) {
+        if (currentPeer.destroyed) {
+          initializePeerNode(boundId, false);
+        } else if (currentPeer.disconnected) {
+          try {
+            currentPeer.reconnect();
+          } catch {
+            // Ignore
+          }
+        } else {
+          connectToMasterAndPeers(currentPeer, boundId);
+        }
+      }
+      const pkt = announcePacketBuilderRef.current();
+      if (pkt) {
+        broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
+      }
+      flushPendingOutboxPackets();
+    };
+
+    window.addEventListener('online', handleNetworkSignalRestored);
+    const navConn = (
+      navigator as Navigator & {
+        connection?: {
+          addEventListener?: (type: string, fn: () => void) => void;
+          removeEventListener?: (type: string, fn: () => void) => void;
+        };
+      }
+    ).connection;
+    navConn?.addEventListener?.('change', handleNetworkSignalRestored);
+
+    // 4. 2.0-second Watchdog Interval + Tolerant Peer Grace Window (45s anti-drop)
     const watchdogTimer = window.setInterval(() => {
       if (isCancelled) return;
       tryConnectLocalHotspotWsHub();
+      activeMqttClients.forEach((client) => {
+        if (client && !client.connected && !client.reconnecting) {
+          try {
+            client.reconnect();
+          } catch {
+            // Ignore
+          }
+        }
+      });
       if (currentPeer && currentPeer.disconnected && !currentPeer.destroyed) {
         try {
           currentPeer.reconnect();
@@ -2596,12 +2827,13 @@ export default function App() {
       if (isMasterRole) {
         broadcastPeerListSyncRef.current();
       }
+      flushPendingOutboxPackets();
 
-      // Prune peers that have neither an open WebRTC/Offline LAN DataChannel nor a recent ANNOUNCE (> 14s)
+      // Graceful Degradation: jangan memutus anggota saat sinyal hilang sesaat (toleransi 45 detik)
       const now = Date.now();
       if (
         channelLockOwnerRef.current &&
-        now - channelLockOwnerRef.current.updatedAt > 12000
+        now - channelLockOwnerRef.current.updatedAt > 14000
       ) {
         channelLockOwnerRef.current = null;
         setChannelLockOwner(null);
@@ -2619,12 +2851,12 @@ export default function App() {
             peerConnectionsRef.current.get(m.id)?.open ||
             anyOfflineDcOpen;
           const lastSeenTs = memberLastSeenMapRef.current.get(m.id) || m.lastSeen || now;
-          const recentlySeen = now - lastSeenTs < 14000;
-          return Boolean(hasOpenRtc || recentlySeen);
+          const withinGracePeriod = now - lastSeenTs < 45000;
+          return Boolean(hasOpenRtc || withinGracePeriod);
         });
         return filtered.length === prev.length ? prev : filtered;
       });
-    }, 2500);
+    }, 2000);
 
     // Send graceful PEER_LEAVE on tab/app close so other phones update immediately
     const handleBeforeUnload = () => {
@@ -2635,6 +2867,8 @@ export default function App() {
 
     return () => {
       isCancelled = true;
+      window.removeEventListener('online', handleNetworkSignalRestored);
+      navConn?.removeEventListener?.('change', handleNetworkSignalRestored);
       window.removeEventListener('beforeunload', handleBeforeUnload);
       window.removeEventListener('pagehide', handleBeforeUnload);
       window.clearInterval(watchdogTimer);
@@ -3303,9 +3537,9 @@ export default function App() {
               const segmentChunks: Blob[] = [];
               recordedChunksRef.current = segmentChunks;
 
-              // Optimasi Kompresi Opus Codec Bitrate Efisien (16 kbps - 24 kbps, default 20 kbps)
-              // Menghemat bandwidth secara maksimal tanpa mengurangi kejernihan vokal (250Hz-3.4kHz)
-              const targetBitrateBps = (opusBitrateKbpsRef.current || 20) * 1000;
+              // Optimasi Kompresi Opus Codec Bitrate Ekstrem (8 kbps - 12 kbps, max 12 kbps Narrowband/Wideband speech)
+              // Menghemat bandwidth secara ekstrem di kondisi internet buruk & packet loss tinggi
+              const targetBitrateBps = (opusBitrateKbpsRef.current || 12) * 1000;
               const { options: recorderOptions, negotiatedMime, timesliceMs } =
                 createOpusLowBitrateRecorderOptions(targetBitrateBps);
 
@@ -6663,18 +6897,18 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* Optimasi Pengkodean Audio Opus Codec Bitrate Efisien (16 kbps - 24 kbps) & Timeslice 45ms */}
+                        {/* Optimasi Ultra-Resilient: Opus Codec Max 12 kbps + FEC + DTX + Adaptive Jitter Buffer (100ms-200ms) */}
                         <div className="space-y-1.5 pt-2 border-t border-cyan-500/20">
                           <div className="flex items-center justify-between text-[11px]">
                             <span className="text-cyan-200">
-                              Opus Codec &amp; Timeslice Optimal (40ms–50ms)
+                              Ultra-Resilient Opus (FEC + DTX • Max 12 kbps)
                             </span>
                             <span className="text-[#23dcff] font-bold">
-                              {opusBitrateKbps} kbps • Timeslice {OPTIMAL_MEDIA_RECORDER_TIMESLICE_MS}ms
+                              {opusBitrateKbps} kbps • Jitter 100–200ms
                             </span>
                           </div>
                           <div className="grid grid-cols-3 gap-1.5">
-                            {([16, 20, 24] as const).map((kbps) => (
+                            {([8, 10, 12] as const).map((kbps) => (
                               <button
                                 key={kbps}
                                 type="button"
@@ -6690,7 +6924,7 @@ export default function App() {
                             ))}
                           </div>
                           <div className="text-[10px] text-cyan-200/80">
-                            Timeslice MediaRecorder disetel di <strong>45ms</strong> (rentang optimal 40ms–50ms) dengan kompresi Opus 16–24 kbps &amp; Pre-Decoded Receiver Buffer Queue agar suara mulus tanpa jeda menumpuk.
+                            SDP WebRTC dikunci ke <strong>useinbandfec=1</strong>, <strong>usedtx=1</strong>, &amp; <strong>maxaveragebitrate=12000</strong> (Max 12 kbps Narrowband/Wideband speech) + <strong>Adaptive Jitter Buffer (100ms–200ms)</strong> &amp; <strong>Auto-Reconnect Store-and-Forward</strong>.
                           </div>
                         </div>
                       </div>

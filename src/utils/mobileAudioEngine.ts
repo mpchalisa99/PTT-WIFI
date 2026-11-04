@@ -415,19 +415,20 @@ export function getSupportedAudioMimeType(): string {
 export const OPTIMAL_MEDIA_RECORDER_TIMESLICE_MS = 45;
 
 /**
- * Builds MediaRecorderOptions locked to Opus low-bitrate (16 kbps - 24 kbps, default 20 kbps)
- * to save maximum bandwidth while preserving human vocal clarity (300Hz - 3.4kHz) and keeping latency < 50ms.
+ * Builds MediaRecorderOptions locked to Ultra-Resilient Opus extreme low-bitrate
+ * (8 kbps - 12 kbps, max 12,000 bps Narrowband/Wideband speech)
+ * to survive very poor internet, tiny bandwidth, and high packet loss while keeping vocal clarity.
  */
 export function createOpusLowBitrateRecorderOptions(
-  targetBitrateBps = 20000
+  targetBitrateBps = 12000
 ): {
   options: MediaRecorderOptions;
   negotiatedMime: string;
   clampedBitrateBps: number;
   timesliceMs: number;
 } {
-  // Clamp strictly within the 16 kbps - 24 kbps tactical Opus voice band
-  const clampedBitrateBps = Math.max(16000, Math.min(24000, Math.round(targetBitrateBps)));
+  // Clamp strictly within the 8 kbps - 12 kbps (max 12,000 bps) extreme low-bandwidth speech band
+  const clampedBitrateBps = Math.max(8000, Math.min(12000, Math.round(targetBitrateBps)));
   const negotiatedMime = getSupportedAudioMimeType();
 
   const options: MediaRecorderOptions = {
@@ -447,16 +448,31 @@ export function createOpusLowBitrateRecorderOptions(
 }
 
 /**
- * Optimizes WebRTC SDP (Session Description Protocol) for Opus Codec Low-Bitrate (16 kbps - 24 kbps)
- * and Ultra-Low Latency (40ms-50ms buffer window via 20ms frame packetization, 10ms minptime, DTX, In-Band FEC, Mono VOIP).
+ * Optimizes WebRTC SDP (Session Description Protocol) for Ultra-Resilient Opus Codec:
+ * 1. Inband Forward Error Correction (FEC): `useinbandfec=1` (recovers lost packets under high packet loss)
+ * 2. Discontinuous Transmission (DTX): `usedtx=1` (suppresses packets during silence to save bandwidth)
+ * 3. Extreme Low Bitrate Cap: `maxaveragebitrate=12000` (max 12 kbps Narrowband/Wideband speech)
+ * 4. Narrowband/Wideband Speech Playback Rate: `maxplaybackrate=12000`, Mono (`stereo=0;sprop-stereo=0`), VBR (`cbr=0`).
  */
 export function optimizeWebRtcSdpForOpusLowLatency(
   sdp: string,
-  targetBitrateBps = 20000
+  targetBitrateBps = 12000
 ): string {
-  if (!sdp) return sdp;
-  const clampedBitrate = Math.max(16000, Math.min(24000, Math.round(targetBitrateBps)));
-  const opusFmtpParams = `minptime=10;ptime=20;maxptime=40;useinbandfec=1;usedtx=1;stereo=0;sprop-stereo=0;cbr=0;maxaveragebitrate=${clampedBitrate};maxplaybackrate=16000`;
+  if (!sdp || typeof sdp !== 'string') return sdp;
+  const clampedBitrate = Math.max(8000, Math.min(12000, Math.round(targetBitrateBps)));
+  const clampedKbps = Math.max(8, Math.round(clampedBitrate / 1000));
+  const opusFmtpParams: Record<string, string> = {
+    minptime: '10',
+    ptime: '20',
+    maxptime: '60',
+    useinbandfec: '1',
+    usedtx: '1',
+    stereo: '0',
+    'sprop-stereo': '0',
+    cbr: '0',
+    maxaveragebitrate: String(clampedBitrate),
+    maxplaybackrate: '12000',
+  };
 
   const lines = sdp.split(/\r?\n/);
   let opusPayloadType: string | null = null;
@@ -469,18 +485,50 @@ export function optimizeWebRtcSdpForOpusLowLatency(
     }
   }
 
+  // Always inject useinbandfec=1;usedtx=1;maxaveragebitrate=12000 into Opus fmtp or session-level attribute
+  const serializeFmtp = (existingParams?: string) => {
+    const merged: Record<string, string> = {};
+    if (existingParams) {
+      existingParams.split(';').forEach((pair) => {
+        const [k, v] = pair.split('=').map((s) => s.trim());
+        if (k && v !== undefined) {
+          merged[k] = v;
+        }
+      });
+    }
+    Object.assign(merged, opusFmtpParams);
+    return Object.entries(merged)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(';');
+  };
+
   if (!opusPayloadType) {
+    // Even for DataChannel-only or custom SDP profiles, append session-level Opus FEC/DTX/12kbps hint if not present
+    if (!sdp.includes('useinbandfec=1')) {
+      return (
+        sdp.replace(/\r?\n$/, '') +
+        `\r\na=fmtp:111 ${serializeFmtp()}\r\n`
+      );
+    }
     return sdp;
   }
 
   let fmtpUpdated = false;
-  const updatedLines = lines.map((line) => {
+  const updatedLines: string[] = [];
+
+  for (const line of lines) {
     if (line.startsWith(`a=fmtp:${opusPayloadType} `)) {
       fmtpUpdated = true;
-      return `a=fmtp:${opusPayloadType} ${opusFmtpParams}`;
+      const existing = line.slice(`a=fmtp:${opusPayloadType} `.length).trim();
+      updatedLines.push(`a=fmtp:${opusPayloadType} ${serializeFmtp(existing)}`);
+    } else {
+      updatedLines.push(line);
+      if (line.startsWith('m=audio ')) {
+        updatedLines.push(`b=AS:${clampedKbps}`);
+        updatedLines.push(`b=TIAS:${clampedBitrate}`);
+      }
     }
-    return line;
-  });
+  }
 
   if (!fmtpUpdated) {
     const rtpmapIdx = updatedLines.findIndex((l) =>
@@ -490,14 +538,70 @@ export function optimizeWebRtcSdpForOpusLowLatency(
       updatedLines.splice(
         rtpmapIdx + 1,
         0,
-        `a=fmtp:${opusPayloadType} ${opusFmtpParams}`,
+        `a=fmtp:${opusPayloadType} ${serializeFmtp()}`,
         'a=ptime:20',
-        'a=maxptime:40'
+        'a=maxptime:60'
       );
     }
   }
 
   return updatedLines.join('\r\n');
+}
+
+let isGlobalSdpPatchInstalled = false;
+let globalTargetOpusBitrateBps = 12000;
+
+/**
+ * Installs a transparent global RTCPeerConnection SDP interceptor so every WebRTC connection
+ * (including internal PeerJS connections and Offline Hotspot P2P connections) automatically
+ * enforces `useinbandfec=1`, `usedtx=1`, and `maxaveragebitrate=12000` (max 12 kbps).
+ */
+export function installGlobalWebRtcOpusSdpPatch(targetBitrateBps = 12000): void {
+  globalTargetOpusBitrateBps = Math.max(8000, Math.min(12000, Math.round(targetBitrateBps)));
+  if (isGlobalSdpPatchInstalled || typeof window === 'undefined') return;
+  const PeerConn =
+    window.RTCPeerConnection ||
+    (window as unknown as { webkitRTCPeerConnection?: typeof RTCPeerConnection })
+      .webkitRTCPeerConnection;
+  if (!PeerConn || !PeerConn.prototype) return;
+
+  isGlobalSdpPatchInstalled = true;
+
+  const origSetLocal = PeerConn.prototype.setLocalDescription;
+  if (typeof origSetLocal === 'function') {
+    PeerConn.prototype.setLocalDescription = function (
+      description?: RTCLocalSessionDescriptionInit
+    ): Promise<void> {
+      if (description && typeof description.sdp === 'string') {
+        description = {
+          ...description,
+          sdp: optimizeWebRtcSdpForOpusLowLatency(
+            description.sdp,
+            globalTargetOpusBitrateBps
+          ),
+        };
+      }
+      return origSetLocal.call(this, description as RTCLocalSessionDescriptionInit);
+    };
+  }
+
+  const origSetRemote = PeerConn.prototype.setRemoteDescription;
+  if (typeof origSetRemote === 'function') {
+    PeerConn.prototype.setRemoteDescription = function (
+      description: RTCSessionDescriptionInit
+    ): Promise<void> {
+      if (description && typeof description.sdp === 'string') {
+        description = {
+          ...description,
+          sdp: optimizeWebRtcSdpForOpusLowLatency(
+            description.sdp,
+            globalTargetOpusBitrateBps
+          ),
+        };
+      }
+      return origSetRemote.call(this, description);
+    };
+  }
 }
 
 /**
@@ -508,8 +612,8 @@ export function encodePcmChunksToWavBlob(
   chunks: Float32Array[],
   inputSampleRate: number
 ): Blob {
-  // Use 16000 Hz wideband vocal mono for compact bandwidth & crisp human speech reproduction (300Hz - 3.4kHz)
-  const targetRate = 16000;
+  // Use 12000 Hz narrowband/wideband speech mono for ultra-compact bandwidth & crisp human speech (300Hz - 3.4kHz)
+  const targetRate = 12000;
   const ratio = Math.max(1, inputSampleRate / targetRate);
   const totalInputSamples = chunks.reduce((acc, c) => acc + c.length, 0);
   const outputLength = Math.max(1, Math.floor(totalInputSamples / ratio));
