@@ -922,13 +922,40 @@ export async function playBase64AudioViaWebAudioFallback(
 }
 
 /**
- * Web Audio API Silent Audio Stream Keep-Alive Controller
- * Prevents Android (Chrome/HarmonyOS) and iOS (Safari) from freezing WebSockets, VOX timers,
- * and incoming RX voice playback when the screen is turned off or the phone is placed in a pocket (visibilitychange).
+ * SVG Artwork Data URI for Media Session API ("Music Player" Lockscreen & Notification Card)
+ * Ensures Android, iOS, and HarmonyOS classify the app as an active foreground Media Player like Spotify.
+ */
+export const TACTICAL_MEDIA_ARTWORK_URI =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+      <rect width="256" height="256" rx="36" fill="#021526"/>
+      <rect x="10" y="10" width="236" height="236" rx="28" fill="none" stroke="#23dcff" stroke-width="6"/>
+      <circle cx="128" cy="116" r="54" fill="#042440" stroke="#23dcff" stroke-width="5"/>
+      <circle cx="128" cy="116" r="22" fill="#23dcff"/>
+      <path d="M58 116 a70 70 0 0 1 140 0" fill="none" stroke="#23dcff" stroke-width="4" stroke-dasharray="8 6"/>
+      <text x="128" y="212" text-anchor="middle" fill="#e9fcff" font-family="monospace" font-weight="bold" font-size="22">NET-COMM PTT</text>
+    </svg>`
+  );
+
+export interface MediaSessionStatusPayload {
+  callsign?: string;
+  channel?: number;
+  statusText?: string;
+  onTogglePtt?: () => void;
+  onToggleVox?: () => void;
+}
+
+/**
+ * Web Audio API + HTML5 <audio loop> Silent Audio Stream & Media Session API Keep-Alive Controller
+ * Prevents Android (Chrome/HarmonyOS) and iOS (Safari) from freezing WebSockets, microphone streams,
+ * VOX timers, and incoming RX voice playback when the browser is minimized or the screen is off.
  */
 export interface SilentKeepAliveSession {
   start: (ctx: AudioContext) => void;
   pulseOnVisibilityChange: (ctx: AudioContext, isHidden: boolean) => void;
+  attachDomAudioElement: (el: HTMLAudioElement | null) => void;
+  updateMediaSessionMetadata: (payload: MediaSessionStatusPayload) => void;
   stop: () => void;
   isActive: () => boolean;
 }
@@ -938,70 +965,204 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
   let bufferSourceNode: AudioBufferSourceNode | null = null;
   let silentGainNode: GainNode | null = null;
   let keepAliveAudioEl: HTMLAudioElement | null = null;
+  let domAudioEl: HTMLAudioElement | null = null;
   let active = false;
+  let lastMetadataPayload: MediaSessionStatusPayload = {
+    callsign: 'UNIT',
+    channel: 1,
+    statusText: 'VOX & PTT SIAGA AKTIF',
+  };
+
+  const applyMediaSessionPlayerState = (payload?: MediaSessionStatusPayload) => {
+    if (payload) {
+      lastMetadataPayload = { ...lastMetadataPayload, ...payload };
+    }
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator) || !navigator.mediaSession) {
+      return;
+    }
+    try {
+      const chStr = String(lastMetadataPayload.channel ?? 1).padStart(2, '0');
+      const unitStr = lastMetadataPayload.callsign || 'UNIT';
+      const statusStr = lastMetadataPayload.statusText || 'SIAGA LATAR BELAKANG';
+
+      if (typeof MediaMetadata !== 'undefined') {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: `CH ${chStr} • ${statusStr}`,
+          artist: `${unitStr} • TACTICAL NET-COMM SUBDISRUDAL`,
+          album: 'Radio PTT & VOX Active Stream (Anti-Suspend)',
+          artwork: [
+            {
+              src: TACTICAL_MEDIA_ARTWORK_URI,
+              sizes: '256x256',
+              type: 'image/svg+xml',
+            },
+          ],
+        });
+      }
+      navigator.mediaSession.playbackState = 'playing';
+
+      if (typeof navigator.mediaSession.setPositionState === 'function') {
+        try {
+          navigator.mediaSession.setPositionState({
+            duration: 3600,
+            playbackRate: 1.0,
+            position: Math.floor((Date.now() / 1000) % 3590),
+          });
+        } catch {
+          // Ignore position state errors on older WebViews
+        }
+      }
+
+      const resumeSilentLoops = () => {
+        if (domAudioEl && domAudioEl.paused) {
+          domAudioEl.play().catch(() => {});
+        }
+        if (keepAliveAudioEl && keepAliveAudioEl.paused) {
+          keepAliveAudioEl.play().catch(() => {});
+        }
+        try {
+          navigator.mediaSession.playbackState = 'playing';
+        } catch {
+          // Ignore
+        }
+      };
+
+      const actionHandlers: Array<[MediaSessionAction, MediaSessionActionHandler]> = [
+        [
+          'play',
+          () => {
+            resumeSilentLoops();
+            lastMetadataPayload.onTogglePtt?.();
+          },
+        ],
+        [
+          'pause',
+          () => {
+            // Never allow OS media controls to suspend the silent loop; keep playing and toggle PTT
+            resumeSilentLoops();
+            lastMetadataPayload.onTogglePtt?.();
+          },
+        ],
+        [
+          'stop',
+          () => {
+            resumeSilentLoops();
+          },
+        ],
+        [
+          'previoustrack',
+          () => {
+            resumeSilentLoops();
+            lastMetadataPayload.onToggleVox?.();
+          },
+        ],
+        [
+          'nexttrack',
+          () => {
+            resumeSilentLoops();
+            lastMetadataPayload.onTogglePtt?.();
+          },
+        ],
+      ];
+
+      for (const [action, handler] of actionHandlers) {
+        try {
+          navigator.mediaSession.setActionHandler(action, handler);
+        } catch {
+          // Ignore unsupported mediaSession action on specific browser
+        }
+      }
+    } catch {
+      // Ignore MediaSession error
+    }
+  };
 
   const ensureHtmlAudioLoop = (ctx: AudioContext) => {
     try {
+      // 1. Ensure attached DOM <audio loop> element is continuously playing SILENT_WAV_DATA_URI
+      if (domAudioEl) {
+        domAudioEl.loop = true;
+        domAudioEl.volume = 0.02;
+        if (!domAudioEl.src) {
+          domAudioEl.src = SILENT_WAV_DATA_URI;
+        }
+        if (domAudioEl.paused) {
+          domAudioEl.play().catch(() => {});
+        }
+      }
+
+      // 2. Ensure programmatic <audio loop> fallback is also running
       if (!keepAliveAudioEl) {
         const el = new Audio();
         el.setAttribute('playsinline', 'true');
         el.setAttribute('webkit-playsinline', 'true');
         el.loop = true;
-        el.volume = 0.01; // Near-zero volume on already silent +/-1 LSB WAV
+        el.volume = 0.02; // Near-zero volume on already silent +/-1 LSB WAV
+        el.src = SILENT_WAV_DATA_URI;
 
-        // If MediaStreamAudioDestinationNode is supported, pipe Web Audio silent stream into <audio>
-        let boundMediaStream = false;
-        if (typeof ctx.createMediaStreamDestination === 'function') {
-          try {
-            const dest = ctx.createMediaStreamDestination();
-            if (silentGainNode) {
-              silentGainNode.connect(dest);
-            }
-            el.srcObject = dest.stream;
-            boundMediaStream = true;
-          } catch {
-            boundMediaStream = false;
+        // Auto-restart immediately if mobile OS tries to pause the silent audio loop in background
+        el.onpause = () => {
+          if (active && el.paused) {
+            el.play().catch(() => {});
           }
-        }
-        if (!boundMediaStream) {
-          el.src = SILENT_WAV_DATA_URI;
-        }
+        };
+        el.onended = () => {
+          if (active) {
+            el.currentTime = 0;
+            el.play().catch(() => {});
+          }
+        };
         keepAliveAudioEl = el;
       }
 
       if (keepAliveAudioEl.paused) {
         keepAliveAudioEl.play().catch(() => {
-          // Fallback to static silent WAV if srcObject play failed on Safari
-          if (keepAliveAudioEl && keepAliveAudioEl.srcObject) {
-            keepAliveAudioEl.srcObject = null;
+          if (keepAliveAudioEl) {
             keepAliveAudioEl.src = SILENT_WAV_DATA_URI;
             keepAliveAudioEl.play().catch(() => {});
           }
         });
       }
 
-      // Register MediaSession metadata so Android/iOS/HarmonyOS lockscreen treats app as active radio receiver
-      if ('mediaSession' in navigator && navigator.mediaSession) {
-        try {
-          if (typeof MediaMetadata !== 'undefined') {
-            navigator.mediaSession.metadata = new MediaMetadata({
-              title: 'TACTICAL NET-COMM SUBDISRUDAL',
-              artist: 'Keep-Alive Saluran Radio Aktif',
-              album: 'PTT & VOX Siaga Latar Belakang',
-            });
-          }
-          navigator.mediaSession.playbackState = 'playing';
-        } catch {
-          // Ignore MediaSession error
-        }
-      }
+      // 3. Register MediaSession metadata & action handlers so OS treats app as active Music Player (like Spotify)
+      applyMediaSessionPlayerState();
     } catch {
       // Ignore HTML audio loop error
     }
   };
 
+  const attachDomAudioElement = (el: HTMLAudioElement | null) => {
+    domAudioEl = el;
+    if (!el) return;
+    try {
+      el.loop = true;
+      el.volume = 0.02;
+      if (!el.src) {
+        el.src = SILENT_WAV_DATA_URI;
+      }
+      el.onpause = () => {
+        if (active && el.paused) {
+          el.play().catch(() => {});
+          applyMediaSessionPlayerState();
+        }
+      };
+      el.onended = () => {
+        if (active) {
+          el.currentTime = 0;
+          el.play().catch(() => {});
+        }
+      };
+      if (active && el.paused) {
+        el.play().catch(() => {});
+      }
+    } catch {
+      // Ignore DOM audio element setup error
+    }
+  };
+
   const start = (ctx: AudioContext) => {
     try {
+      active = true;
       const st = ctx.state as string;
       if (st === 'suspended' || st === 'interrupted') {
         ctx.resume().catch(() => {});
@@ -1042,7 +1203,6 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
       }
 
       ensureHtmlAudioLoop(ctx);
-      active = true;
     } catch {
       // Ignore keep-alive start error
     }
@@ -1050,7 +1210,7 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
 
   const pulseOnVisibilityChange = (ctx: AudioContext, isHidden: boolean) => {
     try {
-      // Ensure Web Audio Silent Stream is running before & during background transition
+      // Ensure Web Audio Silent Stream + DOM <audio loop> are running before & during background transition
       start(ctx);
       const st = ctx.state as string;
       if (st === 'suspended' || st === 'interrupted') {
@@ -1094,6 +1254,14 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
     }
     silentGainNode = null;
 
+    if (domAudioEl) {
+      try {
+        domAudioEl.pause();
+      } catch {
+        // Ignore
+      }
+    }
+
     if (keepAliveAudioEl) {
       try {
         keepAliveAudioEl.pause();
@@ -1109,6 +1277,8 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
   return {
     start,
     pulseOnVisibilityChange,
+    attachDomAudioElement,
+    updateMediaSessionMetadata: applyMediaSessionPlayerState,
     stop,
     isActive: () => active,
   };

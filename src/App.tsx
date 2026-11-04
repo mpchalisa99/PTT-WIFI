@@ -47,6 +47,7 @@ import {
   gatherLocalIceCandidatesExplicit,
 } from './utils/offlineHotspotWebRTC';
 import {
+  SILENT_WAV_DATA_URI,
   detectMobileAudioPlatform,
   getOrCreateCompatibleAudioContext,
   unlockMobileAudioSession,
@@ -647,13 +648,20 @@ export default function App() {
   });
   const [, setIsSilentKeepAliveRunning] = useState<boolean>(false);
   const [isBackgroundMode, setIsBackgroundMode] = useState<boolean>(false);
-  // Mode Minimasi (Floating Mini Button / Background Mode tanpa memutus WebSocket & Web Audio API)
+  // Mode Minimasi (Picture-in-Picture Floating Video Widget + Media Session API Silent Audio Loop)
   const [isMinimizedMode, setIsMinimizedMode] = useState<boolean>(false);
   const isMinimizedModeRef = useRef<boolean>(false);
+  const [isPipFloatingActive, setIsPipFloatingActive] = useState<boolean>(false);
+  const [isMediaSessionActive, setIsMediaSessionActive] = useState<boolean>(false);
   const [isWakeLockActive, setIsWakeLockActive] = useState<boolean>(false);
   const [isSwKeepAliveActive, setIsSwKeepAliveActive] = useState<boolean>(false);
   const keepAliveEnabledRef = useRef<boolean>(keepAliveEnabled);
   const keepAliveSessionRef = useRef<SilentKeepAliveSession | null>(null);
+  // Refs untuk Teknik Bypass 1 (PiP Canvas -> Video Floating Widget) & Teknik Bypass 2 (<audio loop> Silent Loop)
+  const pipCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pipVideoRef = useRef<HTMLVideoElement | null>(null);
+  const pipStreamRef = useRef<MediaStream | null>(null);
+  const silentLoopAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // VOX (Voice Activity Detection) Hands-Free Web Audio API states (Kalibrasi Seimbang 18% - 22%)
   // Ambang batas default disetel seimbang di 20% (kisaran 18% - 22%): cukup kuat meredam bising latar rendah namun responsif terhadap vokal.
@@ -3170,19 +3178,42 @@ export default function App() {
       keepAliveSessionRef.current = createSilentKeepAliveController();
     }
     const controller = keepAliveSessionRef.current;
+    controller.attachDomAudioElement(silentLoopAudioRef.current);
     let backgroundSocketHeartbeat: number | null = null;
+
+    const getMediaSessionStatusText = () => {
+      if (isTransmittingRef.current) return 'TX MENGIRIM SUARA (ON AIR)';
+      if (remoteActiveTxRef.current) return `RX: ${remoteActiveTxRef.current}`;
+      if (voxEnabledRef.current) return `VOX SIAGA (THR ${voxThresholdRef.current}%)`;
+      return 'STANDBY MANUAL PTT';
+    };
 
     const syncKeepAliveState = () => {
       if (!keepAliveEnabled) {
         controller.stop();
         setIsSilentKeepAliveRunning(false);
+        setIsMediaSessionActive(false);
         return;
+      }
+      controller.attachDomAudioElement(silentLoopAudioRef.current);
+      if (silentLoopAudioRef.current) {
+        silentLoopAudioRef.current.loop = true;
+        silentLoopAudioRef.current.volume = 0.02;
+        if (silentLoopAudioRef.current.paused) {
+          silentLoopAudioRef.current.play().catch(() => {});
+        }
       }
       const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
       if (ctx) {
         audioCtxRef.current = ctx;
         controller.start(ctx);
+        controller.updateMediaSessionMetadata({
+          callsign: myCallsign || 'UNIT',
+          channel,
+          statusText: getMediaSessionStatusText(),
+        });
         setIsSilentKeepAliveRunning(controller.isActive());
+        setIsMediaSessionActive(true);
       }
     };
 
@@ -3192,12 +3223,26 @@ export default function App() {
       const isHidden = document.visibilityState === 'hidden' || document.hidden;
       setIsBackgroundMode((prev) => (prev === isHidden ? prev : isHidden));
 
+      if (keepAliveEnabledRef.current && silentLoopAudioRef.current) {
+        silentLoopAudioRef.current.loop = true;
+        if (silentLoopAudioRef.current.paused) {
+          silentLoopAudioRef.current.play().catch(() => {});
+        }
+      }
+
       const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
       if (ctx) {
         audioCtxRef.current = ctx;
         if (keepAliveEnabledRef.current) {
+          controller.attachDomAudioElement(silentLoopAudioRef.current);
           controller.pulseOnVisibilityChange(ctx, isHidden);
+          controller.updateMediaSessionMetadata({
+            callsign: myCallsign || 'UNIT',
+            channel,
+            statusText: getMediaSessionStatusText(),
+          });
           setIsSilentKeepAliveRunning((prev) => (prev ? prev : true));
+          setIsMediaSessionActive((prev) => (prev ? prev : true));
         }
       }
 
@@ -4182,31 +4227,307 @@ export default function App() {
     }
   };
 
-  // Masuk ke Mode Minimasi (Floating Mini Button / Background Mode) tanpa memutus WebSocket & Web Audio API
-  const handleEnterMinimizedMode = useCallback(() => {
+  // =========================================================================
+  // TEKNIK BYPASS 1 & 2:
+  // 1. Picture-in-Picture (PiP) Video Hack dari <canvas> Real-Time (Status PTT & Indikator Mic)
+  // 2. Media Session API ("Pemutar Musik" Aktif) & Continuous Silent Audio Loop (<audio loop>)
+  // =========================================================================
+  const drawTacticalPipCanvasFrame = useCallback(() => {
+    const canvas = pipCanvasRef.current;
+    if (!canvas) return;
+    const ctx2d = canvas.getContext('2d');
+    if (!ctx2d) return;
+
+    const w = canvas.width; // 160px (Ultra-Compact Micro PiP)
+    const h = canvas.height; // 84px (Ultra-Compact Micro PiP)
+    const meterSnap = liveAudioMeterStore.getSnapshot();
+    const isTx = isTransmittingRef.current;
+    const rxSpeaker =
+      remoteActiveTxRef.current ||
+      (channelLockOwnerRef.current &&
+      channelLockOwnerRef.current.ownerId !== myDeviceId
+        ? channelLockOwnerRef.current.ownerCallsign
+        : null);
+    const isVox = voxEnabledRef.current;
+    const thr = voxThresholdRef.current;
+    const liveLevel = Math.min(
+      100,
+      Math.max(
+        0,
+        Math.round(isTx ? Math.max(meterSnap.micLevel, meterSnap.voxInputLevel) : meterSnap.voxInputLevel)
+      )
+    );
+
+    // 1. Background Navy Taktis Ultra-Ringkas
+    ctx2d.fillStyle = '#021526';
+    ctx2d.fillRect(0, 0, w, h);
+
+    // 2. Bingkai Tipis Status Warna Dinamis (Hijau saat TX, Amber saat RX, Cyan saat Siaga)
+    const accentColor = isTx ? '#10b981' : rxSpeaker ? '#f59e0b' : '#23dcff';
+    ctx2d.strokeStyle = accentColor;
+    ctx2d.lineWidth = 2;
+    ctx2d.strokeRect(1.5, 1.5, w - 3, h - 3);
+
+    // 3. Baris Atas Mikro (Channel & Callsign Singkat)
+    ctx2d.fillStyle = '#042440';
+    ctx2d.fillRect(4, 4, w - 8, 18);
+    ctx2d.fillStyle = '#23dcff';
+    ctx2d.font = 'bold 9.5px monospace';
+    ctx2d.fillText(
+      `CH${String(channel).padStart(2, '0')}•${(myCallsign || 'UNIT').slice(0, 8)}`,
+      8,
+      16
+    );
+
+    ctx2d.fillStyle = '#67e8f9';
+    ctx2d.font = 'bold 8.5px monospace';
+    ctx2d.textAlign = 'right';
+    ctx2d.fillText(isVox ? `VOX ${thr}%` : 'PTT', w - 8, 16);
+    ctx2d.textAlign = 'left';
+
+    // 4. Baris Tengah: Indikator Status Utama (TX / RX / SIAGA)
+    ctx2d.fillStyle = isTx
+      ? 'rgba(16, 185, 129, 0.25)'
+      : rxSpeaker
+      ? 'rgba(245, 158, 11, 0.25)'
+      : 'rgba(6, 50, 86, 0.7)';
+    ctx2d.fillRect(5, 25, w - 10, 26);
+    ctx2d.strokeStyle = accentColor;
+    ctx2d.lineWidth = 1;
+    ctx2d.strokeRect(5, 25, w - 10, 26);
+
+    // Titik LED Status
+    ctx2d.beginPath();
+    ctx2d.arc(15, 38, 4.5, 0, Math.PI * 2);
+    ctx2d.fillStyle = accentColor;
+    ctx2d.fill();
+
+    ctx2d.fillStyle = '#ffffff';
+    ctx2d.font = 'bold 11px sans-serif';
+    const primaryStatus = isTx
+      ? 'TX: KIRIM SUARA'
+      : rxSpeaker
+      ? `RX: ${rxSpeaker.slice(0, 9)}`
+      : isVox
+      ? 'VOX SIAGA AKTIF'
+      : 'STANDBY SIAGA';
+    ctx2d.fillText(primaryStatus, 24, 42);
+
+    // 5. Baris Bawah: Micro Bar Level Mic / VOX + Penanda Threshold (THR)
+    const barX = 6;
+    const barY = 56;
+    const barW = w - 44;
+    const barH = 12;
+    ctx2d.fillStyle = '#010b14';
+    ctx2d.fillRect(barX, barY, barW, barH);
+    ctx2d.strokeStyle = 'rgba(35, 220, 255, 0.45)';
+    ctx2d.lineWidth = 1;
+    ctx2d.strokeRect(barX, barY, barW, barH);
+
+    const segments = 14;
+    const segGap = 1.5;
+    const segW = (barW - (segments + 1) * segGap) / segments;
+    const activeSegments = Math.round((liveLevel / 100) * segments);
+    for (let i = 0; i < segments; i++) {
+      const sx = barX + segGap + i * (segW + segGap);
+      const pct = ((i + 1) / segments) * 100;
+      if (i < activeSegments) {
+        ctx2d.fillStyle =
+          pct >= thr
+            ? isTx
+              ? '#10b981'
+              : '#23dcff'
+            : '#0284c7';
+      } else {
+        ctx2d.fillStyle = 'rgba(14, 58, 92, 0.5)';
+      }
+      ctx2d.fillRect(sx, barY + 2, segW, barH - 4);
+    }
+
+    // Garis Penanda Threshold (THR) pada Micro Bar
+    const thrX = barX + Math.min(barW - 1.5, Math.max(1.5, (thr / 100) * barW));
+    ctx2d.strokeStyle = '#facc15';
+    ctx2d.lineWidth = 1.5;
+    ctx2d.beginPath();
+    ctx2d.moveTo(thrX, barY - 1);
+    ctx2d.lineTo(thrX, barY + barH + 1);
+    ctx2d.stroke();
+
+    // Angka Persentase Level Mic di Samping Kanan Bar
+    ctx2d.fillStyle = '#e0f2fe';
+    ctx2d.font = 'bold 9px monospace';
+    ctx2d.textAlign = 'right';
+    ctx2d.fillText(`${liveLevel}%`, w - 6, 65);
+    ctx2d.textAlign = 'left';
+
+    // 6. Status Mikro Anti-Suspend di Paling Bawah
+    ctx2d.fillStyle = '#67e8f9';
+    ctx2d.font = 'bold 7.5px monospace';
+    ctx2d.fillText('BG KEEP-ALIVE • OPUS 12K', 6, h - 5);
+  }, [channel, myCallsign, myDeviceId]);
+
+  // Loop penggambaran <canvas> hemat daya (125ms / 8 FPS + Worker Tick) tanpa memicu React re-render
+  useEffect(() => {
+    if (!isPasscodeAuthenticated || !isSetupCompleted) return;
+    drawTacticalPipCanvasFrame();
+
+    const intervalId = window.setInterval(() => {
+      drawTacticalPipCanvasFrame();
+    }, 125);
+
+    const unsubscribeWorker = subscribeToBackgroundWorkerTicks({
+      onVoxTick: () => {
+        drawTacticalPipCanvasFrame();
+      },
+    });
+
+    return () => {
+      window.clearInterval(intervalId);
+      unsubscribeWorker();
+    };
+  }, [isPasscodeAuthenticated, isSetupCompleted, drawTacticalPipCanvasFrame]);
+
+  // Sinkronisasi event enterpictureinpicture / leavepictureinpicture pada elemen <video> tersembunyi
+  useEffect(() => {
+    const videoEl = pipVideoRef.current;
+    if (!videoEl) return;
+
+    const handleEnterPip = () => {
+      setIsPipFloatingActive(true);
+    };
+    const handleLeavePip = () => {
+      setIsPipFloatingActive(false);
+    };
+
+    videoEl.addEventListener('enterpictureinpicture', handleEnterPip);
+    videoEl.addEventListener('leavepictureinpicture', handleLeavePip);
+    return () => {
+      videoEl.removeEventListener('enterpictureinpicture', handleEnterPip);
+      videoEl.removeEventListener('leavepictureinpicture', handleLeavePip);
+    };
+  }, [isPasscodeAuthenticated, isSetupCompleted]);
+
+  // Fungsi untuk menyiapkan aliran <canvas> ke <video> dan memanggil video.requestPictureInPicture()
+  const requestFloatingPipWidget = useCallback(async (): Promise<boolean> => {
+    try {
+      drawTacticalPipCanvasFrame();
+      const canvas = pipCanvasRef.current;
+      const video = pipVideoRef.current;
+      if (!canvas || !video) return false;
+
+      if (!pipStreamRef.current && typeof canvas.captureStream === 'function') {
+        pipStreamRef.current = canvas.captureStream(12);
+      }
+      if (pipStreamRef.current && video.srcObject !== pipStreamRef.current) {
+        video.srcObject = pipStreamRef.current;
+      }
+
+      video.muted = true;
+      video.playsInline = true;
+      await video.play().catch(() => {});
+
+      // Standar W3C Picture-in-Picture API (Chrome Android / Desktop / WebView)
+      if (
+        typeof document !== 'undefined' &&
+        'pictureInPictureEnabled' in document &&
+        typeof video.requestPictureInPicture === 'function'
+      ) {
+        if (document.pictureInPictureElement !== video) {
+          await video.requestPictureInPicture();
+        }
+        setIsPipFloatingActive(true);
+        return true;
+      }
+
+      // Fallback Safari iOS Picture-in-Picture API
+      const webkitVideo = video as HTMLVideoElement & {
+        webkitSupportsPresentationMode?: (mode: string) => boolean;
+        webkitSetPresentationMode?: (mode: string) => void;
+      };
+      if (
+        typeof webkitVideo.webkitSupportsPresentationMode === 'function' &&
+        webkitVideo.webkitSupportsPresentationMode('picture-in-picture') &&
+        typeof webkitVideo.webkitSetPresentationMode === 'function'
+      ) {
+        webkitVideo.webkitSetPresentationMode('picture-in-picture');
+        setIsPipFloatingActive(true);
+        return true;
+      }
+    } catch {
+      // Jika PiP ditolak oleh kebijakan iframe/OS, antarmuka tetap berjalan di mode minimasi & MediaSession aktif
+    }
+    return false;
+  }, [drawTacticalPipCanvasFrame]);
+
+  // Masuk ke Mode Minimasi (Memicu Picture-in-Picture Floating Video Widget + Media Session API + Silent Audio Loop)
+  const handleEnterMinimizedMode = useCallback(async () => {
     setIsMinimizedMode(true);
     isMinimizedModeRef.current = true;
+
+    // 1. Putar terus-menerus file audio kosong (<audio loop>) agar browser tidak di-suspend OS
+    if (silentLoopAudioRef.current) {
+      silentLoopAudioRef.current.loop = true;
+      silentLoopAudioRef.current.volume = 0.02;
+      silentLoopAudioRef.current.play().catch(() => {});
+    }
+
+    // 2. Aktifkan Media Session API ("Pemutar Musik" seperti Spotify) + Web Audio Silent Stream
     const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
     if (ctx) {
       audioCtxRef.current = ctx;
       if (!keepAliveSessionRef.current) {
         keepAliveSessionRef.current = createSilentKeepAliveController();
       }
+      keepAliveSessionRef.current.attachDomAudioElement(silentLoopAudioRef.current);
       keepAliveSessionRef.current.pulseOnVisibilityChange(ctx, true);
-      setIsSilentKeepAliveRunning((prev) => (prev ? prev : true));
+      keepAliveSessionRef.current.updateMediaSessionMetadata({
+        callsign: myCallsign || 'UNIT',
+        channel,
+        statusText: isTransmittingRef.current
+          ? 'TX MENGIRIM SUARA'
+          : voxEnabledRef.current
+          ? `VOX SIAGA (THR ${voxThresholdRef.current}%)`
+          : 'PTT SIAGA LATAR BELAKANG',
+        onTogglePtt: () => {
+          if (isTransmittingRef.current) {
+            onStopTransmitRef.current();
+          } else {
+            onStartTransmitRef.current('MANUAL');
+          }
+        },
+        onToggleVox: () => {
+          handleToggleVoxSwitch();
+        },
+      });
+      setIsSilentKeepAliveRunning(true);
+      setIsMediaSessionActive(true);
     }
+
+    // 3. Panggil video.requestPictureInPicture() agar widget melayang di atas aplikasi lain di luar browser
+    await requestFloatingPipWidget();
+
     sendServiceWorkerKeepAlivePing({
       callsign: myCallsign || 'UNIT',
       channel,
       minimized: true,
       voxEnabled: voxEnabledRef.current,
     });
-  }, [myCallsign, channel]);
+  }, [myCallsign, channel, requestFloatingPipWidget, handleToggleVoxSwitch]);
 
-  // Pulihkan Antarmuka Utama dari Mode Mini (Restore Full Interface)
-  const handleRestoreFromMinimizedMode = useCallback(() => {
+  // Pulihkan Antarmuka Utama dari Mode Mini (Restore Full Interface & keluar dari PiP jika aktif)
+  const handleRestoreFromMinimizedMode = useCallback(async () => {
     setIsMinimizedMode(false);
     isMinimizedModeRef.current = false;
+
+    try {
+      if (typeof document !== 'undefined' && document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      }
+    } catch {
+      // Ignore exitPiP error
+    }
+    setIsPipFloatingActive(false);
+
     const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
     if (ctx) {
       audioCtxRef.current = ctx;
@@ -5368,103 +5689,111 @@ export default function App() {
   return (
     <div className="h-[100dvh] max-h-[100dvh] w-full bg-[#021322] text-[#e5faff] flex flex-col items-center justify-center overflow-hidden select-none relative">
       {/* =====================================================================
-          MODE MINIMASI (FLOATING MINI BUTTON & BACKGROUND KEEP-ALIVE WIDGET)
-          Ketika diminimalkan, antarmuka utama disembunyikan tanpa memutus WebSocket,
-          WebRTC, maupun Web Audio API VOX. Klik tombol melayang untuk Restore penuh!
-         ===================================================================== */}
+          ELEMEN TERSEMBUNYI UNTUK 2 TEKNIK BYPASS BACKGROUND OS SELULER:
+          1. <canvas> + <video> tersembunyi untuk Picture-in-Picture (PiP) Floating Widget
+          2. <audio loop> tersembunyi yang memutar file audio kosong (Silent Loop) non-stop
+          ===================================================================== */}
+      <canvas
+        ref={pipCanvasRef}
+        width={160}
+        height={84}
+        aria-hidden="true"
+        className="fixed -left-[9999px] -top-[9999px] w-[160px] h-[84px] opacity-0 pointer-events-none"
+      />
+      <video
+        ref={pipVideoRef}
+        width={120}
+        height={63}
+        muted
+        playsInline
+        autoPlay
+        aria-hidden="true"
+        className="fixed -left-[9999px] -top-[9999px] w-[120px] h-[63px] opacity-0 pointer-events-none"
+      />
+      <audio
+        ref={silentLoopAudioRef}
+        src={SILENT_WAV_DATA_URI}
+        loop
+        playsInline
+        preload="auto"
+        aria-hidden="true"
+        className="fixed -left-[9999px] -top-[9999px] opacity-0 pointer-events-none"
+      />
+
+      {/* =====================================================================
+          MODE MINIMASI ULTRA-KECIL (MICRO FLOATING WIDGET & PIP BYPASS)
+          Ukuran sangat kecil di sudut kanan bawah (hanya kapsul mikro ~190x36px)
+          agar sama sekali tidak menghalangi atau mengganggu aplikasi lain.
+          ===================================================================== */}
       {isMinimizedMode && (
-        <div className="fixed inset-0 z-50 bg-[#010b14]/95 tactical-grid-bg flex flex-col justify-between p-4">
-          {/* Status Background Keep-Alive di Bagian Atas */}
-          <div className="tactical-panel rounded-2xl p-3.5 border border-[#23dcff]/60 flex items-center justify-between gap-2 shadow-[0_0_25px_rgba(35,220,255,0.2)]">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-9 h-9 rounded-xl bg-[#042440] border border-[#23dcff] flex items-center justify-center shrink-0">
-                <Shield className="w-5 h-5 text-[#23dcff]" />
+        <div className="fixed bottom-2.5 right-2.5 z-50 pointer-events-auto">
+          <div className="tactical-panel rounded-full px-2.5 py-1 border border-[#23dcff] shadow-[0_0_14px_rgba(35,220,255,0.35)] flex items-center gap-1.5 bg-[#021526]/95 backdrop-blur-xs max-w-[215px]">
+            {/* Indikator Status & Level Mic Super Ringkas (Klik untuk Buka Kembali) */}
+            <div
+              onClick={handleRestoreFromMinimizedMode}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') handleRestoreFromMinimizedMode();
+              }}
+              title="Ketuk untuk membuka kembali antarmuka PTT"
+              className="cursor-pointer text-left min-w-0 flex-1 pr-0.5"
+            >
+              <div className="flex items-center gap-1">
+                <span
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    isTransmitting
+                      ? 'bg-emerald-400 animate-ping'
+                      : activeLockSpeaker
+                      ? 'bg-amber-400 animate-pulse'
+                      : 'bg-[#23dcff]'
+                  }`}
+                />
+                <span className="font-tactical text-[9.5px] font-extrabold tracking-tight text-white truncate">
+                  CH{String(channel).padStart(2, '0')}{' '}
+                  {isTransmitting
+                    ? '• TX'
+                    : activeLockSpeaker
+                    ? `• RX`
+                    : voxEnabled
+                    ? '• VOX'
+                    : '• SIAGA'}
+                </span>
               </div>
-              <div className="min-w-0">
-                <div className="font-tactical text-sm font-extrabold tracking-wider text-white truncate">
-                  MODE LATAR BELAKANG &amp; MINI WIDGET AKTIF
-                </div>
-                <div className="font-telemetry text-[10px] text-cyan-200/90 truncate">
-                  WebSocket • Web Audio VOX • {isWakeLockActive ? 'WakeLock ON' : 'Audio Lock ON'} • {isSwKeepAliveActive ? 'SW Keep-Alive ON' : 'Silent Stream ON'}
-                </div>
+              <div className="font-telemetry text-[8px] text-cyan-200/90 leading-none truncate">
+                <MiniWidgetMicLevelText />
               </div>
             </div>
+
+            {/* Tombol Mikro Pemicu PiP Floating Video di Luar Browser */}
+            <button
+              type="button"
+              onClick={() => {
+                requestFloatingPipWidget();
+              }}
+              title={
+                isPipFloatingActive
+                  ? 'Widget Video PiP Melayang Aktif'
+                  : 'Tampilkan Widget Melayang Mikro (PiP) di Atas Aplikasi Lain'
+              }
+              className={`w-6 h-6 rounded-full border flex items-center justify-center transition-transform active:scale-90 cursor-pointer shrink-0 ${
+                isPipFloatingActive
+                  ? 'bg-emerald-500/25 border-emerald-400 text-emerald-300'
+                  : 'bg-[#042440] border-[#23dcff]/70 text-[#23dcff]'
+              }`}
+            >
+              <Smartphone className="w-3 h-3" />
+            </button>
+
+            {/* Tombol Mikro Pulihkan / Buka Penuh */}
             <button
               type="button"
               onClick={handleRestoreFromMinimizedMode}
-              className="px-3 py-1.5 rounded-xl cyan-btn-glow text-[#02182b] font-tactical text-xs font-extrabold tracking-wider flex items-center gap-1 shrink-0 cursor-pointer"
+              title="Buka Kembali Antarmuka Utama PTT"
+              className="w-6 h-6 rounded-full cyan-btn-glow border border-white text-[#02182b] flex items-center justify-center shadow-[0_0_8px_#23dcff] active:scale-90 transition-transform cursor-pointer shrink-0"
             >
-              <Maximize2 className="w-3.5 h-3.5" />
-              <span>PULIHKAN</span>
+              <Maximize2 className="w-3 h-3" />
             </button>
-          </div>
-
-          {/* Info Panduan Singkat saat Buka Aplikasi Lain di HP */}
-          <div className="my-auto max-w-[380px] mx-auto text-center space-y-2 px-3">
-            <p className="font-tactical text-base font-bold text-cyan-100 tracking-wide">
-              SESI RADIO PTT &amp; VOX TETAP HIDUP DI BACKGROUND
-            </p>
-            <p className="font-telemetry text-[11px] text-cyan-200/80 leading-relaxed">
-              Koneksi <strong className="text-white">WebSocket/WebRTC</strong>, enkripsi <strong className="text-[#23dcff]">AES-256-GCM</strong>, dan sensor <strong className="text-[#23dcff]">VOX (THR {voxThreshold}%)</strong> tetap berjalan penuh meskipun Anda berpindah ke aplikasi lain atau mematikan layar HP.
-            </p>
-          </div>
-
-          {/* FLOATING MINI BUTTON (IKON MELAYANG DI SUDUT LAYAR + TOMBOL RESTORE CEPAT) */}
-          <div className="flex items-end justify-end">
-            <div className="tactical-panel rounded-full p-2 pl-4 border-2 border-[#23dcff] shadow-[0_0_35px_rgba(35,220,255,0.45)] flex items-center gap-3 bg-[#03192e]/95">
-              {/* Info Status Real-Time pada Widget Melayang */}
-              <div
-                onClick={handleRestoreFromMinimizedMode}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') handleRestoreFromMinimizedMode();
-                }}
-                className="cursor-pointer text-left pr-1"
-              >
-                <div className="flex items-center gap-1.5">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      isTransmitting
-                        ? 'bg-[#23dcff] animate-ping'
-                        : activeLockSpeaker
-                        ? 'bg-amber-400 animate-pulse'
-                        : 'bg-emerald-400'
-                    }`}
-                  />
-                  <span className="font-tactical text-xs font-extrabold tracking-wider text-white">
-                    CH {String(channel).padStart(2, '0')} •{' '}
-                    {isTransmitting
-                      ? 'TX MENGIRIM SUARA'
-                      : activeLockSpeaker
-                      ? `RX: ${activeLockSpeaker}`
-                      : voxEnabled
-                      ? `VOX SIAGA (THR ${voxThreshold}%)`
-                      : 'STANDBY'}
-                  </span>
-                </div>
-                <div className="font-telemetry text-[9.5px] text-cyan-200 flex items-center gap-2 mt-0.5">
-                  <MiniWidgetMicLevelText />
-                  <span>•</span>
-                  <span className="text-[#23dcff] font-bold underline">
-                    Ketuk Ikon untuk Buka Penuh
-                  </span>
-                </div>
-              </div>
-
-              {/* Tombol Ikon Melayang Bulat (Klik untuk Pulihkan / Restore Antarmuka Utama) */}
-              <button
-                type="button"
-                onClick={handleRestoreFromMinimizedMode}
-                title="Pulihkan Antarmuka Utama PTT (Restore)"
-                className="w-13 h-13 rounded-full cyan-btn-glow border-2 border-white text-[#02182b] flex flex-col items-center justify-center shadow-[0_0_20px_#23dcff] active:scale-95 transition-transform cursor-pointer shrink-0"
-              >
-                <Radio className="w-5 h-5" />
-                <span className="font-tactical text-[8.5px] font-extrabold tracking-tight leading-none mt-0.5">
-                  BUKA
-                </span>
-              </button>
-            </div>
           </div>
         </div>
       )}
@@ -6929,15 +7258,15 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Keep-Alive Latar Belakang (Screen Wake Lock API + Service Worker + Silent Audio Stream) */}
+                      {/* Keep-Alive Latar Belakang (PiP Video Floating Widget + Media Session API + Silent Audio Loop) */}
                       <div className="p-3 rounded-xl bg-[#021526] border border-[#23dcff]/45 space-y-2">
                         <div className="flex items-center justify-between gap-2">
                           <div>
                             <div className="text-white font-bold">
-                              Background Mode, Wake Lock &amp; Floating Mini
+                              Bypass Background OS: PiP Widget &amp; Media Session
                             </div>
                             <div className="text-[10px] text-cyan-200/75">
-                              Screen Wake Lock API + Service Worker Keep-Alive + Silent Audio Stream agar sesi VOX &amp; WebSocket tetap hidup saat diminimalkan atau membuka aplikasi lain
+                              Picture-in-Picture (PiP) Canvas Video Widget melayang di luar browser + Media Session API (&quot;Pemutar Musik&quot;) &amp; Silent Audio Loop (&lt;audio loop&gt;) anti-suspend
                             </div>
                           </div>
                           <button
@@ -6953,10 +7282,10 @@ export default function App() {
                           </button>
                         </div>
                         <div className="flex items-center justify-between text-[10.5px] pt-1.5 border-t border-cyan-500/20">
-                          <span className="text-cyan-200">Wake Lock &amp; Service Worker:</span>
+                          <span className="text-cyan-200">Status PiP &amp; Media Session:</span>
                           <span className="font-bold text-[#23dcff]">
-                            {isWakeLockActive ? 'WAKE LOCK ON' : 'AUDIO LOCK ON'} •{' '}
-                            {isSwKeepAliveActive ? 'SW KEEP-ALIVE AKTIF' : 'SILENT STREAM SIAGA'}
+                            {isPipFloatingActive ? 'PiP FLOATING ON' : 'PiP SIAGA'} •{' '}
+                            {isMediaSessionActive ? 'MEDIA SESSION ON' : 'SILENT LOOP SIAGA'}
                           </span>
                         </div>
                         <button
@@ -6968,7 +7297,7 @@ export default function App() {
                           className="w-full py-2 px-3 rounded-lg bg-[#063256] hover:bg-[#0a4678] border border-[#23dcff] text-white font-bold text-[11px] flex items-center justify-center gap-1.5 cursor-pointer"
                         >
                           <Minimize2 className="w-3.5 h-3.5 text-[#23dcff]" />
-                          <span>Masuk ke Mode Mini Melayang (Minimize ke Background)</span>
+                          <span>Minimalkan &amp; Buka Widget Video Melayang (PiP)</span>
                         </button>
                       </div>
 
