@@ -1,8 +1,8 @@
 // Military-Grade Tactical End-to-End Audio Encryption Module (AES-256-GCM via Web Crypto API crypto.subtle)
 // Optimized for 20ms-50ms real-time audio streaming chunks with synchronous CryptoKey cache lookup (< 0.2ms latency).
 
-export const PASSCODE_HARIAN = 'DISKOMLEKAU';
-export const TACTICAL_AUTH_SESSION_KEY = 'tactical_netcomm_passcode_auth_v1';
+export const PASSCODE_HARIAN = 'YES';
+export const TACTICAL_AUTH_SESSION_KEY = 'tactical_netcomm_passcode_auth_v2';
 
 const TACTICAL_KDF_SALT = new TextEncoder().encode('SUBDISRUDAL-TACTICAL-NETCOMM-AES256GCM-SALT-V1');
 

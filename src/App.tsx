@@ -77,7 +77,7 @@ import {
 } from './utils/tacticalCrypto';
 
 // Spesifikasi Passcode Operasional Harian (Wajib sebelum akses PTT, Web Audio API & WebSocket)
-const PASSCODE_HARIAN = 'DISKOMLEKAU';
+const PASSCODE_HARIAN = 'YES';
 
 interface TacticalMember {
   id: string;
@@ -612,7 +612,7 @@ export default function App() {
   // In-App Camera Barcode Scanner states (prevents external browser 404 errors)
   const [barcodeTab, setBarcodeTab] = useState<'show' | 'scan'>('show');
   const [isSetupScannerOpen, setIsSetupScannerOpen] = useState<boolean>(false);
-  const [, setIsCameraScanning] = useState<boolean>(false);
+  const [isCameraScanning, setIsCameraScanning] = useState<boolean>(false);
   const [scannerError, setScannerError] = useState<string | null>(null);
   const scannerVideoRef = useRef<HTMLVideoElement | null>(null);
   const scannerCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -622,7 +622,7 @@ export default function App() {
   const [pingMs, setPingMs] = useState<number>(18);
   const [pingDelta, setPingDelta] = useState<number>(2);
   const [isRefreshingPing, setIsRefreshingPing] = useState<boolean>(false);
-  const [talkAll] = useState<boolean>(true);
+  const [talkAll, setTalkAll] = useState<boolean>(true);
   // Real Peers Only: Starts empty and only populates when real peers announce on the channel
   const [members, setMembers] = useState<TacticalMember[]>([]);
   const [selectedMemberId, setSelectedMemberId] = useState<string>('');
@@ -648,9 +648,10 @@ export default function App() {
   });
   const [, setIsSilentKeepAliveRunning] = useState<boolean>(false);
   const [isBackgroundMode, setIsBackgroundMode] = useState<boolean>(false);
-  // Mode Minimasi (Picture-in-Picture Floating Video Widget + Media Session API Silent Audio Loop)
+  // Mode Minimasi (Aplikasi menghilang penuh ke background + Media Session API Silent Audio Loop)
   const [isMinimizedMode, setIsMinimizedMode] = useState<boolean>(false);
   const isMinimizedModeRef = useRef<boolean>(false);
+  const wasHiddenWhileMinimizedRef = useRef<boolean>(false);
   const [isPipFloatingActive, setIsPipFloatingActive] = useState<boolean>(false);
   const [isMediaSessionActive, setIsMediaSessionActive] = useState<boolean>(false);
   const [isWakeLockActive, setIsWakeLockActive] = useState<boolean>(false);
@@ -1819,7 +1820,7 @@ export default function App() {
     try {
       // Ensure real Wi-Fi LAN IP is detected before creating Offer so synthetic IPv4 host candidates can bypass Android mDNS
       if (!detectedLanIpRef.current) {
-        const foundIp = await detectLocalHotspotIpWebRTC(500);
+        const foundIp = await detectLocalHotspotIpWebRTC();
         if (foundIp) {
           detectedLanIpRef.current = foundIp;
         }
@@ -1920,11 +1921,11 @@ export default function App() {
           type: 'O',
           callsign: myCallsign,
           deviceId: myDeviceId,
-          ip: effectiveIp,
+          localIp: effectiveIp,
           channel,
           slotId,
-          sdp: localSdp,
-          gatheredCandidates,
+          rawSdp: localSdp,
+          collectedCandidateLines: gatheredCandidates,
         });
         setOfflineOfferToken(microToken);
       }
@@ -2529,7 +2530,7 @@ export default function App() {
 
     // Auto-detect real Hotspot IP via local WebRTC host ICE candidate & prepare Offline Master Offer once
     let detectedSubnetGateway = '192.168.43.1';
-    detectLocalHotspotIpWebRTC(500).then((detectedIp) => {
+    detectLocalHotspotIpWebRTC().then((detectedIp) => {
       if (isCancelled) return;
       if (detectedIp) {
         detectedLanIpRef.current = detectedIp;
@@ -2866,19 +2867,20 @@ export default function App() {
       });
     }, 2000);
 
-    // Send graceful PEER_LEAVE on tab/app close so other phones update immediately
+    // Send graceful PEER_LEAVE only on actual tab close when not running in background keep-alive mode
     const handleBeforeUnload = () => {
+      if (isMinimizedModeRef.current || keepAliveEnabledRef.current) {
+        return;
+      }
       broadcastMeshPacketRef.current({ type: 'PEER_LEAVE' });
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
-    window.addEventListener('pagehide', handleBeforeUnload);
 
     return () => {
       isCancelled = true;
       window.removeEventListener('online', handleNetworkSignalRestored);
       navConn?.removeEventListener?.('change', handleNetworkSignalRestored);
       window.removeEventListener('beforeunload', handleBeforeUnload);
-      window.removeEventListener('pagehide', handleBeforeUnload);
       window.clearInterval(watchdogTimer);
       broadcastChannelRef.current?.close();
       peerConnectionsRef.current.clear();
@@ -3247,8 +3249,11 @@ export default function App() {
       }
 
       if (isHidden) {
-        // Saat pengguna beralih membuka aplikasi lain di HP / layar mati (background):
-        // Jaga aliran mikrofon (MediaStream), AudioContext, WebSocket, MQTT, & PeerJS tetap aktif tanpa terputus!
+        if (isMinimizedModeRef.current) {
+          wasHiddenWhileMinimizedRef.current = true;
+        }
+        // Saat pengguna meminimalkan aplikasi / beralih membuka aplikasi lain di HP / layar mati (background):
+        // Jaga aliran mikrofon (MediaStream), AudioContext, WebSocket, MQTT, & PeerJS tetap aktif 100% tanpa terputus!
         if (backgroundSocketHeartbeat) {
           window.clearInterval(backgroundSocketHeartbeat);
         }
@@ -3264,6 +3269,9 @@ export default function App() {
         }
         broadcastMeshPacketRef.current({ type: 'ANNOUNCE' });
         backgroundSocketHeartbeat = window.setInterval(() => {
+          if (silentLoopAudioRef.current && silentLoopAudioRef.current.paused) {
+            silentLoopAudioRef.current.play().catch(() => {});
+          }
           if (audioCtxRef.current) {
             const st = audioCtxRef.current.state as string;
             if (st === 'suspended' || st === 'interrupted') {
@@ -3293,9 +3301,14 @@ export default function App() {
               // Ignore
             }
           }
-        }, 4000);
+        }, 3500);
       } else {
-        // Saat layar HP kembali menyala (visible): bersihkan timer latar belakang & pulihkan AudioContext/Mic
+        // Saat aplikasi dibuka kembali ke layar utama HP (visible): otomatis tampilkan kembali UI jika sebelumnya di-minimize ke Home Screen
+        if (isMinimizedModeRef.current && wasHiddenWhileMinimizedRef.current) {
+          wasHiddenWhileMinimizedRef.current = false;
+          isMinimizedModeRef.current = false;
+          setIsMinimizedMode(false);
+        }
         if (backgroundSocketHeartbeat) {
           window.clearInterval(backgroundSocketHeartbeat);
           backgroundSocketHeartbeat = null;
@@ -4035,8 +4048,9 @@ export default function App() {
           });
         }
 
-        analyser.getByteTimeDomainData(timeDomainBuf);
-        analyser.getByteFrequencyData(freqDomainBuf);
+        const activeAnalyser = micAnalyserRef.current || analyser;
+        activeAnalyser.getByteTimeDomainData(timeDomainBuf);
+        activeAnalyser.getByteFrequencyData(freqDomainBuf);
 
         // 1. Hitung RMS Amplitude dari sinyal vokal (250 Hz - 3.400 Hz) dengan peredam derau dasar ringan
         let sumSquares = 0;
@@ -4245,8 +4259,8 @@ export default function App() {
     const rxSpeaker =
       remoteActiveTxRef.current ||
       (channelLockOwnerRef.current &&
-      channelLockOwnerRef.current.ownerId !== myDeviceId
-        ? channelLockOwnerRef.current.ownerCallsign
+      channelLockOwnerRef.current.senderId !== myDeviceId
+        ? channelLockOwnerRef.current.callsign
         : null);
     const isVox = voxEnabledRef.current;
     const thr = voxThresholdRef.current;
@@ -4459,25 +4473,50 @@ export default function App() {
     return false;
   }, [drawTacticalPipCanvasFrame]);
 
-  // Masuk ke Mode Minimasi (Memicu Picture-in-Picture Floating Video Widget + Media Session API + Silent Audio Loop)
+  // Masuk ke Mode Minimasi: Aplikasi menghilang sepenuhnya dari layar HP & tetap 100% berfungsi di background
   const handleEnterMinimizedMode = useCallback(async () => {
+    // Pastikan layanan keep-alive background selalu aktif saat diminimalkan
+    if (!keepAliveEnabledRef.current) {
+      keepAliveEnabledRef.current = true;
+      setKeepAliveEnabled(true);
+    }
     setIsMinimizedMode(true);
     isMinimizedModeRef.current = true;
+    wasHiddenWhileMinimizedRef.current = false;
 
-    // 1. Putar terus-menerus file audio kosong (<audio loop>) agar browser tidak di-suspend OS
+    // 1. Tutup Fullscreen dan tutup jendela Picture-in-Picture agar tidak ada widget yang menghalangi layar HP
+    try {
+      if (typeof document !== 'undefined' && document.fullscreenElement) {
+        await document.exitFullscreen().catch(() => {});
+        setIsFullScreen(false);
+      }
+      if (typeof document !== 'undefined' && document.pictureInPictureElement) {
+        await document.exitPictureInPicture().catch(() => {});
+      }
+    } catch {
+      // Ignore exit errors
+    }
+    setIsPipFloatingActive(false);
+
+    // 2. Putar terus-menerus file audio kosong (<audio loop>) agar proses browser & mikrofon tidak di-suspend OS
     if (silentLoopAudioRef.current) {
       silentLoopAudioRef.current.loop = true;
       silentLoopAudioRef.current.volume = 0.02;
       silentLoopAudioRef.current.play().catch(() => {});
     }
 
-    // 2. Aktifkan Media Session API ("Pemutar Musik" seperti Spotify) + Web Audio Silent Stream
+    // 3. Aktifkan Media Session API ("Pemutar Musik" aktif) + Web Audio Silent Stream + Mikrofon VOX Background
     const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
     if (ctx) {
       audioCtxRef.current = ctx;
+      const st = ctx.state as string;
+      if (st === 'suspended' || st === 'interrupted') {
+        ctx.resume().catch(() => {});
+      }
       if (!keepAliveSessionRef.current) {
         keepAliveSessionRef.current = createSilentKeepAliveController();
       }
+      keepAliveSessionRef.current.start(ctx);
       keepAliveSessionRef.current.attachDomAudioElement(silentLoopAudioRef.current);
       keepAliveSessionRef.current.pulseOnVisibilityChange(ctx, true);
       keepAliveSessionRef.current.updateMediaSessionMetadata({
@@ -4486,7 +4525,7 @@ export default function App() {
         statusText: isTransmittingRef.current
           ? 'TX MENGIRIM SUARA'
           : voxEnabledRef.current
-          ? `VOX SIAGA (THR ${voxThresholdRef.current}%)`
+          ? `VOX SIAGA BACKGROUND (THR ${voxThresholdRef.current}%)`
           : 'PTT SIAGA LATAR BELAKANG',
         onTogglePtt: () => {
           if (isTransmittingRef.current) {
@@ -4503,8 +4542,19 @@ export default function App() {
       setIsMediaSessionActive(true);
     }
 
-    // 3. Panggil video.requestPictureInPicture() agar widget melayang di atas aplikasi lain di luar browser
-    await requestFloatingPipWidget();
+    // Pastikan mikrofon VOX tetap hidup dan siap menangkap suara di latar belakang
+    if (voxEnabledRef.current) {
+      const hasLiveMic = mediaStreamRef.current
+        ?.getAudioTracks()
+        .some((t) => t.readyState === 'live');
+      if (!hasLiveMic) {
+        ensureWebAudioVoxGraphRef.current(true);
+      } else if (mediaStreamRef.current && !isRxQueuePlayingRef.current && !remoteActiveTxRef.current) {
+        mediaStreamRef.current.getAudioTracks().forEach((t) => {
+          if (!t.enabled) t.enabled = true;
+        });
+      }
+    }
 
     sendServiceWorkerKeepAlivePing({
       callsign: myCallsign || 'UNIT',
@@ -4512,10 +4562,36 @@ export default function App() {
       minimized: true,
       voxEnabled: voxEnabledRef.current,
     });
-  }, [myCallsign, channel, requestFloatingPipWidget, handleToggleVoxSwitch]);
 
-  // Pulihkan Antarmuka Utama dari Mode Mini (Restore Full Interface & keluar dari PiP jika aktif)
+    // 4. Pada perangkat Android (di luar iframe preview), arahkan ke layar utama (Home Screen) HP
+    // tanpa menutup tab/proses sehingga aplikasi benar-benar menghilang dari layar HP namun tetap aktif di background
+    try {
+      const isInIframe = typeof window !== 'undefined' && window.self !== window.top;
+      const isAndroidDevice =
+        typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent || '');
+      if (isAndroidDevice && !isInIframe && typeof document !== 'undefined') {
+        const fallbackUrl = encodeURIComponent(window.location.href);
+        const homeIntentUri = `intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.HOME;S.browser_fallback_url=${fallbackUrl};end`;
+        const anchor = document.createElement('a');
+        anchor.href = homeIntentUri;
+        anchor.style.display = 'none';
+        document.body.appendChild(anchor);
+        anchor.click();
+        window.setTimeout(() => {
+          if (anchor.parentNode) {
+            anchor.parentNode.removeChild(anchor);
+          }
+        }, 300);
+      }
+      window.blur?.();
+    } catch {
+      // Abaikan jika OS membatasi intent Home
+    }
+  }, [myCallsign, channel, handleToggleVoxSwitch]);
+
+  // Pulihkan Antarmuka Utama dari Mode Mini (Restore Full Interface)
   const handleRestoreFromMinimizedMode = useCallback(async () => {
+    wasHiddenWhileMinimizedRef.current = false;
     setIsMinimizedMode(false);
     isMinimizedModeRef.current = false;
 
@@ -4786,7 +4862,7 @@ export default function App() {
     // Pre-warm microphone permission & Web Audio API VOX graph on user gesture
     await ensureWebAudioVoxGraph();
 
-    const realLanIp = await detectLocalHotspotIpWebRTC(550);
+    const realLanIp = await detectLocalHotspotIpWebRTC();
     if (realLanIp) {
       detectedLanIpRef.current = realLanIp;
     }
@@ -5165,7 +5241,7 @@ export default function App() {
           (async () => {
             try {
               if (!detectedLanIpRef.current) {
-                const foundIp = await detectLocalHotspotIpWebRTC(450);
+                const foundIp = await detectLocalHotspotIpWebRTC();
                 if (foundIp) detectedLanIpRef.current = foundIp;
               }
 
@@ -5243,11 +5319,11 @@ export default function App() {
                   type: 'A',
                   callsign: effectiveCallsign,
                   deviceId: myDeviceId,
-                  ip: detectedLanIpRef.current || clientIp,
+                  localIp: detectedLanIpRef.current || clientIp,
                   channel: offlineSig.ch,
                   slotId: offlineSig.sid,
-                  sdp: answerSdp,
-                  gatheredCandidates,
+                  rawSdp: answerSdp,
+                  collectedCandidateLines: gatheredCandidates,
                 });
                 setOfflineAnswerToken(encodedAnswer);
                 setBarcodeTab('show');
@@ -5687,10 +5763,14 @@ export default function App() {
   }
 
   return (
-    <div className="h-[100dvh] max-h-[100dvh] w-full bg-[#021322] text-[#e5faff] flex flex-col items-center justify-center overflow-hidden select-none relative">
+    <div
+      className={`h-[100dvh] max-h-[100dvh] w-full ${
+        isMinimizedMode ? 'bg-black' : 'bg-[#021322]'
+      } text-[#e5faff] flex flex-col items-center justify-center overflow-hidden select-none relative`}
+    >
       {/* =====================================================================
-          ELEMEN TERSEMBUNYI UNTUK 2 TEKNIK BYPASS BACKGROUND OS SELULER:
-          1. <canvas> + <video> tersembunyi untuk Picture-in-Picture (PiP) Floating Widget
+          ELEMEN TERSEMBUNYI UNTUK BYPASS BACKGROUND OS SELULER:
+          1. <canvas> + <video> tersembunyi untuk aliran keep-alive
           2. <audio loop> tersembunyi yang memutar file audio kosong (Silent Loop) non-stop
           ===================================================================== */}
       <canvas
@@ -5721,86 +5801,32 @@ export default function App() {
       />
 
       {/* =====================================================================
-          MODE MINIMASI ULTRA-KECIL (MICRO FLOATING WIDGET & PIP BYPASS)
-          Ukuran sangat kecil di sudut kanan bawah (hanya kapsul mikro ~190x36px)
-          agar sama sekali tidak menghalangi atau mengganggu aplikasi lain.
+          MODE MINIMASI PENUH (STEALTH BACKGROUND MODE)
+          Saat tombol MINI ditekan, seluruh tampilan aplikasi menghilang sepenuhnya
+          dari layar HP (dan otomatis kembali ke Home Screen di Android), sementara
+          WebSocket, WebRTC, MediaSession, dan VOX tetap 100% berfungsi di background.
+          Ketuk di mana saja saat kembali ke layar aplikasi untuk membuka tampilan penuh.
           ===================================================================== */}
       {isMinimizedMode && (
-        <div className="fixed bottom-2.5 right-2.5 z-50 pointer-events-auto">
-          <div className="tactical-panel rounded-full px-2.5 py-1 border border-[#23dcff] shadow-[0_0_14px_rgba(35,220,255,0.35)] flex items-center gap-1.5 bg-[#021526]/95 backdrop-blur-xs max-w-[215px]">
-            {/* Indikator Status & Level Mic Super Ringkas (Klik untuk Buka Kembali) */}
-            <div
-              onClick={handleRestoreFromMinimizedMode}
-              role="button"
-              tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') handleRestoreFromMinimizedMode();
-              }}
-              title="Ketuk untuk membuka kembali antarmuka PTT"
-              className="cursor-pointer text-left min-w-0 flex-1 pr-0.5"
-            >
-              <div className="flex items-center gap-1">
-                <span
-                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                    isTransmitting
-                      ? 'bg-emerald-400 animate-ping'
-                      : activeLockSpeaker
-                      ? 'bg-amber-400 animate-pulse'
-                      : 'bg-[#23dcff]'
-                  }`}
-                />
-                <span className="font-tactical text-[9.5px] font-extrabold tracking-tight text-white truncate">
-                  CH{String(channel).padStart(2, '0')}{' '}
-                  {isTransmitting
-                    ? '• TX'
-                    : activeLockSpeaker
-                    ? `• RX`
-                    : voxEnabled
-                    ? '• VOX'
-                    : '• SIAGA'}
-                </span>
-              </div>
-              <div className="font-telemetry text-[8px] text-cyan-200/90 leading-none truncate">
-                <MiniWidgetMicLevelText />
-              </div>
-            </div>
-
-            {/* Tombol Mikro Pemicu PiP Floating Video di Luar Browser */}
-            <button
-              type="button"
-              onClick={() => {
-                requestFloatingPipWidget();
-              }}
-              title={
-                isPipFloatingActive
-                  ? 'Widget Video PiP Melayang Aktif'
-                  : 'Tampilkan Widget Melayang Mikro (PiP) di Atas Aplikasi Lain'
-              }
-              className={`w-6 h-6 rounded-full border flex items-center justify-center transition-transform active:scale-90 cursor-pointer shrink-0 ${
-                isPipFloatingActive
-                  ? 'bg-emerald-500/25 border-emerald-400 text-emerald-300'
-                  : 'bg-[#042440] border-[#23dcff]/70 text-[#23dcff]'
-              }`}
-            >
-              <Smartphone className="w-3 h-3" />
-            </button>
-
-            {/* Tombol Mikro Pulihkan / Buka Penuh */}
-            <button
-              type="button"
-              onClick={handleRestoreFromMinimizedMode}
-              title="Buka Kembali Antarmuka Utama PTT"
-              className="w-6 h-6 rounded-full cyan-btn-glow border border-white text-[#02182b] flex items-center justify-center shadow-[0_0_8px_#23dcff] active:scale-90 transition-transform cursor-pointer shrink-0"
-            >
-              <Maximize2 className="w-3 h-3" />
-            </button>
-          </div>
+        <div
+          onClick={handleRestoreFromMinimizedMode}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') handleRestoreFromMinimizedMode();
+          }}
+          title="Ketuk layar untuk menampilkan kembali antarmuka PTT"
+          className="fixed inset-0 z-50 bg-black cursor-pointer flex items-end justify-center pb-3"
+        >
+          <span className="font-telemetry text-[9px] text-cyan-200/20 tracking-widest select-none">
+            PTT BACKGROUND AKTIF • KETUK LAYAR UNTUK MEMBUKA
+          </span>
         </div>
       )}
 
       <main
         className={`w-full h-[100dvh] max-h-[100dvh] tactical-grid-bg flex flex-col justify-between relative overflow-hidden transition-all ${
-          isMinimizedMode ? 'opacity-0 pointer-events-none' : 'opacity-100'
+          isMinimizedMode ? 'hidden pointer-events-none' : 'opacity-100'
         } ${
           fullScreenStretch
             ? 'max-w-full'

@@ -567,7 +567,10 @@ export function installGlobalWebRtcOpusSdpPatch(targetBitrateBps = 12000): void 
 
   isGlobalSdpPatchInstalled = true;
 
-  const origSetLocal = PeerConn.prototype.setLocalDescription;
+  const origSetLocal = PeerConn.prototype.setLocalDescription as (
+    this: RTCPeerConnection,
+    description?: RTCLocalSessionDescriptionInit
+  ) => Promise<void>;
   if (typeof origSetLocal === 'function') {
     PeerConn.prototype.setLocalDescription = function (
       description?: RTCLocalSessionDescriptionInit
@@ -581,11 +584,14 @@ export function installGlobalWebRtcOpusSdpPatch(targetBitrateBps = 12000): void 
           ),
         };
       }
-      return origSetLocal.call(this, description as RTCLocalSessionDescriptionInit);
+      return origSetLocal.call(this, description);
     };
   }
 
-  const origSetRemote = PeerConn.prototype.setRemoteDescription;
+  const origSetRemote = PeerConn.prototype.setRemoteDescription as (
+    this: RTCPeerConnection,
+    description: RTCSessionDescriptionInit
+  ) => Promise<void>;
   if (typeof origSetRemote === 'function') {
     PeerConn.prototype.setRemoteDescription = function (
       description: RTCSessionDescriptionInit
