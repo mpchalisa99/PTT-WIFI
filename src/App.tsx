@@ -798,6 +798,8 @@ export default function App() {
     }>
   >([]);
   const isRxQueuePlayingRef = useRef<boolean>(false);
+  const lastRxSegmentStartTsRef = useRef<number>(0);
+  const lastPcmFlushTsRef = useRef<number>(0);
   // Adaptive Jitter Buffer (100ms - 200ms) refs untuk menampung paket terlambat di kondisi internet buruk
   const isJitterBufferingRef = useRef<boolean>(false);
   const jitterBufferTimerRef = useRef<number | null>(null);
@@ -1336,6 +1338,7 @@ export default function App() {
         }
 
         setIncomingSpeaker(nextItem.senderCallsign);
+        lastRxSegmentStartTsRef.current = Date.now();
         rxCooldownUntilRef.current = Date.now() + 2800;
 
         // Smooth adaptive catch-up rate if multiple segments arrived in a burst so latency never accumulates
@@ -1343,18 +1346,25 @@ export default function App() {
         const adaptivePlaybackRate =
           remainingQueueDepth >= 4 ? 1.06 : remainingQueueDepth >= 2 ? 1.03 : 1.0;
 
+        let segmentEndedHandled = false;
         const onSegmentEnded = () => {
+          if (segmentEndedHandled) return;
+          segmentEndedHandled = true;
           activeWebAudioRxStopRef.current = null;
           if (rxAudioQueueRef.current.length > 0) {
             // Immediately play next pre-decoded queued segment with zero gap and no extra beep!
             playNextSegmentInQueue();
           } else {
-            // BANTALAN PENAMPUNG PAKET TERLAMBAT (LATE-PACKET JITTER CUSHION 165ms):
-            // Jika paket berikutnya sedang dalam perjalanan akibat sinyal buruk / jitter tinggi,
-            // tahan sesi RX selama 165ms agar aliran suara tidak terputus sebelum paket tiba!
+            // BANTALAN PENAMPUNG PAKET TERLAMBAT (LATE-PACKET JITTER CUSHION):
+            // Selama pengirim masih menahan tombol PTT (remoteActiveTxRef / channelLockOwnerRef aktif),
+            // tahan sesi RX hingga 650ms agar segmen ke-2, ke-3, dst. tidak pernah terputus!
             if (latePacketGraceTimerRef.current) {
               window.clearTimeout(latePacketGraceTimerRef.current);
             }
+            const isSenderStillTransmitting = Boolean(
+              remoteActiveTxRef.current || channelLockOwnerRef.current
+            );
+            const graceWaitMs = isSenderStillTransmitting ? 650 : 220;
             latePacketGraceTimerRef.current = window.setTimeout(() => {
               latePacketGraceTimerRef.current = null;
               if (rxAudioQueueRef.current.length > 0) {
@@ -1362,7 +1372,7 @@ export default function App() {
               } else {
                 finalizeQueueAndRestoreVox(nextItem.senderCallsign);
               }
-            }, 165);
+            }, graceWaitMs);
           }
         };
 
@@ -1450,8 +1460,16 @@ export default function App() {
         return;
       }
 
-      // Jika antrean pemutar atau Adaptive Jitter Buffer sudah berjalan, biarkan mengalir mulus tanpa interupsi
+      // Jika antrean pemutar atau Adaptive Jitter Buffer sudah berjalan, biarkan mengalir mulus
+      // Namun jika segmen sebelumnya macet > 3000ms di browser HP, paksa lanjut ke segmen berikutnya agar suara tidak pernah hilang!
       if (isRxQueuePlayingRef.current || isJitterBufferingRef.current) {
+        if (
+          !isJitterBufferingRef.current &&
+          lastRxSegmentStartTsRef.current > 0 &&
+          now - lastRxSegmentStartTsRef.current > 3000
+        ) {
+          playNextSegmentInQueue();
+        }
         return;
       }
 
@@ -3335,6 +3353,10 @@ export default function App() {
     const unsubscribeWorkerHeartbeat = subscribeToBackgroundWorkerTicks({
       onHeartbeatTick: () => {
         if (!document.hidden && !isMinimizedModeRef.current) return;
+        if (silentLoopAudioRef.current && silentLoopAudioRef.current.paused) {
+          silentLoopAudioRef.current.volume = 0.15;
+          silentLoopAudioRef.current.play().catch(() => {});
+        }
         if (audioCtxRef.current) {
           const st = audioCtxRef.current.state as string;
           if (st === 'suspended' || st === 'interrupted') {
@@ -3343,6 +3365,20 @@ export default function App() {
           if (keepAliveEnabledRef.current) {
             controller.pulseOnVisibilityChange(audioCtxRef.current, true);
           }
+        }
+        // Jika sedang mentransmisikan suara (TX) di background, pastikan segmen PCM tetap terkirim lancar tanpa terputus!
+        if (
+          isTransmittingRef.current &&
+          isPcmRecordingRef.current &&
+          pcmChunksRef.current.length > 0 &&
+          Date.now() - lastPcmFlushTsRef.current >= 750
+        ) {
+          lastPcmFlushTsRef.current = Date.now();
+          const flushedChunks = pcmChunksRef.current;
+          pcmChunksRef.current = [];
+          const sampleRate = audioCtxRef.current?.sampleRate || 44100;
+          const wavBlob = encodePcmChunksToWavBlob(flushedChunks, sampleRate);
+          dispatchRecordedVoiceBlob(wavBlob);
         }
         if (voxEnabledRef.current && !isRxQueuePlayingRef.current && !remoteActiveTxRef.current) {
           const hasLiveMic = mediaStreamRef.current
@@ -3391,15 +3427,22 @@ export default function App() {
   // Helper untuk mengenkripsi (AES-256-GCM via Web Crypto API) & mengirim Blob rekaman suara ke jaringan
   const dispatchRecordedVoiceBlob = useCallback(
     (blob: Blob) => {
-      // Keep mic enabled ONLY if VOX is active and no incoming speaker is playing; otherwise disable track
+      // PERBAIKAN KRITIS: Selama PTT masih aktif mentransmisikan suara (isTransmittingRef.current === true),
+      // JANGAN PERNAH mematikan track mikrofon! Mematikan track di sini menyebabkan suara hilang setelah 1 detik!
       if (mediaStreamRef.current) {
-        const keepOpenForVox =
-          voxEnabledRef.current &&
-          !remoteActiveTxRef.current &&
-          !channelLockOwnerRef.current;
-        mediaStreamRef.current.getAudioTracks().forEach((track) => {
-          track.enabled = keepOpenForVox;
-        });
+        if (isTransmittingRef.current) {
+          mediaStreamRef.current.getAudioTracks().forEach((track) => {
+            if (!track.enabled) track.enabled = true;
+          });
+        } else {
+          const keepOpenForVox =
+            voxEnabledRef.current &&
+            !remoteActiveTxRef.current &&
+            !channelLockOwnerRef.current;
+          mediaStreamRef.current.getAudioTracks().forEach((track) => {
+            track.enabled = keepOpenForVox;
+          });
+        }
       }
 
       // If this recording was aborted due to Anti-Collision, discard the audio clip so it never collides!
@@ -3570,6 +3613,17 @@ export default function App() {
         const stream = mediaStreamRef.current;
         const ctx = audioCtxRef.current;
         if (stream && analyser && ctx) {
+          const st = ctx.state as string;
+          if (st === 'suspended' || st === 'interrupted') {
+            await ctx.resume().catch(() => {});
+          }
+          if (voxPreAmpGainRef.current) {
+            try {
+              voxPreAmpGainRef.current.gain.setValueAtTime(1.65, ctx.currentTime);
+            } catch {
+              voxPreAmpGainRef.current.gain.value = 1.65;
+            }
+          }
           stream.getAudioTracks().forEach((track) => {
             track.enabled = true;
           });
@@ -3581,119 +3635,151 @@ export default function App() {
           // Throttled 110ms meter update via isolated LiveAudioMeterStore (0 re-renders on main App!)
           animFrameRef.current = window.setInterval(() => {
             if (!isTransmittingRef.current) return;
-            analyser.getByteFrequencyData(dataArray);
+            if (mediaStreamRef.current) {
+              mediaStreamRef.current.getAudioTracks().forEach((t) => {
+                if (!t.enabled) t.enabled = true;
+              });
+            }
+            const currentAnalyser = micAnalyserRef.current || analyser;
+            currentAnalyser.getByteFrequencyData(dataArray);
             const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
             setMicLevel(Math.min(100, Math.max(25, Math.round(avg * 1.45))));
           }, 110);
 
-          // Negotiate Opus Codec with Low-Bitrate (16 kbps - 24 kbps) & Optimal 45ms Timeslice (40ms - 50ms window)
-          let startedMediaRecorder = false;
-
-          const startNewMediaRecorderSegment = () => {
-            if (!isTransmittingRef.current || !mediaStreamRef.current) return false;
-            try {
-              const segmentChunks: Blob[] = [];
-              recordedChunksRef.current = segmentChunks;
-
-              // Optimasi Kompresi Opus Codec Bitrate Ekstrem (8 kbps - 12 kbps, max 12 kbps Narrowband/Wideband speech)
-              // Menghemat bandwidth secara ekstrem di kondisi internet buruk & packet loss tinggi
-              const targetBitrateBps = (opusBitrateKbpsRef.current || 12) * 1000;
-              const { options: recorderOptions, negotiatedMime, timesliceMs } =
-                createOpusLowBitrateRecorderOptions(targetBitrateBps);
-
-              let recorder: MediaRecorder;
-              try {
-                recorder = new MediaRecorder(mediaStreamRef.current, recorderOptions);
-              } catch {
-                recorder = negotiatedMime
-                  ? new MediaRecorder(mediaStreamRef.current, {
-                      mimeType: negotiatedMime,
-                      audioBitsPerSecond: targetBitrateBps,
-                    })
-                  : new MediaRecorder(mediaStreamRef.current, {
-                      audioBitsPerSecond: targetBitrateBps,
-                    });
-              }
-
-              recorder.ondataavailable = (e) => {
-                if (e.data && e.data.size > 0) {
-                  segmentChunks.push(e.data);
-                }
-              };
-
-              recorder.onstop = () => {
-                if (segmentChunks.length === 0) return;
-                const effectiveMime =
-                  recorder.mimeType || negotiatedMime || 'audio/webm;codecs=opus';
-                const blob = new Blob(segmentChunks, { type: effectiveMime });
-                dispatchRecordedVoiceBlob(blob);
-              };
-
-              mediaRecorderRef.current = recorder;
-              // Gunakan ukuran timeslice optimal 45ms (di kisaran 40ms - 50ms) agar latensi tetap rendah/real-time
-              // sekaligus cukup stabil mencegah suara terputus-putus atau fragmentasi paket data berlebih
-              recorder.start(timesliceMs || OPTIMAL_MEDIA_RECORDER_TIMESLICE_MS);
-              return true;
-            } catch {
-              return false;
-            }
-          };
-
-          if (typeof MediaRecorder !== 'undefined') {
-            startedMediaRecorder = startNewMediaRecorderSegment();
-          }
-
-          // STREAMING SEGMEN OPUS REAL-TIME TANPA PUTUS (Overlap-Free Segment Rotation setiap 950ms):
-          // Segmen baru dibuka terlebih dahulu sebelum segmen lama ditutup agar tidak ada celah audio yang hilang!
           if (pttSegmentIntervalRef.current) {
             window.clearInterval(pttSegmentIntervalRef.current);
+            pttSegmentIntervalRef.current = null;
           }
-          if (startedMediaRecorder) {
-            pttSegmentIntervalRef.current = window.setInterval(() => {
-              if (!isTransmittingRef.current) return;
-              const prevRecorder = mediaRecorderRef.current;
-              // Mulai perekam segmen baru terlebih dahulu (zero-gap overlap) lalu tutup segmen sebelumnya
-              startNewMediaRecorderSegment();
-              if (prevRecorder && prevRecorder.state === 'recording') {
+
+          // ===================================================================
+          // MESIN TRANSMISI SUARA KONTINYU TANPA PUTUS (GAPLESS CONTINUOUS STREAMING)
+          // Menggunakan Web Audio API Continuous PCM-to-WAV Capture sebagai jalur utama
+          // sehingga stream mikrofon TIDAK PERNAH di-stop/restart setelah 1 detik!
+          // Suara tetap terkirim utuh selama tombol PTT ditekan (baik 2 detik maupun 5 menit).
+          // ===================================================================
+          let startedContinuousPcm = false;
+          if (micSourceRef.current) {
+            try {
+              if (pcmProcessorRef.current) {
                 try {
-                  prevRecorder.stop();
+                  pcmProcessorRef.current.disconnect();
+                  pcmZeroGainRef.current?.disconnect();
                 } catch {
                   // Ignore
                 }
               }
-            }, 950);
+              pcmChunksRef.current = [];
+              isPcmRecordingRef.current = true;
+              lastPcmFlushTsRef.current = Date.now();
+
+              const processor = ctx.createScriptProcessor(4096, 1, 1);
+              const zeroGain = ctx.createGain();
+              zeroGain.gain.value = 0; // Mute local monitor so mic never echoes to own speaker
+
+              processor.onaudioprocess = (ev) => {
+                if (!isTransmittingRef.current || !isPcmRecordingRef.current) return;
+                const inputData = ev.inputBuffer.getChannelData(0);
+                pcmChunksRef.current.push(new Float32Array(inputData));
+              };
+
+              micSourceRef.current.connect(processor);
+              processor.connect(zeroGain);
+              zeroGain.connect(ctx.destination);
+              pcmProcessorRef.current = processor;
+              pcmZeroGainRef.current = zeroGain;
+              startedContinuousPcm = true;
+
+              // Kirim segmen suara utuh setiap 750ms tanpa menghentikan aliran mikrofon sedikit pun!
+              pttSegmentIntervalRef.current = window.setInterval(() => {
+                if (!isTransmittingRef.current || !isPcmRecordingRef.current) return;
+                if (mediaStreamRef.current) {
+                  mediaStreamRef.current.getAudioTracks().forEach((t) => {
+                    if (!t.enabled) t.enabled = true;
+                  });
+                }
+                if (pcmChunksRef.current.length > 0) {
+                  lastPcmFlushTsRef.current = Date.now();
+                  const flushedChunks = pcmChunksRef.current;
+                  pcmChunksRef.current = [];
+                  const sampleRate = audioCtxRef.current?.sampleRate || 44100;
+                  const wavBlob = encodePcmChunksToWavBlob(flushedChunks, sampleRate);
+                  dispatchRecordedVoiceBlob(wavBlob);
+                }
+              }, 750);
+            } catch {
+              startedContinuousPcm = false;
+            }
           }
 
-          // Fallback: Web Audio API ScriptProcessor PCM-to-WAV Recorder (for older iOS Safari / HarmonyOS WebViews)
-          if (!startedMediaRecorder && micSourceRef.current) {
-            pcmChunksRef.current = [];
-            isPcmRecordingRef.current = true;
-            const processor = ctx.createScriptProcessor(4096, 1, 1);
-            const zeroGain = ctx.createGain();
-            zeroGain.gain.value = 0; // Mute output so mic never feeds back into local speaker!
+          // Fallback MediaRecorder berurutan (Sequential Stop -> Start) hanya jika ScriptProcessor tidak tersedia
+          if (!startedContinuousPcm && typeof MediaRecorder !== 'undefined') {
+            const startSequentialRecorder = () => {
+              if (!isTransmittingRef.current || !mediaStreamRef.current) return false;
+              try {
+                mediaStreamRef.current.getAudioTracks().forEach((t) => {
+                  if (!t.enabled) t.enabled = true;
+                });
+                const segmentChunks: Blob[] = [];
+                recordedChunksRef.current = segmentChunks;
 
-            processor.onaudioprocess = (ev) => {
-              if (!isPcmRecordingRef.current) return;
-              const inputData = ev.inputBuffer.getChannelData(0);
-              pcmChunksRef.current.push(new Float32Array(inputData));
+                const targetBitrateBps = (opusBitrateKbpsRef.current || 12) * 1000;
+                const { options: recorderOptions, negotiatedMime, timesliceMs } =
+                  createOpusLowBitrateRecorderOptions(targetBitrateBps);
+
+                let recorder: MediaRecorder;
+                try {
+                  recorder = new MediaRecorder(mediaStreamRef.current, recorderOptions);
+                } catch {
+                  recorder = negotiatedMime
+                    ? new MediaRecorder(mediaStreamRef.current, {
+                        mimeType: negotiatedMime,
+                        audioBitsPerSecond: targetBitrateBps,
+                      })
+                    : new MediaRecorder(mediaStreamRef.current, {
+                        audioBitsPerSecond: targetBitrateBps,
+                      });
+                }
+
+                recorder.ondataavailable = (e) => {
+                  if (e.data && e.data.size > 0) {
+                    segmentChunks.push(e.data);
+                  }
+                };
+
+                recorder.onstop = () => {
+                  if (segmentChunks.length > 0) {
+                    const effectiveMime =
+                      recorder.mimeType || negotiatedMime || 'audio/webm;codecs=opus';
+                    const blob = new Blob(segmentChunks, { type: effectiveMime });
+                    dispatchRecordedVoiceBlob(blob);
+                  }
+                  // Mulai segmen berikutnya SETELAH segmen sebelumnya benar-benar berhenti agar encoder HP tidak macet
+                  if (isTransmittingRef.current) {
+                    startSequentialRecorder();
+                  }
+                };
+
+                mediaRecorderRef.current = recorder;
+                recorder.start(timesliceMs || OPTIMAL_MEDIA_RECORDER_TIMESLICE_MS);
+                return true;
+              } catch {
+                return false;
+              }
             };
 
-            micSourceRef.current.connect(processor);
-            processor.connect(zeroGain);
-            zeroGain.connect(ctx.destination);
-            pcmProcessorRef.current = processor;
-            pcmZeroGainRef.current = zeroGain;
-
-            pttSegmentIntervalRef.current = window.setInterval(() => {
-              if (!isTransmittingRef.current || !isPcmRecordingRef.current) return;
-              if (pcmChunksRef.current.length > 0) {
-                const flushedChunks = pcmChunksRef.current;
-                pcmChunksRef.current = [];
-                const sampleRate = audioCtxRef.current?.sampleRate || 44100;
-                const wavBlob = encodePcmChunksToWavBlob(flushedChunks, sampleRate);
-                dispatchRecordedVoiceBlob(wavBlob);
-              }
-            }, 2300);
+            if (startSequentialRecorder()) {
+              pttSegmentIntervalRef.current = window.setInterval(() => {
+                if (!isTransmittingRef.current) return;
+                const activeRec = mediaRecorderRef.current;
+                if (activeRec && activeRec.state === 'recording') {
+                  try {
+                    activeRec.stop();
+                  } catch {
+                    // Ignore
+                  }
+                }
+              }, 850);
+            }
           }
         } else {
           // If microphone permission is not yet granted, fallback visual meter at throttled 120ms interval
@@ -4473,9 +4559,11 @@ export default function App() {
     return false;
   }, [drawTacticalPipCanvasFrame]);
 
-  // Masuk ke Mode Minimasi: Aplikasi menghilang sepenuhnya dari layar HP & tetap 100% berfungsi di background
+  // Masuk ke Mode Minimasi (Background Sistem):
+  // Aplikasi TIDAK keluar / tidak tertutup, melainkan mengaktifkan Mode Background Sistem penuh
+  // (Media Session 6s Loop + Web Audio Keep-Alive + PiP Mikro + Web Worker VOX) sehingga tetap berjalan
+  // di background sistem meskipun HP digunakan untuk membuka aplikasi lain!
   const handleEnterMinimizedMode = useCallback(async () => {
-    // Pastikan layanan keep-alive background selalu aktif saat diminimalkan
     if (!keepAliveEnabledRef.current) {
       keepAliveEnabledRef.current = true;
       setKeepAliveEnabled(true);
@@ -4484,28 +4572,15 @@ export default function App() {
     isMinimizedModeRef.current = true;
     wasHiddenWhileMinimizedRef.current = false;
 
-    // 1. Tutup Fullscreen dan tutup jendela Picture-in-Picture agar tidak ada widget yang menghalangi layar HP
-    try {
-      if (typeof document !== 'undefined' && document.fullscreenElement) {
-        await document.exitFullscreen().catch(() => {});
-        setIsFullScreen(false);
-      }
-      if (typeof document !== 'undefined' && document.pictureInPictureElement) {
-        await document.exitPictureInPicture().catch(() => {});
-      }
-    } catch {
-      // Ignore exit errors
-    }
-    setIsPipFloatingActive(false);
-
-    // 2. Putar terus-menerus file audio kosong (<audio loop>) agar proses browser & mikrofon tidak di-suspend OS
+    // 1. Putar terus-menerus file audio sub-audible 6 detik (<audio loop>) agar Android/iOS
+    // mengunci layanan Foreground Media Player dan TIDAK PERNAH mematikan aplikasi saat buka aplikasi lain
     if (silentLoopAudioRef.current) {
       silentLoopAudioRef.current.loop = true;
-      silentLoopAudioRef.current.volume = 0.02;
+      silentLoopAudioRef.current.volume = 0.15;
       silentLoopAudioRef.current.play().catch(() => {});
     }
 
-    // 3. Aktifkan Media Session API ("Pemutar Musik" aktif) + Web Audio Silent Stream + Mikrofon VOX Background
+    // 2. Aktifkan Media Session API ("Pemutar Musik" aktif) + Web Audio Silent Stream + Mikrofon VOX Background
     const ctx = getOrCreateCompatibleAudioContext(audioCtxRef.current);
     if (ctx) {
       audioCtxRef.current = ctx;
@@ -4542,7 +4617,7 @@ export default function App() {
       setIsMediaSessionActive(true);
     }
 
-    // Pastikan mikrofon VOX tetap hidup dan siap menangkap suara di latar belakang
+    // 3. Pastikan mikrofon VOX tetap hidup dan siap menangkap suara di latar belakang
     if (voxEnabledRef.current) {
       const hasLiveMic = mediaStreamRef.current
         ?.getAudioTracks()
@@ -4556,38 +4631,16 @@ export default function App() {
       }
     }
 
+    // 4. Aktifkan jendela mikro Picture-in-Picture (jika didukung browser) agar OS menjaga proses tetap prioritas di atas aplikasi lain
+    await requestFloatingPipWidget();
+
     sendServiceWorkerKeepAlivePing({
       callsign: myCallsign || 'UNIT',
       channel,
       minimized: true,
       voxEnabled: voxEnabledRef.current,
     });
-
-    // 4. Pada perangkat Android (di luar iframe preview), arahkan ke layar utama (Home Screen) HP
-    // tanpa menutup tab/proses sehingga aplikasi benar-benar menghilang dari layar HP namun tetap aktif di background
-    try {
-      const isInIframe = typeof window !== 'undefined' && window.self !== window.top;
-      const isAndroidDevice =
-        typeof navigator !== 'undefined' && /Android/i.test(navigator.userAgent || '');
-      if (isAndroidDevice && !isInIframe && typeof document !== 'undefined') {
-        const fallbackUrl = encodeURIComponent(window.location.href);
-        const homeIntentUri = `intent:#Intent;action=android.intent.action.MAIN;category=android.intent.category.HOME;S.browser_fallback_url=${fallbackUrl};end`;
-        const anchor = document.createElement('a');
-        anchor.href = homeIntentUri;
-        anchor.style.display = 'none';
-        document.body.appendChild(anchor);
-        anchor.click();
-        window.setTimeout(() => {
-          if (anchor.parentNode) {
-            anchor.parentNode.removeChild(anchor);
-          }
-        }, 300);
-      }
-      window.blur?.();
-    } catch {
-      // Abaikan jika OS membatasi intent Home
-    }
-  }, [myCallsign, channel, handleToggleVoxSwitch]);
+  }, [myCallsign, channel, requestFloatingPipWidget, handleToggleVoxSwitch]);
 
   // Pulihkan Antarmuka Utama dari Mode Mini (Restore Full Interface)
   const handleRestoreFromMinimizedMode = useCallback(async () => {
@@ -5763,15 +5816,11 @@ export default function App() {
   }
 
   return (
-    <div
-      className={`h-[100dvh] max-h-[100dvh] w-full ${
-        isMinimizedMode ? 'bg-black' : 'bg-[#021322]'
-      } text-[#e5faff] flex flex-col items-center justify-center overflow-hidden select-none relative`}
-    >
+    <div className="h-[100dvh] max-h-[100dvh] w-full bg-[#021322] text-[#e5faff] flex flex-col items-center justify-center overflow-hidden select-none relative">
       {/* =====================================================================
           ELEMEN TERSEMBUNYI UNTUK BYPASS BACKGROUND OS SELULER:
-          1. <canvas> + <video> tersembunyi untuk aliran keep-alive
-          2. <audio loop> tersembunyi yang memutar file audio kosong (Silent Loop) non-stop
+          1. <canvas> + <video> tersembunyi untuk aliran keep-alive / PiP Mikro
+          2. <audio loop> tersembunyi yang memutar file audio sub-audible 6 detik non-stop
           ===================================================================== */}
       <canvas
         ref={pipCanvasRef}
@@ -5801,32 +5850,73 @@ export default function App() {
       />
 
       {/* =====================================================================
-          MODE MINIMASI PENUH (STEALTH BACKGROUND MODE)
-          Saat tombol MINI ditekan, seluruh tampilan aplikasi menghilang sepenuhnya
-          dari layar HP (dan otomatis kembali ke Home Screen di Android), sementara
-          WebSocket, WebRTC, MediaSession, dan VOX tetap 100% berfungsi di background.
-          Ketuk di mana saja saat kembali ke layar aplikasi untuk membuka tampilan penuh.
+          KAPSUL MINIMALIS MODE BACKGROUND SISTEM (TIDAK KELUAR DARI APLIKASI)
+          Saat tombol MINI ditekan, aplikasi TIDAK keluar melainkan mengunci
+          Background Service (MediaSession 6s + WebAudio + Worker VOX) agar tetap
+          aktif 100% meskipun Anda berpindah membuka aplikasi lain di HP.
           ===================================================================== */}
       {isMinimizedMode && (
-        <div
-          onClick={handleRestoreFromMinimizedMode}
-          role="button"
-          tabIndex={0}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') handleRestoreFromMinimizedMode();
-          }}
-          title="Ketuk layar untuk menampilkan kembali antarmuka PTT"
-          className="fixed inset-0 z-50 bg-black cursor-pointer flex items-end justify-center pb-3"
-        >
-          <span className="font-telemetry text-[9px] text-cyan-200/20 tracking-widest select-none">
-            PTT BACKGROUND AKTIF • KETUK LAYAR UNTUK MEMBUKA
-          </span>
+        <div className="fixed bottom-2.5 right-2.5 z-50 pointer-events-auto">
+          <div className="tactical-panel rounded-full px-2.5 py-1 border border-[#23dcff] shadow-[0_0_16px_rgba(35,220,255,0.4)] flex items-center gap-1.5 bg-[#021526]/95 backdrop-blur-xs max-w-[235px]">
+            <div
+              onClick={handleRestoreFromMinimizedMode}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') handleRestoreFromMinimizedMode();
+              }}
+              title="Mode Background Sistem Aktif — Ketuk untuk kembali ke tampilan penuh"
+              className="cursor-pointer text-left min-w-0 flex-1 pr-0.5"
+            >
+              <div className="flex items-center gap-1">
+                <span
+                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                    isTransmitting
+                      ? 'bg-emerald-400 animate-ping'
+                      : activeLockSpeaker
+                      ? 'bg-amber-400 animate-pulse'
+                      : 'bg-[#23dcff]'
+                  }`}
+                />
+                <span className="font-tactical text-[9.5px] font-extrabold tracking-tight text-white truncate">
+                  BG SISTEM ON • CH{String(channel).padStart(2, '0')}
+                </span>
+              </div>
+              <div className="font-telemetry text-[8px] text-cyan-200/90 leading-none truncate">
+                <MiniWidgetMicLevelText /> • Siap Buka Apk Lain
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                requestFloatingPipWidget();
+              }}
+              title="Tampilkan Widget Mikro PiP di Atas Aplikasi Lain"
+              className={`w-6 h-6 rounded-full border flex items-center justify-center transition-transform active:scale-90 cursor-pointer shrink-0 ${
+                isPipFloatingActive
+                  ? 'bg-emerald-500/25 border-emerald-400 text-emerald-300'
+                  : 'bg-[#042440] border-[#23dcff]/70 text-[#23dcff]'
+              }`}
+            >
+              <Smartphone className="w-3 h-3" />
+            </button>
+
+            <button
+              type="button"
+              onClick={handleRestoreFromMinimizedMode}
+              title="Kembali ke Antarmuka Penuh"
+              className="w-6 h-6 rounded-full cyan-btn-glow border border-white text-[#02182b] flex items-center justify-center shadow-[0_0_8px_#23dcff] active:scale-90 transition-transform cursor-pointer shrink-0"
+            >
+              <Maximize2 className="w-3 h-3" />
+            </button>
+          </div>
         </div>
       )}
 
       <main
         className={`w-full h-[100dvh] max-h-[100dvh] tactical-grid-bg flex flex-col justify-between relative overflow-hidden transition-all ${
-          isMinimizedMode ? 'hidden pointer-events-none' : 'opacity-100'
+          isMinimizedMode ? 'opacity-25 pointer-events-none scale-[0.98]' : 'opacity-100'
         } ${
           fullScreenStretch
             ? 'max-w-full'

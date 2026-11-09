@@ -1,10 +1,13 @@
 // Mobile Browser Web Audio API, Microphone Fallback, PCM/WAV Recorder Fallback,
 // and Background Keep-Alive (Silent Audio Stream) Engine for Safari (iOS), Chrome (Android), and HarmonyOS.
 
-// 1-second 8kHz 16-bit Mono Silent WAV Data URI (with +/-1 LSB dither so mobile OS audio engines do not suspend it as digital zero)
+// 6-second 8kHz 16-bit Mono Sub-Audible Keep-Alive WAV Data URI:
+// Duration MUST be >= 5.0 seconds so Android Chromium's MediaSessionImpl::IsControllable() (kMinimumDurationForMediaSession = 5s)
+// grants a persistent Foreground Media Service lock and never suspends the app when opening other phone apps!
 export const SILENT_WAV_DATA_URI = (() => {
   const sampleRate = 8000;
-  const numSamples = sampleRate; // 1 second
+  const durationSeconds = 6;
+  const numSamples = sampleRate * durationSeconds; // 6 seconds (> 5s Chromium MediaSession requirement)
   const buffer = new ArrayBuffer(44 + numSamples * 2);
   const view = new DataView(buffer);
 
@@ -28,15 +31,20 @@ export const SILENT_WAV_DATA_URI = (() => {
   writeString(36, 'data');
   view.setUint32(40, numSamples * 2, true);
 
-  // Fill with +/- 1 LSB imperceptible sub-audible dither so iOS/Android/HarmonyOS never flags stream as dead silence
+  // Fill with an imperceptible 18 Hz sub-audible infra-bass wave (amplitude 96 / 32767)
+  // Phone speakers cannot reproduce 18 Hz, yet OS audio watchdogs detect non-zero RMS energy and keep the background service alive 100%
+  const twoPiFreq = (2 * Math.PI * 18) / sampleRate;
   for (let i = 0; i < numSamples; i++) {
-    view.setInt16(44 + i * 2, i % 2 === 0 ? 1 : -1, true);
+    const sample = Math.round(Math.sin(i * twoPiFreq) * 96);
+    view.setInt16(44 + i * 2, sample, true);
   }
 
   const bytes = new Uint8Array(buffer);
   let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.byteLength; i += chunkSize) {
+    const sub = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, Array.from(sub));
   }
   return `data:audio/wav;base64,${btoa(binary)}`;
 })();
@@ -503,13 +511,6 @@ export function optimizeWebRtcSdpForOpusLowLatency(
   };
 
   if (!opusPayloadType) {
-    // Even for DataChannel-only or custom SDP profiles, append session-level Opus FEC/DTX/12kbps hint if not present
-    if (!sdp.includes('useinbandfec=1')) {
-      return (
-        sdp.replace(/\r?\n$/, '') +
-        `\r\na=fmtp:111 ${serializeFmtp()}\r\n`
-      );
-    }
     return sdp;
   }
 
@@ -758,18 +759,48 @@ export async function preDecodeBase64AudioToBuffer(
       bytes[i] = binaryString.charCodeAt(i);
     }
 
-    const audioBuffer = await new Promise<AudioBuffer>((resolve, reject) => {
+    const audioBuffer = await new Promise<AudioBuffer | null>((resolve) => {
+      let settled = false;
+      const timer = window.setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      }, 1100);
+
       try {
         const res = ctx.decodeAudioData(
           bytes.buffer.slice(0),
-          (decoded) => resolve(decoded),
-          (err) => reject(err)
+          (decoded) => {
+            if (!settled) {
+              settled = true;
+              window.clearTimeout(timer);
+              resolve(decoded);
+            }
+          },
+          () => {
+            if (!settled) {
+              settled = true;
+              window.clearTimeout(timer);
+              resolve(null);
+            }
+          }
         );
         if (res && typeof res.then === 'function') {
-          res.catch(reject);
+          res.catch(() => {
+            if (!settled) {
+              settled = true;
+              window.clearTimeout(timer);
+              resolve(null);
+            }
+          });
         }
-      } catch (err) {
-        reject(err);
+      } catch {
+        if (!settled) {
+          settled = true;
+          window.clearTimeout(timer);
+          resolve(null);
+        }
       }
     });
 
@@ -778,6 +809,10 @@ export async function preDecodeBase64AudioToBuffer(
     return null;
   }
 }
+
+// Keep strong references to active playing AudioBufferSourceNodes so mobile V8/JavaScriptCore GC
+// never collects an in-flight node before its onended callback fires!
+const activeRxBufferSources = new Set<AudioBufferSourceNode>();
 
 /**
  * Decodes (or uses pre-decoded) AES-GCM Base64 Data URL and plays it through Web Audio API AudioBufferSourceNode
@@ -826,6 +861,7 @@ export async function playBase64AudioViaWebAudioFallback(
     source.buffer = audioBuffer;
     const clampedRate = Math.max(0.95, Math.min(1.12, playbackRate));
     source.playbackRate.setValueAtTime(clampedRate, ctx.currentTime);
+    activeRxBufferSources.add(source);
 
     // Stage 1: Sub-Bass Rumble Cut (180 Hz Highpass) to eliminate mud & speaker rattle
     const rumbleCutFilter = ctx.createBiquadFilter();
@@ -877,42 +913,55 @@ export async function playBase64AudioViaWebAudioFallback(
     limiter.connect(ctx.destination);
 
     let stopped = false;
-    source.onended = () => {
-      if (!stopped) {
-        stopped = true;
-        try {
-          source.disconnect();
-          rumbleCutFilter.disconnect();
-          hissCutFilter.disconnect();
-          vocalClarityFilter.disconnect();
-          gainNode.disconnect();
-          limiter.disconnect();
-        } catch {
-          // Ignore disconnect error
-        }
+    let safetyTimerId: number | null = null;
+
+    const finalizeNodePlayback = (callOnEnded: boolean) => {
+      if (stopped) return;
+      stopped = true;
+      if (safetyTimerId !== null) {
+        window.clearTimeout(safetyTimerId);
+        safetyTimerId = null;
+      }
+      activeRxBufferSources.delete(source);
+      try {
+        source.disconnect();
+        rumbleCutFilter.disconnect();
+        hissCutFilter.disconnect();
+        vocalClarityFilter.disconnect();
+        gainNode.disconnect();
+        limiter.disconnect();
+      } catch {
+        // Ignore disconnect error
+      }
+      if (callOnEnded) {
         onEnded();
       }
     };
+
+    source.onended = () => {
+      finalizeNodePlayback(true);
+    };
+
+    // Guaranteed fallback timer so if a mobile browser drops source.onended, the RX queue NEVER gets stuck after segment #1!
+    safetyTimerId = window.setTimeout(
+      () => {
+        finalizeNodePlayback(true);
+      },
+      Math.max(120, Math.ceil(effectiveDuration * 1000) + 85)
+    );
 
     source.start(0);
 
     return {
       stop: () => {
-        if (stopped) return;
-        stopped = true;
         try {
           gainNode.gain.cancelScheduledValues(ctx.currentTime);
           gainNode.gain.value = 0;
           source.stop(0);
-          source.disconnect();
-          rumbleCutFilter.disconnect();
-          hissCutFilter.disconnect();
-          vocalClarityFilter.disconnect();
-          gainNode.disconnect();
-          limiter.disconnect();
         } catch {
           // Ignore stop error
         }
+        finalizeNodePlayback(false);
       },
       setGain: (val: number) => {
         if (stopped) return;
@@ -1088,7 +1137,7 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
       // 1. Ensure attached DOM <audio loop> element is continuously playing SILENT_WAV_DATA_URI
       if (domAudioEl) {
         domAudioEl.loop = true;
-        domAudioEl.volume = 0.02;
+        domAudioEl.volume = 0.15;
         if (!domAudioEl.src) {
           domAudioEl.src = SILENT_WAV_DATA_URI;
         }
@@ -1103,7 +1152,7 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
         el.setAttribute('playsinline', 'true');
         el.setAttribute('webkit-playsinline', 'true');
         el.loop = true;
-        el.volume = 0.02; // Near-zero volume on already silent +/-1 LSB WAV
+        el.volume = 0.15; // Audible-flagged volume on sub-audible 18Hz WAV so OS never suspends background service
         el.src = SILENT_WAV_DATA_URI;
 
         // Auto-restart immediately if mobile OS tries to pause the silent audio loop in background
@@ -1142,7 +1191,7 @@ export function createSilentKeepAliveController(): SilentKeepAliveSession {
     if (!el) return;
     try {
       el.loop = true;
-      el.volume = 0.02;
+      el.volume = 0.15;
       if (!el.src) {
         el.src = SILENT_WAV_DATA_URI;
       }
