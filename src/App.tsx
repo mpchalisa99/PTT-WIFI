@@ -6019,15 +6019,15 @@ export default function App() {
                 <span>Ping</span>
               </button>
 
-              {/* Tombol EMG.CLEAR (Dipindahkan ke posisi tombol CLIENT, tombol CLIENT dihilangkan) */}
+              {/* Tombol EMERGENCY CLEAR (Dipindahkan ke posisi tombol CLIENT, tombol CLIENT dihilangkan) */}
               <button
                 type="button"
                 onClick={handleEmergencyClear}
-                title="EMG.CLEAR: Putuskan WebSocket, Matikan Mikrofon, Hapus Cache & Reset ke Login"
+                title="EMERGENCY CLEAR: Putuskan WebSocket, Matikan Mikrofon, Hapus Cache & Reset ke Login"
                 className="px-2 py-1 rounded-lg bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 border border-red-300/80 shadow-[0_0_10px_rgba(239,68,68,0.45)] text-white font-tactical text-[9.5px] font-extrabold tracking-wider flex items-center justify-center gap-1 active:scale-95 transition-all shrink-0 cursor-pointer"
               >
                 <ShieldAlert className="w-3.5 h-3.5 text-white shrink-0" />
-                <span>EMG.CLEAR</span>
+                <span>EMERGENCY CLEAR</span>
               </button>
             </div>
 
@@ -6390,7 +6390,7 @@ export default function App() {
                 hasActiveLockSpeaker={Boolean(activeLockSpeaker)}
               />
 
-              {/* Tombol Lingkaran PTT (VOX Hands-Free Otomatis + Klik Manual + Channel Lockout + Animasi Berdenyut Saat TX) */}
+              {/* Tombol Lingkaran PTT (VOX Hands-Free Otomatis + Klik Manual + Channel Lockout) */}
               <button
                 type="button"
                 disabled={isPttLocked}
@@ -6399,24 +6399,10 @@ export default function App() {
                   isPttLocked
                     ? 'bg-[#1a1318] border-red-500/80 opacity-85 cursor-not-allowed'
                     : isTransmitting
-                    ? 'ptt-ring-active border-white cursor-pointer'
+                    ? 'ptt-ring-active border-white scale-[0.98] cursor-pointer'
                     : 'ptt-ring-outer border-[#2fe0ff] active:scale-95 cursor-pointer'
                 }`}
               >
-                {/* Cincin Gelombang Sonar Berdenyut Ganda Saat Mentransmisikan Suara (Murni CSS GPU, 0 Re-render) */}
-                {isTransmitting && !isPttLocked && (
-                  <>
-                    <span
-                      aria-hidden="true"
-                      className="ptt-tx-sonar-ring pointer-events-none absolute -inset-2 rounded-full border-2 border-[#23dcff] shadow-[0_0_18px_#23dcff]"
-                    />
-                    <span
-                      aria-hidden="true"
-                      className="ptt-tx-sonar-ring-delay pointer-events-none absolute -inset-2 rounded-full border-2 border-emerald-300/90 shadow-[0_0_18px_rgba(52,211,153,0.8)]"
-                    />
-                  </>
-                )}
-
                 {/* Teks Melingkar */}
                 <div className="absolute inset-0 pointer-events-none">
                   {curvedChars.map((char, index) => {
@@ -6444,27 +6430,19 @@ export default function App() {
                     isPttLocked
                       ? 'bg-gradient-to-b from-[#3d121d] to-[#1c080d] border-red-400/80'
                       : isTransmitting
-                      ? 'ptt-inner-active-pulse bg-gradient-to-b from-[#33e6ff] via-[#0ea5e9] to-[#066c96] border-white shadow-[0_0_22px_rgba(35,220,255,0.9),inset_0_2px_10px_rgba(255,255,255,0.65)]'
+                      ? 'bg-gradient-to-b from-[#33e6ff] to-[#066c96] border-white shadow-inner'
                       : 'bg-gradient-to-b from-[#178bbf] via-[#0a4c73] to-[#052942] border-[#6beaff]/65 shadow-[inset_0_3px_10px_rgba(255,255,255,0.25)]'
                   }`}
                 >
-                  <div className="relative flex items-center justify-center">
-                    <Radio
-                      className={`w-7 h-7 mb-0.5 ${
-                        isPttLocked
-                          ? 'text-red-300 animate-pulse'
-                          : isTransmitting
-                          ? 'text-[#021b30] animate-bounce'
-                          : 'text-[#03233b]'
-                      }`}
-                    />
-                    {isTransmitting && !isPttLocked && (
-                      <span className="absolute -right-2.5 top-0 flex h-2.5 w-2.5">
-                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-300 opacity-90" />
-                        <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-400 border border-[#021b30]" />
-                      </span>
-                    )}
-                  </div>
+                  <Radio
+                    className={`w-7 h-7 mb-0.5 ${
+                      isPttLocked
+                        ? 'text-red-300 animate-pulse'
+                        : isTransmitting
+                        ? 'text-[#021b30] animate-pulse'
+                        : 'text-[#03233b]'
+                    }`}
+                  />
                   <span className="font-tactical text-[12px] font-extrabold tracking-wider text-white drop-shadow leading-tight">
                     {isTransmitting
                       ? voxEnabled
@@ -6480,7 +6458,7 @@ export default function App() {
                   </span>
                   <span className="font-telemetry text-[8px] font-bold text-cyan-100/95 leading-none mt-0.5">
                     {isTransmitting
-                      ? 'TX AKTIF • DATA TERKIRIM'
+                      ? 'SALURAN DIKUNCI • RX OFF'
                       : isPttLocked
                       ? 'VOX & TX LOCKED'
                       : voxEnabled

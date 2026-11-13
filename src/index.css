@@ -78,60 +78,11 @@
 .ptt-ring-active {
   background: radial-gradient(circle at 50% 35%, #a5f3fc 0%, #23dcff 45%, #0284c7 78%, #033557 100%);
   box-shadow:
-    0 0 42px rgba(35, 220, 255, 0.92),
-    0 0 65px rgba(16, 185, 129, 0.55),
-    inset 0 2px 10px rgba(255, 255, 255, 0.82),
+    0 0 42px rgba(35, 220, 255, 0.88),
+    0 0 55px rgba(14, 165, 233, 0.75),
+    inset 0 2px 10px rgba(255, 255, 255, 0.78),
     inset 0 -6px 14px rgba(0, 20, 40, 0.85);
-  animation: pttTransmitHeartbeat 1.15s ease-in-out infinite;
 }
 
-.ptt-inner-active-pulse {
-  animation: pttInnerCorePulse 1.15s ease-in-out infinite;
-}
 
-.ptt-tx-sonar-ring {
-  animation: pttTxSonarWave 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
-}
 
-.ptt-tx-sonar-ring-delay {
-  animation: pttTxSonarWave 1.5s cubic-bezier(0, 0, 0.2, 1) 0.75s infinite;
-}
-
-@keyframes pttTransmitHeartbeat {
-  0%, 100% {
-    transform: scale(0.98);
-    box-shadow:
-      0 0 32px rgba(35, 220, 255, 0.85),
-      0 0 48px rgba(14, 165, 233, 0.65),
-      inset 0 2px 10px rgba(255, 255, 255, 0.78),
-      inset 0 -6px 14px rgba(0, 20, 40, 0.85);
-  }
-  50% {
-    transform: scale(1.035);
-    box-shadow:
-      0 0 58px rgba(35, 220, 255, 1),
-      0 0 85px rgba(52, 211, 153, 0.75),
-      inset 0 2px 14px rgba(255, 255, 255, 0.95),
-      inset 0 -6px 14px rgba(0, 20, 40, 0.85);
-  }
-}
-
-@keyframes pttInnerCorePulse {
-  0%, 100% {
-    transform: scale(1);
-  }
-  50% {
-    transform: scale(1.04);
-  }
-}
-
-@keyframes pttTxSonarWave {
-  0% {
-    transform: scale(0.96);
-    opacity: 0.85;
-  }
-  100% {
-    transform: scale(1.24);
-    opacity: 0;
-  }
-}
