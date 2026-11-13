@@ -1179,11 +1179,27 @@ export default function App() {
       );
       currentAdaptiveJitterDelayMsRef.current = adaptiveJitterBufferMs;
 
+      const previousLockSenderId = channelLockOwnerRef.current?.senderId;
+      const previousSpeakerCallsign = remoteActiveTxRef.current;
+      // Hanya lakukan preempt/flush antrean jika OVERRIDE mengambil alih dari pembicara LAIN.
+      // Jika segmen ke-2, ke-3, dst. berasal dari pembicara OVERRIDE yang SAMA, JANGAN memotong antrean!
+      const isPreemptingDifferentSpeaker =
+        isPriorityPreempt &&
+        Boolean(
+          (previousLockSenderId &&
+            senderDeviceId &&
+            previousLockSenderId !== senderDeviceId) ||
+            (previousSpeakerCallsign && previousSpeakerCallsign !== senderCallsign)
+        );
+
       if (senderDeviceId) {
         const lockObj: ChannelLockInfo = {
           senderId: senderDeviceId,
           callsign: senderCallsign,
-          startedAt: channelLockOwnerRef.current?.startedAt || now,
+          startedAt:
+            previousLockSenderId === senderDeviceId
+              ? channelLockOwnerRef.current?.startedAt || now
+              : now,
           updatedAt: now,
           isPriorityOverride:
             isPriorityPreempt || channelLockOwnerRef.current?.isPriorityOverride,
@@ -1191,6 +1207,7 @@ export default function App() {
         channelLockOwnerRef.current = lockObj;
         setChannelLockOwner(lockObj);
       }
+      remoteActiveTxRef.current = senderCallsign;
 
       // ISOLASI TOTAL SPEAKER-KE-MIKROFON (ANTI-ECHO GATE SAAT PLAYBACK PENERIMA):
       // Matikan track mikrofon & kunci gain input mikrofon ke 0.0 selama speaker memutar suara masuk
@@ -1208,8 +1225,8 @@ export default function App() {
         });
       }
 
-      // If Priority Override preempts a different speaker, clear old queue and stop previous speaker immediately
-      if (isPriorityPreempt) {
+      // If Priority Override preempts a DIFFERENT speaker, clear old queue and stop previous speaker immediately
+      if (isPreemptingDifferentSpeaker) {
         rxAudioQueueRef.current = [];
         isJitterBufferingRef.current = false;
         if (jitterBufferTimerRef.current) {
@@ -2197,6 +2214,12 @@ export default function App() {
 
       if (pkt.type === 'PRIORITY_OVERRIDE') {
         const now = Date.now();
+        const existingLock = channelLockOwnerRef.current;
+        const isSameOverrideSpeaker =
+          existingLock &&
+          existingLock.senderId === pkt.senderId &&
+          existingLock.isPriorityOverride;
+
         // TOMBOL OVERRIDE DARI REKAN: Hentikan transmisi lokal seketika tanpa syarat!
         if (isPriorityOverrideRef.current) {
           isPriorityOverrideRef.current = false;
@@ -2205,22 +2228,57 @@ export default function App() {
         if (isTransmittingRef.current) {
           forceStopLocalRecording(true);
         }
+
+        // Jika sebelumnya sedang memutar suara dari pembicara LAIN, hentikan suara pembicara lama seketika
+        if (existingLock && existingLock.senderId !== pkt.senderId) {
+          rxAudioQueueRef.current = [];
+          isJitterBufferingRef.current = false;
+          if (jitterBufferTimerRef.current) {
+            window.clearTimeout(jitterBufferTimerRef.current);
+            jitterBufferTimerRef.current = null;
+          }
+          if (activeWebAudioRxStopRef.current) {
+            try {
+              activeWebAudioRxStopRef.current();
+            } catch {
+              // Ignore
+            }
+            activeWebAudioRxStopRef.current = null;
+          }
+          if (activeAudioElementRef.current) {
+            try {
+              activeAudioElementRef.current.pause();
+            } catch {
+              // Ignore
+            }
+            activeAudioElementRef.current = null;
+          }
+          isRxQueuePlayingRef.current = false;
+        }
+
         const lockObj: ChannelLockInfo = {
           senderId: pkt.senderId,
           callsign: pkt.callsign,
-          startedAt: pkt.lockStartedAt || now,
+          startedAt: isSameOverrideSpeaker
+            ? existingLock.startedAt
+            : pkt.lockStartedAt || now,
           updatedAt: now,
           isPriorityOverride: true,
         };
         channelLockOwnerRef.current = lockObj;
-        setChannelLockOwner(lockObj);
         remoteActiveTxRef.current = pkt.callsign;
-        setIncomingSpeaker(pkt.callsign);
-        setCollisionBlockedNotice(
-          `PRIORITAS OVERRIDE: TRANSMISI DIAMBIL ALIH OLEH ${pkt.callsign}`
-        );
-        window.setTimeout(() => setCollisionBlockedNotice(null), 2600);
-        playTacticalTone('rx');
+
+        // Hanya tampilkan notifikasi & bunyikan beep saat OVERRIDE baru pertama kali diambil alih,
+        // BUKAN setiap heartbeat 1.8 detik agar aliran suara OVERRIDE tidak terputus-putus!
+        if (!isSameOverrideSpeaker) {
+          setChannelLockOwner(lockObj);
+          setIncomingSpeaker(pkt.callsign);
+          setCollisionBlockedNotice(
+            `PRIORITAS OVERRIDE: TRANSMISI DIAMBIL ALIH OLEH ${pkt.callsign}`
+          );
+          window.setTimeout(() => setCollisionBlockedNotice(null), 2600);
+          playTacticalTone('rx');
+        }
         return;
       }
 
@@ -3928,16 +3986,18 @@ export default function App() {
       setIncomingSpeaker(null);
       setCollisionBlockedNotice(null);
 
-      broadcastMeshPacket({
-        type: 'PRIORITY_OVERRIDE',
-        isPriorityOverride: true,
-        lockOwnerId: myDeviceId,
-        lockOwnerCallsign: myCallsign,
-        lockStartedAt: Date.now(),
-      });
-
       if (!isTransmittingRef.current) {
+        // onStartTransmit('OVERRIDE') langsung memancarkan sinyal PRIORITY_OVERRIDE & membuka stream audio
         onStartTransmit('OVERRIDE');
+      } else {
+        // Jika mikrofon lokal sudah sedang transmit, tingkatkan status menjadi PRIORITY_OVERRIDE tanpa memutus rekaman
+        broadcastMeshPacket({
+          type: 'PRIORITY_OVERRIDE',
+          isPriorityOverride: true,
+          lockOwnerId: myDeviceId,
+          lockOwnerCallsign: myCallsign,
+          lockStartedAt: localTxStartedAtRef.current || Date.now(),
+        });
       }
     } else {
       if (isTransmittingRef.current) {
