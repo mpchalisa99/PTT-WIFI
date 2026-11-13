@@ -6019,15 +6019,15 @@ export default function App() {
                 <span>Ping</span>
               </button>
 
-              {/* Tombol EMERGENCY CLEAR (Dipindahkan ke posisi tombol CLIENT, tombol CLIENT dihilangkan) */}
+              {/* Tombol CLEAR (Dipindahkan ke posisi tombol CLIENT, tombol CLIENT dihilangkan) */}
               <button
                 type="button"
                 onClick={handleEmergencyClear}
-                title="EMERGENCY CLEAR: Putuskan WebSocket, Matikan Mikrofon, Hapus Cache & Reset ke Login"
-                className="px-2 py-1 rounded-lg bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 border border-red-300/80 shadow-[0_0_10px_rgba(239,68,68,0.45)] text-white font-tactical text-[9.5px] font-extrabold tracking-wider flex items-center justify-center gap-1 active:scale-95 transition-all shrink-0 cursor-pointer"
+                title="CLEAR: Putuskan WebSocket, Matikan Mikrofon, Hapus Cache & Reset ke Login"
+                className="px-2.5 py-1 rounded-lg bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 border border-red-300/80 shadow-[0_0_10px_rgba(239,68,68,0.45)] text-white font-tactical text-[10.5px] font-extrabold tracking-wider flex items-center justify-center gap-1 active:scale-95 transition-all shrink-0 cursor-pointer"
               >
                 <ShieldAlert className="w-3.5 h-3.5 text-white shrink-0" />
-                <span>EMERGENCY CLEAR</span>
+                <span>CLEAR</span>
               </button>
             </div>
 
