@@ -353,7 +353,7 @@ const VoxThresholdSliderRow = React.memo(function VoxThresholdSliderRow({
   return (
     <div className="flex items-center gap-2">
       <span
-        title="Ambang Batas Sensitivitas VOX (Kalibrasi Seimbang 18%–22%, Default 20% — Stabil & Manual)"
+        title="Ambang Batas Sensitivitas VOX (Tenang 30%, Ramai 50%, Angin 80%)"
         className="font-telemetry text-[9px] font-bold text-cyan-100 shrink-0"
       >
         THR <strong className="text-[#23dcff]">{voxThreshold}%</strong>
@@ -672,14 +672,14 @@ export default function App() {
     return saved !== null ? saved === 'true' : true;
   });
   const [voxThreshold, setVoxThreshold] = useState<number>(() => {
-    const raw = localStorage.getItem('diskomlekau_vox_threshold_balanced_v5');
+    const raw = localStorage.getItem('diskomlekau_vox_threshold_balanced_v6');
     if (raw !== null) {
       const parsed = Number(raw);
       if (!Number.isNaN(parsed) && parsed >= 5 && parsed <= 85) {
         return parsed;
       }
     }
-    return 20;
+    return 30;
   });
   const [voxHoldMs, setVoxHoldMs] = useState<number>(() => {
     const saved = Number(localStorage.getItem('diskomlekau_vox_hold_ms'));
@@ -718,8 +718,8 @@ export default function App() {
   }, []);
 
   const getVoxNoiseGateLabel = (thr: number) => {
-    if (thr <= 24) return 'TENANG';
-    if (thr <= 40) return 'RAMAI';
+    if (thr <= 35) return 'TENANG';
+    if (thr <= 65) return 'RAMAI';
     return 'ANGIN';
   };
 
@@ -862,7 +862,7 @@ export default function App() {
     installGlobalWebRtcOpusSdpPatch(opusBitrateKbps * 1000);
     try {
       localStorage.setItem('diskomlekau_vox_enabled', String(voxEnabled));
-      localStorage.setItem('diskomlekau_vox_threshold_balanced_v5', String(voxThreshold));
+      localStorage.setItem('diskomlekau_vox_threshold_balanced_v6', String(voxThreshold));
       localStorage.setItem('diskomlekau_vox_threshold', String(voxThreshold));
       localStorage.setItem('diskomlekau_vox_hold_ms', String(voxHoldMs));
       localStorage.setItem('diskomlekau_keepalive_enabled', String(keepAliveEnabled));
@@ -6019,11 +6019,16 @@ export default function App() {
                 <span>Ping</span>
               </button>
 
-              {/* Label Status Permanen: MASTER (192.168.43.1) atau CLIENT */}
-              <div className="px-2.5 py-1 rounded-lg cyan-btn-glow text-[#021d33] font-extrabold text-[11px] flex items-center gap-1 shrink-0">
-                <Star className="w-3.5 h-3.5 fill-[#021d33]" />
-                <span>{isMasterDevice ? 'MASTER' : 'CLIENT'}</span>
-              </div>
+              {/* Tombol EMERGENCY CLEAR (Dipindahkan ke posisi tombol CLIENT, tombol CLIENT dihilangkan) */}
+              <button
+                type="button"
+                onClick={handleEmergencyClear}
+                title="EMERGENCY CLEAR: Putuskan WebSocket, Matikan Mikrofon, Hapus Cache & Reset ke Login"
+                className="px-2 py-1 rounded-lg bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 border border-red-300/80 shadow-[0_0_10px_rgba(239,68,68,0.45)] text-white font-tactical text-[9.5px] font-extrabold tracking-wider flex items-center justify-center gap-1 active:scale-95 transition-all shrink-0 cursor-pointer"
+              >
+                <ShieldAlert className="w-3.5 h-3.5 text-white shrink-0" />
+                <span>EMERGENCY CLEAR</span>
+              </button>
             </div>
 
             {/* Teks Informasi Peran Permanen, Status AES-GCM & Peer Aktif */}
@@ -6079,16 +6084,23 @@ export default function App() {
                 </div>
               </button>
 
-              {/* Kolom Kanan: TOMBOL EMERGENCY CLEAR DI ATAS PERSIS TOMBOL BARCODE */}
+              {/* Kolom Kanan: TOMBOL KEEP:ON DI ATAS PERSIS TOMBOL BARCODE (Menggantikan posisi lama EMERGENCY CLEAR) */}
               <div className="flex flex-col items-stretch gap-1 shrink-0">
                 <button
                   type="button"
-                  onClick={handleEmergencyClear}
-                  title="EMERGENCY CLEAR: Putuskan WebSocket, Matikan Mikrofon, Hapus Cache & Reset ke Login"
-                  className="px-2 py-1 rounded-lg bg-gradient-to-r from-red-700 to-red-600 hover:from-red-600 hover:to-red-500 border border-red-300/80 shadow-[0_0_10px_rgba(239,68,68,0.45)] text-white font-tactical text-[9px] font-extrabold tracking-wider flex items-center justify-center gap-1 active:scale-95 transition-all cursor-pointer"
+                  onClick={() => setKeepAliveEnabled((prev) => !prev)}
+                  title="Keep-Alive Silent Audio Stream (Agar WebSocket & Audio Tetap Hidup Saat Layar HP Mati / Masuk Saku)"
+                  className={`px-2.5 py-1 rounded-lg border font-telemetry text-[9.5px] font-extrabold flex items-center justify-center gap-1 active:scale-95 transition-all cursor-pointer ${
+                    keepAliveEnabled
+                      ? 'bg-[#06385c] border-[#23dcff] text-[#23dcff] shadow-[0_0_10px_rgba(35,220,255,0.28)]'
+                      : 'bg-[#031829] border-cyan-500/35 text-cyan-300/60'
+                  }`}
                 >
-                  <ShieldAlert className="w-3 h-3 text-white shrink-0" />
-                  <span>EMERGENCY CLEAR</span>
+                  {keepAliveEnabled
+                    ? isBackgroundMode
+                      ? 'SAKU:AKTIF'
+                      : 'KEEP:ON'
+                    : 'KEEP:OFF'}
                 </button>
 
                 <button
@@ -6201,16 +6213,14 @@ export default function App() {
                   </span>
                 </button>
 
-                {/* Tombol Preset Cepat Kalibrasi Seimbang: TENANG (20% — di kisaran 18%-22%), RAMAI (32%), ANGIN (48%) */}
+                {/* Tombol Preset Cepat VOX: TENANG (30%), RAMAI (50%), ANGIN (80%) */}
                 <div className="flex items-center gap-1 min-w-0">
                   {[
-                    { label: 'TENANG', val: 20 },
-                    { label: 'RAMAI', val: 32 },
-                    { label: 'ANGIN', val: 48 },
+                    { label: 'TENANG', val: 30 },
+                    { label: 'RAMAI', val: 50 },
+                    { label: 'ANGIN', val: 80 },
                   ].map((preset) => {
-                    const isActivePreset =
-                      voxThreshold === preset.val ||
-                      (preset.label === 'TENANG' && voxThreshold >= 18 && voxThreshold <= 22);
+                    const isActivePreset = voxThreshold === preset.val;
                     return (
                       <button
                         key={preset.label}
@@ -6225,29 +6235,11 @@ export default function App() {
                             : 'bg-[#042138] hover:bg-[#083456] text-cyan-100 border border-cyan-400/35'
                         }`}
                       >
-                        {preset.label}
+                        {preset.label} {preset.val}%
                       </button>
                     );
                   })}
                 </div>
-
-                {/* Tombol Sakelar Keep-Alive (Silent Audio Stream Mode Saku / Layar Mati) */}
-                <button
-                  type="button"
-                  onClick={() => setKeepAliveEnabled((prev) => !prev)}
-                  title="Keep-Alive Silent Audio Stream (Agar WebSocket & Audio Tetap Hidup Saat Layar HP Mati / Masuk Saku)"
-                  className={`px-1.5 py-0.5 rounded border font-telemetry text-[8px] font-extrabold transition-colors shrink-0 cursor-pointer ${
-                    keepAliveEnabled
-                      ? 'bg-[#06385c] border-[#23dcff] text-[#23dcff]'
-                      : 'bg-[#031829] border-cyan-500/30 text-cyan-300/60'
-                  }`}
-                >
-                  {keepAliveEnabled
-                    ? isBackgroundMode
-                      ? 'SAKU:AKTIF'
-                      : 'KEEP:ON'
-                    : 'KEEP:OFF'}
-                </button>
 
                 {/* Tombol Penguat Volume Penerima (Web Audio API GainNode Boost: 2.0x / 2.2x / 3.0x) */}
                 <button
@@ -7293,9 +7285,9 @@ export default function App() {
                           />
                           <div className="grid grid-cols-3 gap-1.5 pt-1">
                             {[
-                              { label: 'Tenang (20%)', val: 20 },
-                              { label: 'Ramai (32%)', val: 32 },
-                              { label: 'Angin (48%)', val: 48 },
+                              { label: 'Tenang (30%)', val: 30 },
+                              { label: 'Ramai (50%)', val: 50 },
+                              { label: 'Angin (80%)', val: 80 },
                             ].map((p) => (
                               <button
                                 key={p.label}
@@ -7315,7 +7307,7 @@ export default function App() {
                           </div>
                           <div className="flex items-center justify-between pt-1.5 text-[10.5px] text-cyan-200/90">
                             <span>
-                              Kalibrasi Seimbang: <strong className="text-[#23dcff]">18%–22% (Default 20%)</strong> • Slider Stabil di <strong className="text-white">{voxThreshold}%</strong>
+                              Preset VOX: <strong className="text-[#23dcff]">Tenang 30% • Ramai 50% • Angin 80%</strong> • Slider Stabil di <strong className="text-white">{voxThreshold}%</strong>
                             </span>
                           </div>
                         </div>
